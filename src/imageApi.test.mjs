@@ -18,6 +18,9 @@ test('unknown model IDs stay unclassified instead of being silently treated as t
   assert.equal(api.isModelAutoEnabled({ id: 'vendor-next-gen-2026', name: 'Next Gen', capability: 'unknown' }), false)
   assert.equal(api.inferModelCapability('gpt-image-2'), 'image')
   assert.equal(api.inferModelCapability('wan2.7-t2v'), 'video')
+  assert.equal(api.inferModelCapability('gemini-2.5-flash'), 'text')
+  assert.equal(api.inferModelCapability('gpt-5.4'), 'text')
+  assert.equal(api.inferModelCapability('nano-banana-pro'), 'image')
 })
 
 test('GPT Image 2 preserves exact portrait ratios while legacy image models retain compatible buckets', () => {
@@ -136,4 +139,36 @@ test('HFSY Nano Banana reads Gemini fileData.fileUri generation results', () => 
     }],
   }
   assert.deepEqual(api.extractImageUrlsFromAdminResult(JSON.stringify(payload)), ['https://www.qixinai.net/generated/nano-banana.png'])
+})
+
+test('GRS AI model catalogue uses the host-root getModelList control endpoint', async (t) => {
+  let calledUrl = ''
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calledUrl = String(url)
+    assert.equal(init?.method, 'POST')
+    return Response.json({
+      code: 0,
+      data: {
+        list: [
+          { name: 'gpt-image-2', desc: 'image model', maintenance: '' },
+          { name: 'gpt-5.4', desc: 'text model', maintenance: '' },
+          { name: 'offline-model', maintenance: '维护中' },
+        ],
+      },
+    })
+  })
+  const models = await api.fetchRemoteModels({ baseUrl: 'https://grsai.dakka.com.cn/v1', apiKey: 'test-key' })
+  assert.equal(calledUrl, 'https://grsai.dakka.com.cn/client/serverGrsai/getModelList')
+  assert.deepEqual(models.map((model) => model.id), ['gpt-5.4', 'gpt-image-2'])
+  assert.equal(models.find((model) => model.id === 'gpt-image-2')?.capability, 'image')
+  assert.equal(models.find((model) => model.id === 'gpt-5.4')?.capability, 'text')
+  assert.equal(api.isModelAutoEnabled(models.find((model) => model.id === 'gpt-5.4')), true)
+})
+
+test('GRS AI model catalogue fails clearly when getModelList is unavailable', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('<html></html>', { status: 200, headers: { 'content-type': 'text/html' } }))
+  await assert.rejects(
+    () => api.fetchRemoteModels({ baseUrl: 'https://grsaiapi.com/v1', apiKey: 'test-key' }),
+    /GRS AI 当前模型目录不可用/,
+  )
 })

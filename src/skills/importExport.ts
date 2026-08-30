@@ -19,6 +19,7 @@ export async function importSkillFile(file: File): Promise<SkillManifest> {
   try { value = JSON.parse(await file.text()) } catch { throw new Error(`${file.name} 不是有效 JSON`) }
   rejectForbidden(value)
   const parsed = parseSkillManifest(value)
+  if (parsed.kind === 'composite') throw new Error(`${file.name} 是复合 Skill，当前技能库已不再收录`)
   const now = Date.now()
   return parseSkillManifest({
     ...parsed, id: parsed.source === 'official' ? `user.${crypto.randomUUID()}` : parsed.id,

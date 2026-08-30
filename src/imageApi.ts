@@ -921,13 +921,30 @@ const VENDOR_MODEL_SUPPLEMENTS: VendorModelSupplement[] = [
   { match: isGrsaiBaseUrl, catalogOnly: true },
 ]
 
-const GRSAI_CATALOG_PROXY_PATH = '/api/model-catalog?provider=grsai'
-
-async function fetchGrsaiProxyCatalog(): Promise<RemoteModel[] | null> {
+/** GRS exposes the live catalogue at a host-root control path, not OpenAI `/v1/models`. */
+async function fetchGrsaiLiveCatalog(settings: Pick<ApiRequestSettings, 'baseUrl'>): Promise<RemoteModel[] | null> {
   try {
-    const response = await fetch(GRSAI_CATALOG_PROXY_PATH)
-    if (!response.ok || !/application\/json/i.test(response.headers.get('content-type') ?? '')) return null
-    const models = parseRemoteModelCatalog(await response.json() as unknown)
+    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/serverGrsai/getModelList'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: '{}',
+    })
+    if (!response.ok) return null
+    const payload = await response.json() as { code?: unknown; data?: { list?: unknown[] } }
+    if (payload.code !== 0 || !Array.isArray(payload.data?.list)) return null
+    const models = parseRemoteModelCatalog(payload.data.list.map((row) => {
+      if (!row || typeof row !== 'object') return null
+      const item = row as Record<string, unknown>
+      const id = String(item.name ?? item.model ?? item.id ?? '').trim()
+      if (!id) return null
+      const maintenance = typeof item.maintenance === 'string' ? item.maintenance.trim() : ''
+      return {
+        id,
+        name: id,
+        available: !maintenance,
+        desc: typeof item.desc === 'string' ? item.desc : undefined,
+      }
+    }).filter(Boolean))
     return models.length ? models : null
   } catch {
     return null
@@ -957,11 +974,10 @@ export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'base
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings)
   const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
-  // GRS has no standard OpenAI-compatible model endpoint. Do not resurrect a
-  // static fallback when its live proxy is unavailable: stale entries are worse
-  // than showing a retriable refresh error.
+  // GRS has no standard OpenAI-compatible model endpoint. Prefer the live
+  // host-root catalogue; do not fall back to a static list when it fails.
   if (supplement?.catalogOnly) {
-    const models = await fetchGrsaiProxyCatalog()
+    const models = await fetchGrsaiLiveCatalog(settings)
     if (!models) throw new Error('GRS AI 当前模型目录不可用，请稍后重新刷新')
     return models
   }

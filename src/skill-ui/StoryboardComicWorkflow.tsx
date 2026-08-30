@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { ArrowLeft, Check, ChevronDown, ChevronRight, Download, FileImage, FileUp, FolderArchive, GripHorizontal, Grid3X3, ImagePlus, Layers3, LoaderCircle, PackageCheck, Plus, Settings2, Sparkles, Trash2, WandSparkles, X } from 'lucide-react'
 import {
   COMIC_ASSET_LABELS, COMIC_LAYOUTS, COMIC_STYLE_LABELS, buildAssetPlan, buildAssetRequests, buildCompositionRequests, buildSketchRequests,
-  createComicSection, createComicWorkflow, estimatePanelCount, normalizeComicWorkflow, type ComicAssetCategory, type ComicGeneratedResult, type ComicGenerationRequest,
+  createComicSection, createComicWorkflow, estimatePanelCount, forkComicWorkflowAtStage, normalizeComicWorkflow, type ComicAssetCategory, type ComicGeneratedResult, type ComicGenerationRequest,
   type ComicComposition, type ComicLayout, type ComicStyle, type ComicWorkflowState,
 } from '../skills/storyboard'
 import { GlassSelect } from './GlassSelect'
@@ -142,10 +142,16 @@ export function StoryboardComicWorkflow({ open, initialContent, initialState, re
   const currentStage = stageIndex(state.status)
   const reviewingPreviousStage = viewStage < currentStage
   const running = busy || generating
+  const isNiuniu = state.profile === 'niuniu' || state.skillKey.includes('niuniu-comic')
   const patch = (value: Partial<ComicWorkflowState>) => {
     if (running) return
     if (!reviewingPreviousStage) { save({ ...state, ...value }); return }
-    // 回看时首次修改即 Fork 任务：旧任务可继续，新任务从修改步骤重新推进。
+    // 牛牛工厂：回退编辑就地清空后续步骤，不新建画布分支节点。
+    if (isNiuniu) {
+      save(forkComicWorkflowAtStage({ ...state, ...value }, STEPS[viewStage].key, state.workflowNodeId ?? ''))
+      return
+    }
+    // 其他漫画工作流：回看时首次修改仍 Fork 任务，旧任务可继续。
     save(onFork({ ...state, ...value, status: STEPS[viewStage].key }))
   }
   const panelCount = estimatePanelCount(state)
@@ -153,7 +159,6 @@ export function StoryboardComicWorkflow({ open, initialContent, initialState, re
   const completedAssetTasks = state.assetTasks.filter((task) => task.status === 'completed')
   const layoutReferences = state.layoutReferences?.length ? state.layoutReferences : state.layoutReference ? [state.layoutReference] : []
   const groupedAssets = useMemo(() => (Object.keys(COMIC_ASSET_LABELS) as ComicAssetCategory[]).map((category) => ({ category, tasks: state.assetTasks.filter((task) => task.category === category) })), [state.assetTasks])
-  const isNiuniu = state.profile === 'niuniu' || state.skillKey.includes('niuniu-comic')
 
   if (!open) return null
 
@@ -308,7 +313,7 @@ export function StoryboardComicWorkflow({ open, initialContent, initialState, re
 
         <main ref={mainRef} className={`comic-studio-main ${reviewingPreviousStage ? 'is-reviewing' : ''}`}>
           <fieldset disabled={running} style={{ border: 0, margin: 0, minWidth: 0, padding: 0 }}>
-          {reviewingPreviousStage && <div className="comic-reviewing-banner"><span>正在查看第 {viewStage + 1} 步</span><small>引导式 Skill 仍停留在第 {currentStage + 1} 步，当前工作不会中断。</small><button type="button" onClick={() => setViewStage(currentStage)}>返回进行中的步骤</button></div>}
+          {reviewingPreviousStage && <div className="comic-reviewing-banner"><span>正在查看第 {viewStage + 1} 步</span><small>{isNiuniu ? '在此修改会就地回退后续步骤；生成结果直接落在画布上，不建连线分支。' : '引导式 Skill 仍停留在第 ' + (currentStage + 1) + ' 步，当前工作不会中断。'}</small><button type="button" onClick={() => setViewStage(currentStage)}>返回进行中的步骤</button></div>}
           {viewStage === 0 && <>
             <div className="comic-studio-title"><small>第 1 步</small><h3>把脚本变成不会散架的区块</h3><p>每个区块是一组必须连续呈现的信息。你可以增删区块和要点，系统不会擅自重排或编号。</p>{isNiuniu && <div className="comic-invoke-actions"><button className="comic-demo-button" type="button" onClick={() => invokeFileRef.current?.click()}><FileUp size={13}/>导入调用词 TXT</button><button className="comic-demo-button" type="button" onClick={() => setBriefOpen(true)}><WandSparkles size={13}/>一句话写需求</button><input hidden ref={invokeFileRef} type="file" accept=".txt,text/plain" onChange={(event) => { void importInvokeText(event.target.files?.[0]); event.currentTarget.value = '' }}/>{importNotice && <span>{importNotice}</span>}</div>}</div>
             <div className="comic-studio-form-grid"><label><span>项目名称</span><input value={state.projectName} onChange={(e) => patch({ projectName: e.target.value })}/></label><label><span>主题 / 脚本</span><input value={state.theme} placeholder="例如：SPX 与 VIX 入门" onChange={(e) => patch({ theme: e.target.value })}/></label></div>

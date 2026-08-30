@@ -4,8 +4,12 @@ export type CatalogModel = { id: string; name: string; capability: ModelCapabili
 
 export function inferModelCapability(modelId: string): ModelCapability {
   if (/audio|suno|tts|voice|speech|music/i.test(modelId)) return 'audio'
+  // Image markers must run before generic gpt/gemini chat families.
   if (/image|seedream|imagen|flux|banana|dall-e|gpt-image/i.test(modelId)) return 'image'
   if (/video|seedance|sora|veo|kling|runway|hailuo|happyhorse|wan(?:2\.\d)?|(?:^|[-_.])sd-2(?:[.\d-]|$)|(?:^|[-_.])(?:t2v|i2v|r2v)(?:[-_.]|$)/i.test(modelId)) return 'video'
+  // Providers often omit modality metadata for chat models; classify known LLM families as text.
+  if (/(?:^|[-_.\/])(?:gpt|o[1-9]|claude|gemini|deepseek|qwen|glm|moonshot|kimi|mistral|llama|grok|command-r)(?:[-_.\/]|$)/i.test(modelId)
+    || /chat|instruct|completion/i.test(modelId)) return 'text'
   return 'unknown'
 }
 

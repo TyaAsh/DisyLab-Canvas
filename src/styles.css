@@ -367,9 +367,23 @@ button { border: 0; cursor: pointer; }
 .project-settings-popover > textarea { width: 100%; min-height: 86px; resize: vertical; padding: 11px; border: 1px solid var(--line); border-radius: 10px; outline: 0; color: var(--ink); background: color-mix(in srgb, var(--canvas) 58%, transparent); font: 500 10px/1.65 'Manrope', 'PingFang SC', sans-serif; }
 .project-settings-popover > textarea:focus { border-color: color-mix(in srgb, var(--accent) 52%, var(--line)); box-shadow: 0 0 0 3px var(--accent-soft); }
 
-.top-right-cluster {
+.top-right-chrome {
+  position: absolute;
   top: 16px;
   right: 16px;
+  z-index: 230;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  pointer-events: none;
+}
+.top-right-chrome > .floating-chrome {
+  position: relative;
+  top: auto;
+  right: auto;
+  pointer-events: auto;
+}
+.top-right-cluster {
   min-height: 48px;
   padding: 5px;
   border-radius: 15px;
@@ -404,8 +418,7 @@ button { border: 0; cursor: pointer; }
 .chrome-icon-button { width: 36px; padding: 0; color: var(--muted); }
 .api-chip { padding: 0 11px; font-size: 11px; font-weight: 700; }
 .performance-monitor-control { position: relative; z-index: 31; display: inline-flex; }
-.performance-monitor-dock { top: 16px; right: 174px; min-height: 46px; padding: 5px; border-radius: 14px; }
-.top-right-cluster:has(.credits-control) + .performance-monitor-dock { right: 270px; }
+.performance-monitor-dock { min-height: 46px; padding: 5px; border-radius: 14px; }
 .performance-monitor-chip { height: 36px; padding: 0 10px; border-radius: 10px; display: inline-flex; align-items: center; gap: 7px; color: var(--muted); background: transparent; font-size: 10px; font-weight: 760; transition: color .18s ease, background .18s ease, transform .18s ease; }
 .performance-monitor-chip:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 8%, transparent); }
 .performance-monitor-chip:active { transform: scale(.97); }
@@ -3865,9 +3878,7 @@ body.is-resizing-node-editor { cursor: ns-resize !important; user-select: none !
 
 @media (max-width: 720px) {
   .top-left-cluster { left: 10px; top: 10px; }
-  .top-right-cluster { right: 10px; top: 10px; }
-  .performance-monitor-dock { top: 10px; right: 168px; }
-  .top-right-cluster:has(.credits-control) + .performance-monitor-dock { right: 264px; }
+  .top-right-chrome { right: 10px; top: 10px; gap: 8px; }
   .brand-word, .cluster-divider, .canvas-title-chip { display: none; }
   .tool-rail { left: 10px; }
   .help-launcher { left: 14px; bottom: 14px; }

@@ -5957,7 +5957,7 @@ function App() {
   const appendCanvasGraphAtOrigin = async (
     origin: { projectId: string; canvasId: string },
     node: CanvasNode,
-    edge: Edge,
+    edge?: Edge,
   ) => {
     const switchBarrier = canvasSwitchBarrierRef.current
     if (switchBarrier && switchBarrier.origin.projectId === origin.projectId && switchBarrier.origin.canvasId === origin.canvasId) {
@@ -5965,7 +5965,7 @@ function App() {
     }
     if (activeProjectIdRef.current === origin.projectId && activeCanvasIdRef.current === origin.canvasId) {
       setNodes((current) => current.some((item) => item.id === node.id) ? current : [...current, node])
-      setEdges((current) => current.some((item) => item.id === edge.id) ? current : [...current, edge])
+      if (edge) setEdges((current) => current.some((item) => item.id === edge.id) ? current : [...current, edge])
       return true
     }
     const canvas = await loadWorkspaceCanvas(origin.canvasId)
@@ -5973,9 +5973,11 @@ function App() {
     const nextNodes = (canvas.nodes as CanvasNode[]).some((item) => item.id === node.id)
       ? canvas.nodes as CanvasNode[]
       : [...canvas.nodes as CanvasNode[], node]
-    const nextEdges = (canvas.edges as Edge[]).some((item) => item.id === edge.id)
-      ? canvas.edges as Edge[]
-      : [...canvas.edges as Edge[], edge]
+    const nextEdges = edge
+      ? ((canvas.edges as Edge[]).some((item) => item.id === edge.id)
+        ? canvas.edges as Edge[]
+        : [...canvas.edges as Edge[], edge])
+      : canvas.edges as Edge[]
     const updatedAt = new Date().toISOString()
     await saveWorkspaceCanvas({ ...canvas, nodes: nextNodes, edges: nextEdges, updatedAt })
     setWorkspaceCanvases((current) => current.map((item) => item.id === origin.canvasId && item.projectId === origin.projectId
@@ -6762,7 +6764,9 @@ function App() {
     (node) => node.id === activeEditorNodeId && node.data.kind === 'text',
   )
   const activeImageNode = nodes.find(
-    (node) => node.id === activeImageNodeId && node.data.kind === 'upload' && Boolean(node.data.imageUrl),
+    (node) => node.id === activeImageNodeId
+      && (node.data.kind === 'upload' || Boolean(node.data.comicGenerationRequestId))
+      && Boolean(node.data.imageUrl),
   )
   const activeGenerationNode = nodes.find(
     (node) => node.id === activeGenerationNodeId && node.data.kind === 'image',
@@ -7424,11 +7428,7 @@ function App() {
   }
   const launchSkillFromFactory = (skill: SkillManifest) => {
     setSkillFactoryOpen(false)
-    if (skill.kind === 'composite') {
-      setActiveCompositeSkill(skill)
-      setToastMessage(`已打开复合工作台：${skill.name}`)
-      return
-    }
+    if (skill.kind === 'composite') return
     const center = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     if (skill.kind === 'storyboard_comic') {
       const nodeId = createNode('image', { x: center.x - 170, y: center.y - 210 })
@@ -9600,6 +9600,9 @@ function App() {
     const generationOrigin = { projectId: activeProjectId, canvasId: activeCanvasId }
     const nodeId = activeGenerationNode.id
     const workflowNodeId = activeGenerationNode.data.comicWorkflow?.workflowNodeId ?? activeGenerationNode.data.comicWorkflowNodeId ?? nodeId
+    const isNiuniuComic = activeGenerationNode.data.comicWorkflow?.profile === 'niuniu'
+      || Boolean(activeGenerationNode.data.comicWorkflow?.skillKey?.includes('niuniu-comic'))
+      || Boolean(activeGenerationNode.data.activeSkillId?.includes('niuniu-comic'))
     const sourcePosition = { ...activeGenerationNode.position }
     const sourceWidth = activeGenerationNode.measured?.width || Number(activeGenerationNode.style?.width) || 320
     const completed: ComicGeneratedResult[] = []
@@ -9636,10 +9639,11 @@ function App() {
         const variant = variants?.[0]
         if (!variant) continue
         const availableOriginNodes = [...originNodes, ...createdOutputNodes]
-        const recoveredParentNodeId = request.meta.parentRequestId
+        // 牛牛：结果直接落在工厂节点旁，不沿父结果节点串连。
+        const recoveredParentNodeId = !isNiuniuComic && request.meta.parentRequestId
           ? availableOriginNodes.find((node) => node.data.comicGenerationRequestId === request.meta.parentRequestId)?.id
           : undefined
-        const requestedParentNodeId = request.meta.parentNodeId ?? recoveredParentNodeId
+        const requestedParentNodeId = isNiuniuComic ? nodeId : (request.meta.parentNodeId ?? recoveredParentNodeId)
         const parentNodeId = requestedParentNodeId && availableOriginNodes.some((node) => node.id === requestedParentNodeId) ? requestedParentNodeId : nodeId
         const parentNode = availableOriginNodes.find((node) => node.id === parentNodeId)
         const parentPosition = parentNode?.position ?? sourcePosition
@@ -9657,7 +9661,9 @@ function App() {
           },
           style: outputSize,
           data: {
-            kind: 'image',
+            // Workflow results are finished canvas images, not generation
+            // editors. Keep workflow metadata only for recovery/grouping.
+            kind: 'upload',
             title: comicOutputTitle(request),
             body: visiblePrompt,
             promptText: visiblePrompt,
@@ -9685,7 +9691,9 @@ function App() {
           },
         }
         createdOutputNodes.push(outputNode)
-        const outputEdge: Edge = { id: `edge-${crypto.randomUUID()}`, source: parentNodeId, target: outputNodeId, type: 'luminous' }
+        const outputEdge = isNiuniuComic
+          ? undefined
+          : { id: `edge-${crypto.randomUUID()}`, source: parentNodeId, target: outputNodeId, type: 'luminous' } as Edge
         const appendedToVisibleCanvas = await appendCanvasGraphAtOrigin(generationOrigin, outputNode, outputEdge)
         if (appendedToVisibleCanvas) window.requestAnimationFrame(() => updateNodeInternals(outputNodeId))
         completed.push({ id: variant.id, requestId: request.id, url: variant.url, mediaId: variant.mediaId, fileName: variant.fileName, createdAt: variant.createdAt, canvasNodeId: outputNodeId })
@@ -12194,7 +12202,11 @@ function App() {
               return item.selected === selected ? item : { ...item, selected }
             }))
             setSelectedNodeIds([node.id])
-            const linkedWorkflowNodeId = node.data.comicWorkflow?.workflowNodeId ?? node.data.comicWorkflowNodeId ?? (node.data.comicWorkflow ? node.id : undefined)
+            // Only the factory anchor opens the workflow. Generated skeletons,
+            // compositions and assets behave as ordinary image nodes.
+            const linkedWorkflowNodeId = node.data.comicWorkflow
+              ? (node.data.comicWorkflow.workflowNodeId ?? node.id)
+              : undefined
             const linkedWorkflowNode = linkedWorkflowNodeId ? nodes.find((item) => item.id === linkedWorkflowNodeId && item.data.comicWorkflow) : undefined
             if (linkedWorkflowNode) {
               setActiveEditorNodeId(null)
@@ -12209,8 +12221,9 @@ function App() {
             const keepUploadedPreview = (previewOnlyNodeUntilRef.current.get(node.id) ?? 0) > Date.now()
             previewOnlyNodeUntilRef.current.delete(node.id)
             setActiveEditorNodeId(node.data.kind === 'text' ? node.id : null)
-            setActiveImageNodeId(!keepUploadedPreview && node.data.kind === 'upload' && node.data.imageUrl ? node.id : null)
-            setActiveGenerationNodeId(!keepUploadedPreview && node.data.kind === 'image' ? node.id : null)
+            const isComicOutputImage = Boolean(node.data.comicGenerationRequestId && node.data.imageUrl)
+            setActiveImageNodeId(!keepUploadedPreview && ((node.data.kind === 'upload' && node.data.imageUrl) || isComicOutputImage) ? node.id : null)
+            setActiveGenerationNodeId(!keepUploadedPreview && node.data.kind === 'image' && !isComicOutputImage ? node.id : null)
             const isLocalVideoAsset = node.data.kind === 'video' && (node.data.videoSource === 'local-upload' || (node.data.status === '已上传' && Boolean(node.data.videoUrl) && !node.data.videoMediaId && !node.data.videoGeneratedAt))
             setActiveVideoNodeId(!keepUploadedPreview && node.data.kind === 'video' && !isLocalVideoAsset ? node.id : null)
             window.requestAnimationFrame(() => measureNodeOverlay(node.id))
@@ -13411,101 +13424,102 @@ function App() {
           }}
         />
 
-        <div className="floating-chrome top-right-cluster">
-          <button
-            type="button"
-            className="chrome-icon-button"
-            aria-label="导入 / 导出"
-            title="导入 / 导出项目"
-            disabled={transferBusy}
-            onClick={() => openTransferDialog('project-replace')}
-          >
-            <ArrowUpDown size={16} />
-          </button>
-          {displayedProviderCredits && <div
-            className="credits-control"
-            onMouseEnter={() => {
-              if (creditsPopoverCloseTimerRef.current !== null) window.clearTimeout(creditsPopoverCloseTimerRef.current)
-              setCreditsPopoverOpen(true)
-            }}
-            onMouseLeave={() => {
-              if (creditsPopoverCloseTimerRef.current !== null) window.clearTimeout(creditsPopoverCloseTimerRef.current)
-              creditsPopoverCloseTimerRef.current = window.setTimeout(() => setCreditsPopoverOpen(false), 140)
-            }}
-            onFocusCapture={() => setCreditsPopoverOpen(true)}
-            onBlurCapture={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget as globalThis.Node | null)) setCreditsPopoverOpen(false)
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.preventDefault()
-                setCreditsPopoverOpen(false)
-              }
-            }}
-          >
+        <div className="top-right-chrome">
+          <div className="floating-chrome performance-monitor-dock">
+            <div className="performance-monitor-control">
+              <button type="button" className={`performance-monitor-chip ${performanceModeActive ? 'is-active' : ''}`} aria-label="性能监控" aria-expanded={performanceMonitorOpen} aria-controls="performance-monitor-panel" onClick={() => setPerformanceMonitorOpen((open) => !open)}>
+                <Activity size={15} /><span>性能监控</span><i className="performance-monitor-pulse" aria-hidden="true" />
+              </button>
+              <AnimatePresence>
+                {performanceMonitorOpen && <motion.section id="performance-monitor-panel" className="performance-monitor-panel" aria-label="画布性能监控详情" initial={{ opacity: 0, y: -7, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -5, scale: .98 }} transition={{ duration: .16, ease: 'easeOut' }}>
+                  <header><span><Activity size={15} /><strong>性能监控</strong></span><button type="button" aria-label="关闭性能监控" onClick={() => setPerformanceMonitorOpen(false)}><X size={15} /></button></header>
+                  <div className="performance-monitor-fps"><b>{performanceFps}</b><span>FPS</span><em className={performanceModeActive ? 'is-protected' : ''}>{performanceStatus}</em></div>
+                  <div className="performance-monitor-load"><span><b>画布负载</b><small>{canvasLoad}% · {nodes.length} 节点 / {edges.length} 连线</small></span><i><u style={{ width: `${canvasLoad}%` }} /></i></div>
+                  <label className="performance-mode-switch"><span><b>手动性能模式</b><small>{automaticPerformanceMode ? '画布负载偏高，自动保护已生效' : '减少不可见元素与高开销光效'}</small></span><input type="checkbox" checked={manualPerformanceMode} onChange={(event) => setManualPerformanceMode(event.target.checked)} /><i aria-hidden="true" /></label>
+                  <footer>自动阈值：16 个节点或 28 条连线</footer>
+                </motion.section>}
+              </AnimatePresence>
+            </div>
+          </div>
+          <div className="floating-chrome top-right-cluster">
             <button
               type="button"
-              className="credits-chip"
-              onClick={openApiSettings}
-              aria-label="查看各厂商余额"
-              aria-haspopup="listbox"
-              aria-expanded={creditsPopoverOpen}
-              aria-controls="provider-credits-popover"
-              title={creditsTooltip}
+              className="chrome-icon-button"
+              aria-label="导入 / 导出"
+              title="导入 / 导出项目"
+              disabled={transferBusy}
+              onClick={() => openTransferDialog('project-replace')}
             >
-              <WalletCards size={15} />
-              <AnimatePresence mode="wait" initial={false}>
-                <motion.span key={displayedProviderCreditEntry?.key ?? 'credit'} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: .28, ease: 'easeOut' }}>
-                  {formatProviderCreditAmount(displayedProviderCredits)}{formatProviderCreditUnit(displayedProviderCredits) ? ` ${formatProviderCreditUnit(displayedProviderCredits)}` : ''}
-                </motion.span>
+              <ArrowUpDown size={16} />
+            </button>
+            {displayedProviderCredits && <div
+              className="credits-control"
+              onMouseEnter={() => {
+                if (creditsPopoverCloseTimerRef.current !== null) window.clearTimeout(creditsPopoverCloseTimerRef.current)
+                setCreditsPopoverOpen(true)
+              }}
+              onMouseLeave={() => {
+                if (creditsPopoverCloseTimerRef.current !== null) window.clearTimeout(creditsPopoverCloseTimerRef.current)
+                creditsPopoverCloseTimerRef.current = window.setTimeout(() => setCreditsPopoverOpen(false), 140)
+              }}
+              onFocusCapture={() => setCreditsPopoverOpen(true)}
+              onBlurCapture={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as globalThis.Node | null)) setCreditsPopoverOpen(false)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  setCreditsPopoverOpen(false)
+                }
+              }}
+            >
+              <button
+                type="button"
+                className="credits-chip"
+                onClick={openApiSettings}
+                aria-label="查看各厂商余额"
+                aria-haspopup="listbox"
+                aria-expanded={creditsPopoverOpen}
+                aria-controls="provider-credits-popover"
+                title={creditsTooltip}
+              >
+                <WalletCards size={15} />
+                <AnimatePresence mode="wait" initial={false}>
+                  <motion.span key={displayedProviderCreditEntry?.key ?? 'credit'} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: .28, ease: 'easeOut' }}>
+                    {formatProviderCreditAmount(displayedProviderCredits)}{formatProviderCreditUnit(displayedProviderCredits) ? ` ${formatProviderCreditUnit(displayedProviderCredits)}` : ''}
+                  </motion.span>
+                </AnimatePresence>
+              </button>
+              <AnimatePresence>
+                {creditsPopoverOpen && <motion.div id="provider-credits-popover" className="credits-popover" role="listbox" aria-label="各 API 厂商余额" initial={{ opacity: 0, y: -5, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -3, scale: .98 }} transition={{ duration: .14, ease: 'easeOut' }}>
+                  <header><strong>API 余额</strong><small>悬停查看 · 点击常亮</small></header>
+                  {availableProviderCredits.map(({ key, connectionName, credits }) => <button
+                    key={key}
+                    type="button"
+                    role="option"
+                    aria-selected={key === displayedProviderCreditEntry?.key}
+                    className={`credits-provider-row ${key === displayedProviderCreditEntry?.key ? 'is-pinned' : ''}`}
+                    onClick={() => {
+                      setPinnedCreditConnectionId(key)
+                      setCreditsPopoverOpen(true)
+                    }}
+                    title={`点击让此厂商余额常亮${formatProviderCreditView(credits).original && usdToCnyRate ? ` · ${formatProviderCreditView(credits).original} · 汇率 ${usdToCnyRate.rate.toFixed(4)}（${usdToCnyRate.date}）` : ''}`}
+                  >
+                    <span className="credits-provider-copy"><strong>{credits.provider}</strong><small>{connectionName}</small></span>
+                    <span className="credits-provider-value"><b>{formatProviderCreditAmount(credits)}</b>{formatProviderCreditUnit(credits) && <small>{formatProviderCreditUnit(credits)}</small>}</span>
+                    <span className="credits-provider-state" aria-hidden="true">{key === displayedProviderCreditEntry?.key ? '常亮' : '选择'}</span>
+                  </button>)}
+                </motion.div>}
               </AnimatePresence>
+            </div>}
+            <button
+              ref={apiButtonRef}
+              className={`api-chip ${apiConfigured ? 'configured' : ''}`}
+              onClick={openApiSettings}
+            >
+              <KeyRound size={15} />
+              {apiConfigured ? 'API 已配置' : '配置 API'}
             </button>
-            <AnimatePresence>
-              {creditsPopoverOpen && <motion.div id="provider-credits-popover" className="credits-popover" role="listbox" aria-label="各 API 厂商余额" initial={{ opacity: 0, y: -5, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -3, scale: .98 }} transition={{ duration: .14, ease: 'easeOut' }}>
-                <header><strong>API 余额</strong><small>悬停查看 · 点击常亮</small></header>
-                {availableProviderCredits.map(({ key, connectionName, credits }) => <button
-                  key={key}
-                  type="button"
-                  role="option"
-                  aria-selected={key === displayedProviderCreditEntry?.key}
-                  className={`credits-provider-row ${key === displayedProviderCreditEntry?.key ? 'is-pinned' : ''}`}
-                  onClick={() => {
-                    setPinnedCreditConnectionId(key)
-                    setCreditsPopoverOpen(true)
-                  }}
-                  title={`点击让此厂商余额常亮${formatProviderCreditView(credits).original && usdToCnyRate ? ` · ${formatProviderCreditView(credits).original} · 汇率 ${usdToCnyRate.rate.toFixed(4)}（${usdToCnyRate.date}）` : ''}`}
-                >
-                  <span className="credits-provider-copy"><strong>{credits.provider}</strong><small>{connectionName}</small></span>
-                  <span className="credits-provider-value"><b>{formatProviderCreditAmount(credits)}</b>{formatProviderCreditUnit(credits) && <small>{formatProviderCreditUnit(credits)}</small>}</span>
-                  <span className="credits-provider-state" aria-hidden="true">{key === displayedProviderCreditEntry?.key ? '常亮' : '选择'}</span>
-                </button>)}
-              </motion.div>}
-            </AnimatePresence>
-          </div>}
-          <button
-            ref={apiButtonRef}
-            className={`api-chip ${apiConfigured ? 'configured' : ''}`}
-            onClick={openApiSettings}
-          >
-            <KeyRound size={15} />
-            {apiConfigured ? 'API 已配置' : '配置 API'}
-          </button>
-        </div>
-
-        <div className="floating-chrome performance-monitor-dock">
-          <div className="performance-monitor-control">
-            <button type="button" className={`performance-monitor-chip ${performanceModeActive ? 'is-active' : ''}`} aria-label="性能监控" aria-expanded={performanceMonitorOpen} aria-controls="performance-monitor-panel" onClick={() => setPerformanceMonitorOpen((open) => !open)}>
-              <Activity size={15} /><span>性能监控</span><i className="performance-monitor-pulse" aria-hidden="true" />
-            </button>
-            <AnimatePresence>
-              {performanceMonitorOpen && <motion.section id="performance-monitor-panel" className="performance-monitor-panel" aria-label="画布性能监控详情" initial={{ opacity: 0, y: -7, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -5, scale: .98 }} transition={{ duration: .16, ease: 'easeOut' }}>
-                <header><span><Activity size={15} /><strong>性能监控</strong></span><button type="button" aria-label="关闭性能监控" onClick={() => setPerformanceMonitorOpen(false)}><X size={15} /></button></header>
-                <div className="performance-monitor-fps"><b>{performanceFps}</b><span>FPS</span><em className={performanceModeActive ? 'is-protected' : ''}>{performanceStatus}</em></div>
-                <div className="performance-monitor-load"><span><b>画布负载</b><small>{canvasLoad}% · {nodes.length} 节点 / {edges.length} 连线</small></span><i><u style={{ width: `${canvasLoad}%` }} /></i></div>
-                <label className="performance-mode-switch"><span><b>手动性能模式</b><small>{automaticPerformanceMode ? '画布负载偏高，自动保护已生效' : '减少不可见元素与高开销光效'}</small></span><input type="checkbox" checked={manualPerformanceMode} onChange={(event) => setManualPerformanceMode(event.target.checked)} /><i aria-hidden="true" /></label>
-                <footer>自动阈值：16 个节点或 28 条连线</footer>
-              </motion.section>}
-            </AnimatePresence>
           </div>
         </div>
 
@@ -13550,14 +13564,6 @@ function App() {
             onClick={() => setSkillFactoryOpen(true)}
           >
             <Factory size={18} />
-          </button>
-          <button
-            className={workflowTemplateOpen ? 'is-active' : ''}
-            aria-label="工作流"
-            data-tooltip="工作流"
-            onClick={() => setWorkflowTemplateOpen(true)}
-          >
-            <Shapes size={18} />
           </button>
           <button
             aria-label="资产库"

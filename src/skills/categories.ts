@@ -10,7 +10,6 @@ export type SkillCategory = {
 }
 
 const STORAGE_KEY = 'disylab-skill-categories-v1'
-const ORDER_MIGRATION_KEY = 'disylab-skill-categories-composite-last-v1'
 
 export const defaultSkillCategories: SkillCategory[] = [
   { id: 'all', label: '全部 Skill', skillKeys: [], system: true },
@@ -18,7 +17,6 @@ export const defaultSkillCategories: SkillCategory[] = [
   { id: 'image', label: '图像创作', kind: 'image', skillKeys: [], system: true },
   { id: 'video', label: '视频制作', kind: 'video', skillKeys: [], system: true },
   { id: 'text', label: '文本与策划', kind: 'text', skillKeys: [], system: true },
-  { id: 'composite', label: '复合 Skill', kind: 'composite', skillKeys: [], system: true },
 ]
 
 export function loadSkillCategories(): SkillCategory[] {
@@ -29,15 +27,9 @@ export function loadSkillCategories(): SkillCategory[] {
     const defaultsById = new Map(defaultSkillCategories.map((item) => [item.id, item]))
     const restored = categories.map((item) => defaultsById.has(item.id) ? { ...defaultsById.get(item.id)!, ...item } : item)
     const missing = defaultSkillCategories.filter((item) => !restored.some((current) => current.id === item.id))
-    let ordered = [...restored, ...missing]
+    let ordered = [...restored, ...missing].filter((item) => item.id !== 'composite' && item.kind !== 'composite')
     const all = ordered.find((item) => item.id === 'all') ?? defaultSkillCategories[0]
     ordered = [all, ...ordered.filter((item) => item.id !== 'all')]
-    if (localStorage.getItem(ORDER_MIGRATION_KEY) !== 'done') {
-      const composite = ordered.find((item) => item.id === 'composite')
-      ordered = [...ordered.filter((item) => item.id !== 'composite'), ...(composite ? [composite] : [])]
-      localStorage.setItem(ORDER_MIGRATION_KEY, 'done')
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(ordered))
-    }
     return ordered
   } catch {
     return defaultSkillCategories
