@@ -1,0 +1,43 @@
+node_modules/
+dist/
+.netlify/
+.netlify-appdata/
+.netlify-config/
+.netlify-npm-cache/
+.tmp/
+.wrangler/
+coverage/
+*.tsbuildinfo
+disylab-beta-publish/
+disylab-online-debug/
+.env
+.env.*
+!.env.example
+*.local
+*.log
+.DS_Store
+Thumbs.db
+
+# Local planning/session notes
+task_plan.md
+findings.md
+progress.md
+
+# Local-only project notes
+docs/Disy-上线部署指南.md
+docs/Disy-样式与文案修改指南.md
+docs/Disy无限可能-项目实施文档.md
+HANDOFF-*
+HANDOFF_*
+
+# APIYI integration scratch (not secrets, just session artifacts — keep out of git)
+apiyi_pricing.json
+npm_install.log
+
+# WorkBuddy / Trae / Agents — local tool caches, not for public repos
+.workbuddy-ai/
+.workbuddy/
+.trae/
+.agents/
+.formal-publish/
+skills-lock.json

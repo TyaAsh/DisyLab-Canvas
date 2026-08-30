@@ -1,0 +1,2334 @@
+/*!
+ * Copyright (c) 2026 DisyLab. All rights reserved.
+ * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
+ * Unauthorized commercial use, redistribution, white-labeling, relicensing,
+ * or removal of this copyright notice is prohibited.
+ * Repository: https://github.com/TyaAsh/DisyLab-Canvas
+ * SPDX-FileCopyrightText: 2026 DisyLab
+ * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
+ */
+import type { ModelCapability } from './store'
+import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
+import { inferModelCapability, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
+
+export { inferModelCapability } from './modelCatalog'
+
+export type ApiRequestSettings = {
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
+export type RemoteModel = {
+  id: string
+  name: string
+  capability: ModelCapability
+}
+
+export type GeneratedImage = {
+  url: string
+  revisedPrompt?: string
+}
+
+export type GeneratedVideo = { blob: Blob; taskId: string; progress: number; sourceUrl?: string }
+export type GeneratedAudio = { blob: Blob; taskId: string; progress: number; sourceUrl?: string; payload: unknown }
+export type AudioGenerationOptions = {
+  prompt: string
+  referenceAudioUrl?: string
+  referenceImageUrl?: string
+  voice?: string
+  language?: string
+  duration?: number
+  extra?: Record<string, unknown>
+  signal?: AbortSignal
+  onProgress?: (progress: number, status: string) => void
+  onTaskId?: (taskId: string) => void
+}
+export type VideoGenerationOptions = {
+  prompt: string
+  seconds: number
+  size: string
+  mode?: 'text2video' | 'image2video' | 'first_last_frame' | 'image_reference' | 'all_reference'
+  referenceImage?: string
+  referenceImages?: string[]
+  firstFrame?: string
+  lastFrame?: string
+  referenceVideo?: string
+  referenceVideos?: string[]
+  generateAudio?: boolean
+  signal?: AbortSignal
+  onProgress?: (progress: number, status: string) => void
+  /** Persists an async provider task before polling/download begins. */
+  onTaskId?: (taskId: string) => void
+  /** Captures the provider request/result for recovery and output history. */
+  captureAdminLog?: (log: GenerationAdminLog) => void
+}
+
+export type GenerationAdminLog = {
+  provider: string
+  taskId?: string
+  model: string
+  startedAt: string
+  finishedAt: string
+  durationMs: number
+  resultType: 'success' | 'failed'
+  requestJson: string
+  resultJson: string
+  /** Recoverable image/result URLs kept outside sanitized JSON (http kept in full). */
+  resultUrls?: string[]
+  kind?: 'image' | 'text' | 'video' | 'audio'
+}
+
+export type TextGenerationOptions = {
+  referenceImages?: string[]
+  signal?: AbortSignal
+  captureAdminLog?: (log: GenerationAdminLog) => void
+}
+
+export type ImageGenerationOptions = {
+  prompt: string
+  count: number
+  referenceImages?: string[]
+  aspectRatio?: string
+  resolution?: '1K' | '2K' | '4K'
+  detail?: 'low' | 'medium' | 'high'
+  signal?: AbortSignal
+  /** Persists a paid async task before polling starts so it can be recovered safely. */
+  onTaskId?: (taskId: string) => void
+  /** Captures a sanitized request/result snapshot for admin recovery logs. */
+  captureAdminLog?: (log: GenerationAdminLog) => void
+}
+
+const REFERENCE_IMAGE_REQUEST_MAX_DIMENSION = 1024
+const REFERENCE_IMAGE_READ_TIMEOUT_MS = 45_000
+const REFERENCE_IMAGE_READ_ATTEMPTS = 2
+const GRSAI_IMAGE_POLL_INTERVAL_MS = 2_500
+const GRSAI_IMAGE_POLL_TIMEOUT_MS = 15 * 60_000
+const GRSAI_MAX_CONSECUTIVE_POLL_ERRORS = 24
+const VISIONARY_POLL_INTERVAL_MS = 3_000
+const VISIONARY_POLL_TIMEOUT_MS = 15 * 60_000
+const VISIONARY_MAX_CONSECUTIVE_POLL_ERRORS = 5
+const VISIONARY_SUCCESS_WITHOUT_URL_RETRIES = 20
+const GENERIC_PROVIDER_POLL_INTERVAL_MS = 3_000
+const GENERIC_PROVIDER_POLL_TIMEOUT_MS = 15 * 60_000
+const GENERIC_PROVIDER_MAX_CONSECUTIVE_POLL_ERRORS = 5
+const GENERIC_PROVIDER_SUCCESS_WITHOUT_URL_RETRIES = 20
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error ?? new Error('参考图片读取失败'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error('参考图片压缩失败')),
+      type,
+      quality,
+    )
+  })
+}
+
+export async function readImageSourceBlob(source: string, signal?: AbortSignal, referenceLabel = '图片'): Promise<Blob> {
+  if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+  const trimmedSource = source.trim()
+  const isBrowserRelativeImage = /^(?:\/|\.\/|\.\.\/)/.test(trimmedSource)
+  if (!trimmedSource || (!isBrowserRelativeImage && !/^(?:https?:|blob:|data:image\/)/i.test(trimmedSource))) {
+    throw new GenerationRequestError('platform', '图片地址无效', '图片地址不是可读取的图片源')
+  }
+  const readableSource = (() => {
+    if (isBrowserRelativeImage) return new URL(trimmedSource, window.location.href).href
+    // HFSY result assets are currently served from aixinai.net without CORS.
+    // Route both newly generated and older saved URLs through the same-origin
+    // media relay before converting them to request data.
+    try {
+      const host = new URL(trimmedSource).hostname.toLowerCase()
+      // Some providers allow <img> previews but omit CORS headers, which makes
+      // their successful output unusable as the next node's reference image.
+      // Route those known result hosts through the same-origin media relay.
+      if (typeof window !== 'undefined' && (
+        host === 'aixinai.net' || host.endsWith('.aixinai.net')
+        || host === 'www.qixinai.net'
+        || host === 'gptgod.online' || host.endsWith('.gptgod.online')
+        || host === 'gptgod.com' || host.endsWith('.gptgod.com')
+      )) return apiYiGeneratedMediaUrl(trimmedSource)
+    } catch { /* retain the original source and surface a normal read error */ }
+    return trimmedSource
+  })()
+
+  let sourceBlob: Blob | undefined
+  let lastReadError: unknown
+  try {
+    for (let attempt = 1; attempt <= REFERENCE_IMAGE_READ_ATTEMPTS; attempt += 1) {
+      const referenceController = new AbortController()
+      const abortReferenceRead = () => referenceController.abort()
+      signal?.addEventListener('abort', abortReferenceRead, { once: true })
+      const referenceTimeout = window.setTimeout(() => referenceController.abort(), REFERENCE_IMAGE_READ_TIMEOUT_MS)
+      try {
+        const separator = readableSource.includes('?') ? '&' : '?'
+        const attemptSource = attempt > 1 && /^https?:/i.test(readableSource) ? `${readableSource}${separator}disy_retry=${attempt}` : readableSource
+        const response = await fetch(attemptSource, { signal: referenceController.signal, cache: 'no-store' })
+        if (!response.ok) throw new Error(`图片读取失败（${response.status}）`)
+        sourceBlob = await response.blob()
+        break
+      } catch (error) {
+        if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+        lastReadError = error
+        if (attempt === REFERENCE_IMAGE_READ_ATTEMPTS) throw error
+      } finally {
+        window.clearTimeout(referenceTimeout)
+        signal?.removeEventListener('abort', abortReferenceRead)
+      }
+    }
+  } catch (error) {
+    if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+    // Report the host and transport, never signed URL paths/query parameters.
+    const sourceDescription = (() => {
+      if (/^blob:/i.test(trimmedSource)) return '本地临时图片（blob）'
+      if (/^data:/i.test(trimmedSource)) return '内嵌图片（data）'
+      try {
+        const original = new URL(trimmedSource, window.location.href)
+        const relayTarget = original.pathname === '/apiyi/media' ? original.searchParams.get('url') : null
+        const host = relayTarget ? new URL(relayTarget).hostname : original.hostname
+        return `${host}（${relayTarget || readableSource !== trimmedSource && readableSource.startsWith('/apiyi/media?') ? '同源媒体转发' : '直接读取'}）`
+      } catch { return '无法识别的图片地址' }
+    })()
+    throw new GenerationRequestError(
+      'platform',
+      `${referenceLabel}${lastReadError instanceof DOMException && lastReadError.name === 'AbortError' ? '读取超时' : '无法读取'}`,
+      `来源：${sourceDescription}。已自动重试 ${REFERENCE_IMAGE_READ_ATTEMPTS} 次。${lastReadError instanceof Error ? `${lastReadError.name}: ${lastReadError.message}` : String(lastReadError)}。`,
+    )
+  }
+
+  if (!sourceBlob || !sourceBlob.size || !sourceBlob.type.startsWith('image/')) {
+    throw new GenerationRequestError('platform', '参考图片格式无法识别', `收到的文件类型为 ${sourceBlob?.type || 'unknown'}`)
+  }
+
+  return sourceBlob
+}
+
+export async function prepareReferenceImageForRequest(source: string | Blob, signal?: AbortSignal, referenceLabel = '参考图片'): Promise<string> {
+  if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+  const trimmedSource = typeof source === 'string' ? source.trim() : ''
+  let sourceBlob: Blob
+  try {
+    sourceBlob = typeof source === 'string' ? await readImageSourceBlob(source, signal, referenceLabel) : source
+  } catch (error) {
+    if (error instanceof GenerationRequestError) error.detail += '本次付费生成请求尚未发送。'
+    throw error
+  }
+
+  const isPreferredEditFormat = /^image\/(?:png|jpe?g)$/i.test(sourceBlob.type)
+  // Remote and blob URLs are converted to stable request data. Unsupported
+  // formats are always re-encoded while preserving their exact pixel dimensions.
+  let bitmap: ImageBitmap
+  try {
+    bitmap = await createImageBitmap(sourceBlob)
+  } catch (error) {
+    throw new GenerationRequestError(
+      'platform',
+      '参考图片无法解码',
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    )
+  }
+
+  try {
+    if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+    const maxSourceDimension = Math.max(bitmap.width, bitmap.height)
+    if (isPreferredEditFormat && maxSourceDimension <= REFERENCE_IMAGE_REQUEST_MAX_DIMENSION) {
+      return /^data:image\//i.test(trimmedSource) ? trimmedSource : blobToDataUrl(sourceBlob)
+    }
+    const canvas = document.createElement('canvas')
+    // Requests cap their longest edge at 1K. This is large enough for image
+    // guidance while preventing an oversized local upload from bloating payloads.
+    const scale = Math.min(1, REFERENCE_IMAGE_REQUEST_MAX_DIMENSION / maxSourceDimension)
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('浏览器无法创建图片压缩画布')
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+
+    // WebP and uncommon formats become PNG only for request compatibility.
+    // PNG remains lossless; JPEG retains JPEG encoding at high quality.
+    const outputType = /^image\/jpe?g$/i.test(sourceBlob.type) ? 'image/jpeg' : 'image/png'
+    return blobToDataUrl(await canvasToBlob(canvas, outputType, .92))
+
+  } finally {
+    bitmap.close()
+  }
+}
+
+export type GenerationErrorCategory = 'api' | 'network' | 'platform'
+
+export class GenerationRequestError extends Error {
+  category: GenerationErrorCategory
+  detail: string
+  status?: number
+  code?: string
+  requestId?: string
+  adminLog?: GenerationAdminLog
+  resultUrls?: string[]
+
+  constructor(
+    category: GenerationErrorCategory,
+    message: string,
+    detail: string,
+    metadata?: { status?: number; code?: string; requestId?: string; adminLog?: GenerationAdminLog; resultUrls?: string[] },
+  ) {
+    super(message)
+    this.name = 'GenerationRequestError'
+    this.category = category
+    this.detail = detail
+    this.status = metadata?.status
+    this.code = metadata?.code
+    this.requestId = metadata?.requestId
+    this.adminLog = metadata?.adminLog
+    this.resultUrls = metadata?.resultUrls
+  }
+}
+
+function sanitizeAdminLogValue(value: unknown, depth = 0): unknown {
+  if (depth > 10) return '[…]'
+  if (typeof value === 'string') {
+    if (/^data:image\//i.test(value) || (value.length > 240 && /^[A-Za-z0-9+/=\s]+$/.test(value.slice(0, 120)))) {
+      return `base64 image… (${value.length} chars)`
+    }
+    if (value.length > 6_000) return `${value.slice(0, 6_000)}…`
+    return value
+  }
+  if (Array.isArray(value)) return value.slice(0, 40).map((item) => sanitizeAdminLogValue(item, depth + 1))
+  if (!value || typeof value !== 'object') return value
+  const output: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value as Record<string, unknown>).slice(0, 80)) {
+    output[key] = sanitizeAdminLogValue(child, depth + 1)
+  }
+  return output
+}
+
+export function sanitizeAdminLogJson(value: unknown) {
+  try {
+    return JSON.stringify(sanitizeAdminLogValue(value), null, 0)
+  } catch {
+    return String(value)
+  }
+}
+
+export function extractImageUrlsFromAdminResult(resultJson: string): string[] {
+  try {
+    return extractGeneratedImages(JSON.parse(resultJson) as unknown).map((image) => image.url)
+  } catch {
+    return []
+  }
+}
+
+function normalizedApiBaseUrl(baseUrl: string) {
+  const trimmed = baseUrl.trim().replace(/^['"]|['"]$/g, '').replace(/\/$/, '')
+  if (!trimmed) throw new Error('接口地址不能为空')
+  if (/\.apifox\.cn(?:\/|$)/i.test(trimmed)) {
+    throw new Error('这里填写的是 Apifox 文档地址。GRS AI 请使用 https://grsaiapi.com/v1 或 https://grsai.dakka.com.cn/v1')
+  }
+  let url: URL
+  try {
+    url = new URL(trimmed)
+  } catch {
+    throw new Error('接口地址必须是完整的 http(s) URL，例如 https://api.example.com/v1')
+  }
+  if (!/^https?:$/i.test(url.protocol)) throw new Error('接口地址只支持 http:// 或 https://')
+  let host = url.hostname.toLowerCase()
+  // `visionary.beer` is the website/result-media host. Users commonly copy it
+  // from task history, but generation endpoints live on api.visionary.beer/v1.
+  // Canonicalize only a bare website base; preserve explicit custom paths.
+  if (host === 'visionary.beer' && (!url.pathname || url.pathname === '/')) {
+    url.hostname = 'api.visionary.beer'
+    url.pathname = '/v1'
+    host = 'api.visionary.beer'
+  }
+  if (!url.pathname || url.pathname === '/') {
+    const defaultPath = host === 'api.openai.com' || host === 'api.deepseek.com' || /siliconflow\.cn$/i.test(host)
+      ? '/v1'
+      : /(?:api\.apiyi\.com|apiyi\.com|apimart\.ai)$/i.test(host)
+        ? '/v1'
+        : /^(?:www\.|api\.|apigo\.)?hfsyapi\.cn$/i.test(host)
+          ? '/v1'
+        : host === 'api.visionary.beer'
+          ? '/v1'
+        : host === 'api.evolink.ai'
+          ? '/v1'
+        : /^(?:grsaiapi\.com|grsai\.dakka\.com\.cn)$/i.test(host)
+          ? '/v1'
+          : ''
+    if (defaultPath) url.pathname = defaultPath
+  }
+  return url.toString().replace(/\/$/, '')
+}
+
+function endpoint(baseUrl: string, path: string) {
+  // APIYI's OpenAI-compatible endpoints are not consistently CORS-enabled.
+  // Browser builds use the same-origin relay; server-side callers keep the
+  // configured provider URL. The relay forwards the original path unchanged.
+  if (typeof window !== 'undefined' && /api\.apiyi\.com|apiyi\.com/i.test(baseUrl)) {
+    const normalized = normalizedApiBaseUrl(baseUrl)
+    const providerPath = new URL(normalized).pathname.replace(/\/$/, '')
+    return `/apiyi/openai${providerPath}/${path.replace(/^\//, '')}`
+  }
+  if (typeof window !== 'undefined' && isHfsyBaseUrl(baseUrl)) {
+    const providerPath = new URL(normalizedApiBaseUrl(baseUrl)).pathname.replace(/^\//, '').replace(/\/$/, '')
+    return `/hfsy/${providerPath}/${path.replace(/^\//, '')}`
+  }
+  if (typeof window !== 'undefined' && isVisionaryBaseUrl(baseUrl)) {
+    return `/visionary/${path.replace(/^\//, '')}`
+  }
+  if (typeof window !== 'undefined' && isEvolinkBaseUrl(baseUrl)) {
+    return `/evolink/${path.replace(/^\//, '')}`
+  }
+  return `${normalizedApiBaseUrl(baseUrl)}/${path.replace(/^\//, '')}`
+}
+
+function apiYiRelayHeaders(settings: Pick<ApiRequestSettings, 'baseUrl'>, init?: HeadersInit) {
+  const headers = new Headers(init)
+  if (typeof window !== 'undefined' && /api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl)) {
+    try {
+      const normalized = normalizedApiBaseUrl(settings.baseUrl)
+      headers.set('X-DisyLab-APIYI-Origin', new URL(normalized).origin)
+      headers.set('X-DisyLab-APIYI-Base', normalized)
+    } catch { /* validated by endpoint */ }
+  }
+  if (typeof window !== 'undefined' && isHfsyBaseUrl(settings.baseUrl)) {
+    try { headers.set('X-DisyLab-HFSY-Base', normalizedApiBaseUrl(settings.baseUrl)) } catch { /* validated by endpoint */ }
+  }
+  return headers
+}
+
+/** GRS's account endpoints live at the host root, outside the /v1 API prefix. */
+function grsaiControlEndpoint(baseUrl: string, path: string) {
+  const url = new URL(normalizedApiBaseUrl(baseUrl))
+  return `${url.origin}/${path.replace(/^\//, '')}`
+}
+
+function isGrsaiBaseUrl(baseUrl: string) {
+  return /^https?:\/\/(?:grsaiapi\.com|grsai\.dakka\.com\.cn)(?:\/|$)/i.test(normalizedApiBaseUrl(baseUrl))
+}
+
+function isHfsyBaseUrl(baseUrl: string) {
+  try { return /^(?:www\.|api\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(baseUrl)).hostname) } catch { return false }
+}
+
+function isVisionaryBaseUrl(baseUrl: string) {
+  try {
+    const host = new URL(normalizedApiBaseUrl(baseUrl)).hostname.toLowerCase()
+    return host === 'visionary.beer' || host === 'api.visionary.beer'
+  } catch {
+    return false
+  }
+}
+
+function isEvolinkBaseUrl(baseUrl: string) {
+  try { return new URL(normalizedApiBaseUrl(baseUrl)).hostname.toLowerCase() === 'api.evolink.ai' } catch { return false }
+}
+
+function providerRelayHeaders(settings: Pick<ApiRequestSettings, 'baseUrl'>, init?: HeadersInit) {
+  const headers = apiYiRelayHeaders(settings, init)
+  if (typeof window !== 'undefined' && isVisionaryBaseUrl(settings.baseUrl)) {
+    headers.set('X-DisyLab-Visionary-Base', normalizedApiBaseUrl(settings.baseUrl))
+  }
+  if (typeof window !== 'undefined' && isEvolinkBaseUrl(settings.baseUrl)) {
+    headers.set('X-DisyLab-Evolink-Base', normalizedApiBaseUrl(settings.baseUrl))
+  }
+  return headers
+}
+
+// Decide whether the structured numbered reference guide ("图1 / 图片1 / 参考图1 =
+// 第 1 张输入图片") should be appended to the prompt.
+//
+// The guide is ONLY required by the OpenAI `images/edits` multipart path
+// (GPT Image / ChatGPT Image): there the reference images are uploaded as unnamed
+// files, so the model can only tell them apart from the prompt's "图N" mapping.
+//
+// Every other path receives reference images positionally (GRS AI unified
+// `images` array, Seedream / Volces `image_urls`, the standard OpenAI
+// `image_urls` field, or multimodal text content). For these the guide is
+// redundant and — critically — GRS AI enforces a server-side prompt regex
+// ("The string did not match the expected pattern") that the guide's
+// `图1 / 图片1 / 参考图1 = 第 1 张输入图片（@name）` structure violates, so the
+// request is rejected before any image is generated. We omit it everywhere but
+// the multipart GPT Image path so every model accepts the prompt and returns
+// results. Position-based reference ("图1/图2" in the user's own prompt) still
+// works because those providers align images by upload order.
+export function shouldAppendReferenceGuide(opts: { modelId: string; baseUrl: string; isImageGeneration: boolean }): boolean {
+  if (isGrsaiBaseUrl(opts.baseUrl) || isVisionaryBaseUrl(opts.baseUrl)) return false
+  if (opts.isImageGeneration) return /(?:gpt-image|chatgpt-image)/i.test(opts.modelId)
+  return true
+}
+
+export function resolveProviderLabel(baseUrl: string) {
+  const normalized = normalizedApiBaseUrl(baseUrl).toLowerCase()
+  if (/grsaiapi\.com|grsai\.dakka\.com\.cn/.test(normalized)) return 'GRS AI'
+  if (/api\.evolink\.ai/.test(normalized)) return 'Evolink'
+  if (/(?:api\.)?visionary\.beer/.test(normalized)) return 'Visionary'
+  if (/api\.apiyi\.com|apiyi\.com/.test(normalized)) return 'APIYI'
+  if (/(?:www\.|api\.|apigo\.)?hfsyapi\.cn/.test(normalized)) return 'HFSY'
+  if (/api\.apimart\.ai|apimart\.ai/.test(normalized)) return 'APIMart'
+  if (/gptgod\.online|gptgod\.com/.test(normalized)) return 'GPTGod'
+  if (/ark\.cn-beijing\.volces\.com/.test(normalized)) return '即梦'
+  if (/api\.openai\.com/.test(normalized)) return 'OpenAI'
+  if (/api\.siliconflow\.cn|siliconflow/.test(normalized)) return '硅基流动'
+  if (/api\.deepseek\.com/.test(normalized)) return 'DeepSeek'
+  try {
+    return new URL(normalized).hostname.replace(/^www\./, '') || 'Custom API'
+  } catch {
+    return 'Custom API'
+  }
+}
+
+function extractTaskId(payload: unknown) {
+  return extractProviderTaskId(payload)
+}
+
+function collectRecoverableResultUrls(payload: unknown) {
+  return extractGeneratedImages(payload)
+    .map((image) => image.url)
+    .filter((url) => {
+      if (/^https?:\/\//i.test(url)) return true
+      // Keep small embedded results so admins can still recover when CDN URLs are absent.
+      return /^data:image\//i.test(url) && url.length <= 350_000
+    })
+}
+
+function waitForDelay(delay: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Generation interrupted', 'AbortError'))
+      return
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, delay)
+    const abort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('Generation interrupted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+async function mediaSourceForApiYi(source: string, signal?: AbortSignal) {
+  // APIYI accepts remote URLs, but browser clients cannot reliably read the
+  // provider CDN (CORS). Route APIYI-hosted media through our same-origin
+  // relay; data/blob URLs remain local and are read directly.
+  const isRemote = /^https?:\/\//i.test(source)
+  const isApiYiMedia = (() => {
+    try { return /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$/i.test(new URL(source).hostname) } catch { return false }
+  })()
+  const readableSource = typeof window !== 'undefined' && isRemote && isApiYiMedia
+    ? `/apiyi/media?url=${encodeURIComponent(source)}`
+    : source
+  if (isRemote && typeof window === 'undefined') return source
+  const response = await fetch(readableSource, { signal })
+  if (!response.ok) throw new GenerationRequestError('platform', '参考媒体无法读取', `媒体读取失败（${response.status}）`)
+  const blob = await response.blob()
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error ?? new Error('参考媒体转换失败'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function videoResultUrl(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') return ''
+  const record = payload as Record<string, unknown>
+  const nested = record.content && typeof record.content === 'object' ? record.content as Record<string, unknown> : null
+  const data = record.data && typeof record.data === 'object' ? record.data as Record<string, unknown> : null
+  const output = record.output && typeof record.output === 'object' ? record.output as Record<string, unknown> : null
+  const candidates = [
+    record.video_url, record.videoUrl, record.result_url, record.resultUrl, record.url,
+    nested?.video_url, nested?.videoUrl, nested?.result_url, nested?.resultUrl, nested?.url,
+    data?.video_url, data?.videoUrl, data?.result_url, data?.resultUrl, data?.url,
+    output?.video_url, output?.videoUrl, output?.result_url, output?.resultUrl, output?.url,
+  ]
+  return candidates.find((value): value is string => typeof value === 'string' && /^https?:\/\//i.test(value))
+    ?? extractGeneratedImages(payload).find((item) => /^https?:\/\//i.test(item.url))?.url
+    ?? ''
+}
+
+function videoTaskStatus(payload: unknown, fallback = 'queued') {
+  return extractProviderTaskStatus(payload) || fallback
+}
+
+async function waitForReplicatedVideoUrl(taskUrl: string, headers: HeadersInit, initialPayload: unknown, signal?: AbortSignal) {
+  let payload = initialPayload
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const url = videoResultUrl(payload)
+    if (url) return { url, payload }
+    await waitForDelay(2_000, signal)
+    try {
+      const response = await fetch(taskUrl, { headers, signal })
+      if (response.ok) payload = await response.json() as unknown
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+    }
+  }
+  return { url: '', payload }
+}
+
+function apiYiGeneratedMediaUrl(source: string) {
+  // Result/CDN URLs are often missing CORS headers. Keep browser downloads on
+  // the app origin; server-side callers continue to use the provider URL.
+  return typeof window === 'undefined' ? source : `/apiyi/media?url=${encodeURIComponent(source)}`
+}
+
+function browserReadableImageResult(source: string, settings: ApiRequestSettings) {
+  // The provider can return this CDN regardless of the configured gateway.
+  // Normalize new outputs before archiving; older saved URLs are also handled
+  // by prepareReferenceImageForRequest above.
+  if (typeof window !== 'undefined') {
+    try {
+      const url = new URL(source)
+      if (url.protocol === 'https:' && url.hostname === 'www.qixinai.net') return apiYiGeneratedMediaUrl(source)
+    } catch { /* data/blob and relative URLs retain their existing handling */ }
+  }
+  if (typeof window === 'undefined' || !isVisionaryBaseUrl(settings.baseUrl) || !/^https?:\/\//i.test(source)) return source
+  try {
+    const hostname = new URL(source).hostname.toLowerCase()
+    if (hostname === 'visionary.beer' || hostname.endsWith('.visionary.beer')) return `/apiyi/media?url=${encodeURIComponent(source)}`
+  } catch { /* keep the original result */ }
+  return source
+}
+
+function apiYiVideoEndpoint(settings: ApiRequestSettings, relayPrefix: string, path: string) {
+  if (typeof window !== 'undefined') return `${relayPrefix}${path}`
+  return `${new URL(normalizedApiBaseUrl(settings.baseUrl)).origin}${path}`
+}
+
+function apiYiVideoHeaders(settings: ApiRequestSettings, headers: Record<string, string> = {}) {
+  const output = { ...headers }
+  if (typeof window !== 'undefined') output['X-DisyLab-APIYI-Origin'] = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
+  return output
+}
+
+function apiYiVideoRatio(size: string) {
+  const match = /^(\d+)x(\d+)$/i.exec(size)
+  if (!match) return 'adaptive'
+  const ratio = Number(match[1]) / Number(match[2])
+  const options: Array<[string, number]> = [['16:9', 16 / 9], ['4:3', 4 / 3], ['1:1', 1], ['3:4', 3 / 4], ['9:16', 9 / 16], ['21:9', 21 / 9]]
+  return options.sort((left, right) => Math.abs(left[1] - ratio) - Math.abs(right[1] - ratio))[0][0]
+}
+
+async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const origin = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
+  const taskPath = '/seedance/api/v3/contents/generations/tasks'
+  // APIYI documents that browsers cannot read this endpoint's response because
+  // of CORS even when the paid task was accepted. Use the app's same-origin
+  // relay in the browser; Node/test callers continue to use the provider URL.
+  const taskEndpoint = typeof window === 'undefined'
+    ? `${origin}${taskPath}`
+    : `/apiyi/seedance${taskPath}`
+  const content: Array<Record<string, unknown>> = [{ type: 'text', text: options.prompt }]
+  const imageSources = options.mode === 'first_last_frame'
+    ? [options.firstFrame, options.lastFrame]
+    : options.mode === 'image2video'
+      ? [options.firstFrame ?? options.referenceImage]
+      : options.referenceImages ?? []
+  const imageRoles = options.mode === 'first_last_frame' ? ['first_frame', 'last_frame'] : imageSources.map(() => options.mode === 'image2video' ? undefined : 'reference_image')
+  for (const [index, source] of imageSources.entries()) {
+    if (!source) continue
+    content.push({ type: 'image_url', image_url: { url: await mediaSourceForApiYi(source, options.signal) }, ...(imageRoles[index] ? { role: imageRoles[index] } : {}) })
+  }
+  const referenceVideos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((source): source is string => Boolean(source))))
+  for (const source of referenceVideos) {
+    content.push({ type: 'video_url', video_url: { url: await mediaSourceForApiYi(source, options.signal) } })
+  }
+  const requestedResolution = /fast|mini/i.test(settings.model) && options.size.endsWith('x1080') ? '720p' : options.size.endsWith('x480') ? '480p' : options.size.endsWith('x1080') ? '1080p' : '720p'
+  let response: Response
+  const requestHeaders = new Headers({
+    Authorization: `Bearer ${settings.apiKey}`,
+    'Content-Type': 'application/json',
+    'Accept-Encoding': 'identity',
+  })
+  if (typeof window !== 'undefined') requestHeaders.set('X-DisyLab-APIYI-Origin', origin)
+  try {
+    response = await fetch(taskEndpoint, {
+      method: 'POST',
+      signal: options.signal,
+      headers: requestHeaders,
+      body: JSON.stringify({
+        model: settings.model,
+        content,
+        resolution: requestedResolution,
+        ratio: apiYiVideoRatio(options.size),
+        duration: Math.max(4, Math.min(15, Math.round(options.seconds))),
+        generate_audio: options.generateAudio !== false,
+      }),
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new GenerationRequestError('network', 'Seedance 同源代理请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。请求地址：${taskEndpoint}`)
+  }
+  if (!response.ok) throw await createApiError(response)
+  const created = await response.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', 'Seedance 没有返回任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  options.onProgress?.(1, 'queued')
+  const startedAt = Date.now()
+  let status = 'queued'
+  while (!['succeeded', 'completed', 'success', 'failed', 'expired', 'cancelled', 'canceled'].includes(status)) {
+    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Seedance 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`)
+    await waitForDelay(20_000, options.signal)
+    let poll: Response
+    try {
+      poll = await fetch(`${taskEndpoint}/${encodeURIComponent(taskId)}`, {
+        signal: options.signal,
+        headers: requestHeaders,
+      })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new GenerationRequestError('network', 'Seedance 任务查询请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}`, { requestId: taskId })
+    }
+    if (!poll.ok) throw await createApiError(poll)
+    const job = await poll.json() as Record<string, unknown>
+    status = videoTaskStatus(job, status)
+    options.onProgress?.(status === 'running' || status === 'processing' ? 50 : ['succeeded', 'completed', 'success'].includes(status) ? 90 : 10, status)
+    if (['failed', 'expired', 'cancelled', 'canceled'].includes(status)) throw new GenerationRequestError('api', `Seedance 任务${status === 'expired' ? '已过期' : '失败'}`, sanitizeAdminLogJson(job), { requestId: taskId })
+    if (['succeeded', 'completed', 'success'].includes(status)) {
+      const replicated = await waitForReplicatedVideoUrl(`${taskEndpoint}/${encodeURIComponent(taskId)}`, requestHeaders, job, options.signal)
+      const videoUrl = replicated.url
+      if (!videoUrl) throw new GenerationRequestError('platform', 'Seedance 成功但没有返回视频地址', sanitizeAdminLogJson(replicated.payload), { requestId: taskId })
+      let videoResponse: Response
+      try {
+        videoResponse = await fetch(apiYiGeneratedMediaUrl(videoUrl), { signal: options.signal })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        throw new GenerationRequestError('network', 'Seedance 视频下载请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
+      }
+      if (!videoResponse.ok) throw new GenerationRequestError('network', 'Seedance 视频下载失败', `视频下载失败（${videoResponse.status}）。任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
+      const blob = await videoResponse.blob()
+      if (!blob.size) throw new GenerationRequestError('platform', 'Seedance 返回了空视频文件', `任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
+      options.onProgress?.(100, 'completed')
+      return { blob, taskId, progress: 100, sourceUrl: videoUrl }
+    }
+  }
+  throw new GenerationRequestError('platform', 'Seedance 任务未完成', `任务 ${taskId}`, { requestId: taskId })
+}
+
+function videoResolutionFromSize(size: string) {
+  const height = Number(/x(\d+)$/i.exec(size)?.[1] ?? 720)
+  return height >= 2160 ? '4k' : height >= 1080 ? '1080p' : height <= 480 ? '480p' : '720p'
+}
+
+async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  if (options.mode !== 'text2video') {
+    throw new GenerationRequestError('api', 'Veo 图生视频需要专用上传接口', '当前已适配 APIYI Veo 3.1 文生视频端点；图生视频请先使用文本模式，避免把参考图静默丢弃。')
+  }
+  const resolution = videoResolutionFromSize(options.size)
+  const requestedSeconds = [4, 6, 8].reduce((best, current) => Math.abs(current - options.seconds) < Math.abs(best - options.seconds) ? current : best, 4)
+  const seconds = resolution === '1080p' || resolution === '4k' ? 8 : requestedSeconds
+  const response = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', '/v1/videos'), {
+    method: 'POST',
+    signal: options.signal,
+    headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      model: settings.model,
+      prompt: options.prompt,
+      seconds: String(seconds),
+      size: options.size,
+      metadata: { resolution, aspectRatio: apiYiVideoRatio(options.size) },
+    }),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const created = await response.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', 'Veo 没有返回任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  let status = videoTaskStatus(created)
+  const startedAt = Date.now()
+  while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
+    if (Date.now() - startedAt > 10 * 60_000) throw new GenerationRequestError('network', 'Veo 视频生成等待超时', `任务 ${taskId} 超过 10 分钟仍未完成`, { requestId: taskId })
+    await waitForDelay(8_000, options.signal)
+    const poll = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    if (!poll.ok) throw await createApiError(poll)
+    const job = await poll.json() as Record<string, unknown>
+    status = videoTaskStatus(job, status)
+    const jobProgress = Number(job.progress)
+    options.onProgress?.(Number.isFinite(jobProgress) ? jobProgress : (['completed', 'succeeded', 'success'].includes(status) ? 100 : 30), status)
+    if (status === 'failed') throw new GenerationRequestError('api', 'Veo 视频生成失败', sanitizeAdminLogJson(job), { requestId: taskId })
+    if (status === 'cancelled' || status === 'canceled') throw new GenerationRequestError('api', 'Veo 视频生成已取消', sanitizeAdminLogJson(job), { requestId: taskId })
+  }
+  await waitForDelay(4_000, options.signal)
+  let lastError: GenerationRequestError | null = null
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const content = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    if (content.ok) {
+      const blob = await content.blob()
+      if (blob.size) return { blob, taskId, progress: 100 }
+    }
+    lastError = await createApiError(content)
+    if (attempt < 3) await waitForDelay(4_000, options.signal)
+  }
+  throw lastError ?? new GenerationRequestError('platform', 'Veo 返回了空视频文件', `任务 ${taskId}`, { requestId: taskId })
+}
+
+async function generateApiYiWanVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const requestedMode = options.mode ?? 'text2video'
+  const expectedSuffix = requestedMode === 'image2video'
+    ? 'i2v'
+    : requestedMode === 'image_reference' || requestedMode === 'all_reference' || requestedMode === 'first_last_frame'
+      ? 'r2v'
+      : 't2v'
+  const modelSuffix = /-(t2v|i2v|r2v)$/i.exec(settings.model)?.[1]?.toLowerCase()
+  if (modelSuffix && modelSuffix !== expectedSuffix) {
+    throw new GenerationRequestError(
+      'api',
+      `当前选择的是 ${settings.model}`,
+      `当前节点使用 ${requestedMode} 模式，但模型 ${settings.model} 与它不匹配。请选择 wan2.7-${expectedSuffix}；wan2.7-videoedit 只用于输入已有视频后再编辑。`,
+    )
+  }
+  const input: Record<string, unknown> = { prompt: options.prompt }
+  if (expectedSuffix === 'i2v') {
+    const image = options.firstFrame ?? options.referenceImage ?? options.referenceImages?.[0]
+    if (!image) throw new GenerationRequestError('platform', 'Wan 图生视频缺少参考图', '请选择一张首帧或参考图片后再生成。')
+    input.img_url = await mediaSourceForApiYi(image, options.signal)
+  } else if (expectedSuffix === 'r2v') {
+    const images = [
+      ...(options.referenceImages ?? []),
+      ...(requestedMode === 'first_last_frame' ? [options.firstFrame, options.lastFrame] : []),
+    ].filter((source): source is string => Boolean(source))
+    if (images.length) input.reference_image_urls = await Promise.all(images.map((source) => mediaSourceForApiYi(source, options.signal)))
+    const videos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((source): source is string => Boolean(source))))
+    if (videos.length) input.reference_video_urls = await Promise.all(videos.map((source) => mediaSourceForApiYi(source, options.signal)))
+    if (!images.length && !videos.length) throw new GenerationRequestError('platform', 'Wan 参考生视频缺少参考素材', '请选择至少一张参考图或一个参考视频后再生成。')
+  }
+  const response = await fetch(apiYiVideoEndpoint(settings, '/apiyi/wan', '/wan/api/v1/services/aigc/video-generation/video-synthesis'), {
+    method: 'POST',
+    signal: options.signal,
+    headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' }),
+    body: JSON.stringify({
+      model: settings.model,
+      input,
+      parameters: {
+        resolution: videoResolutionFromSize(options.size) === '1080p' ? '1080P' : '720P',
+        ratio: apiYiVideoRatio(options.size),
+        duration: Math.max(2, Math.min(15, Math.round(options.seconds))),
+        prompt_extend: true,
+        watermark: false,
+      },
+    }),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const created = await response.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', 'Wan 没有返回任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  const startedAt = Date.now()
+  let status = 'submitted'
+  while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
+    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Wan 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`, { requestId: taskId })
+    await waitForDelay(8_000, options.signal)
+    const poll = await fetch(apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    if (!poll.ok) throw await createApiError(poll)
+    const job = await poll.json() as Record<string, unknown>
+    status = videoTaskStatus(job, status)
+    const progressValue = Number(job.progress ?? (status === 'completed' || status === 'succeeded' || status === 'success' ? 100 : 30))
+    options.onProgress?.(Number.isFinite(progressValue) ? progressValue : 30, status)
+    if (['failed', 'cancelled', 'canceled'].includes(status)) throw new GenerationRequestError('api', 'Wan 视频生成失败', sanitizeAdminLogJson(job), { requestId: taskId })
+    if (['completed', 'succeeded', 'success'].includes(status)) {
+      const taskUrl = apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${encodeURIComponent(taskId)}`)
+      const taskHeaders = apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` })
+      const replicated = await waitForReplicatedVideoUrl(taskUrl, taskHeaders, job, options.signal)
+      const resultUrl = replicated.url
+      if (!resultUrl) throw new GenerationRequestError('platform', 'Wan 成功但没有返回视频地址', sanitizeAdminLogJson(replicated.payload), { requestId: taskId })
+      const video = await fetch(apiYiGeneratedMediaUrl(resultUrl), { signal: options.signal })
+      if (!video.ok) throw new GenerationRequestError('network', 'Wan 视频下载失败', `视频下载失败（${video.status}）`, { requestId: taskId, resultUrls: [resultUrl] })
+      const blob = await video.blob()
+      if (!blob.size) throw new GenerationRequestError('platform', 'Wan 返回了空视频文件', `任务 ${taskId}`, { requestId: taskId, resultUrls: [resultUrl] })
+      return { blob, taskId, progress: 100, sourceUrl: resultUrl }
+    }
+  }
+  throw new GenerationRequestError('platform', 'Wan 任务未完成', `任务 ${taskId}`, { requestId: taskId })
+}
+
+async function readError(response: Response) {
+  try {
+    const payload = await response.json() as { error?: { message?: string } | string; message?: string }
+    if (typeof payload.error === 'string') return payload.error
+    return payload.error?.message || payload.message || `请求失败（${response.status}）`
+  } catch {
+    return `请求失败（${response.status}）`
+  }
+}
+
+function apiErrorSummary(status: number) {
+  if (status === 400 || status === 422) return '当前模型不接受这组生成参数'
+  if (status === 401) return 'API Key 无效或已经过期'
+  if (status === 403) return '当前账号没有使用这个模型的权限'
+  if (status === 404) return '接口地址或模型不存在'
+  if (status === 408) return 'API 请求超时了'
+  if (status === 429) return '请求太频繁，或者账号额度不足'
+  if (status >= 500) return 'API 服务暂时不可用'
+  return 'API 服务拒绝了这次请求'
+}
+
+async function createApiError(response: Response) {
+  const detail = await readError(response)
+  const responseRequestId = response.headers.get('x-request-id') ?? response.headers.get('x-shellapi-request-id') ?? undefined
+  if (response.status === 502 && response.headers.get('x-disylab-relay-error') === 'upstream-fetch-failed') {
+    return new GenerationRequestError('network', '没有连接到 APIYI 视频服务', `${detail}。请检查当前网络是否能访问所配置的 APIYI 节点，或在接口设置中切换 APIYI 官方备用节点。`, {
+      status: response.status,
+      requestId: responseRequestId,
+    })
+  }
+  if (/no available channels|没有可用通道|no available channel/i.test(detail)) {
+    return new GenerationRequestError('api', '当前 API 分组没有可用通道', `${detail}。请在 APIYI Token 页面切换支持该模型的分组，或改用当前分组可用的模型；这不是浏览器网络故障。`, {
+      status: response.status,
+      requestId: responseRequestId,
+    })
+  }
+  return new GenerationRequestError('api', apiErrorSummary(response.status), detail, {
+    status: response.status,
+    requestId: responseRequestId,
+  })
+}
+
+function createNetworkError(error: unknown) {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+  return new GenerationRequestError('network', '没有连接到 API 服务，请检查网络、接口地址或跨域设置', detail)
+}
+
+export function normalizeGenerationError(error: unknown) {
+  if (error instanceof GenerationRequestError) return error
+  if (error instanceof TypeError && /fetch|network|load|cors/i.test(error.message)) return createNetworkError(error)
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+  if (error instanceof Error && /没有返回图片|没有返回图像/.test(error.message)) {
+    return new GenerationRequestError('platform', '模型没有返回图像', detail)
+  }
+  return new GenerationRequestError('platform', 'Disy 处理生成结果时遇到了问题', detail)
+}
+
+// Generic registry so any vendor can declare models that its standard OpenAI-compatible
+// GET /v1/models endpoint will not enumerate (typically video/image models behind a
+// dedicated endpoint). Vendors flagged `catalogOnly` skip the live request entirely.
+type VendorModelSupplement = {
+  match: (normalizedBaseUrl: string) => boolean
+  catalogOnly?: boolean
+}
+
+const VENDOR_MODEL_SUPPLEMENTS: VendorModelSupplement[] = [
+  { match: isGrsaiBaseUrl, catalogOnly: true },
+]
+
+const GRSAI_CATALOG_PROXY_PATH = '/api/model-catalog?provider=grsai'
+
+async function fetchGrsaiProxyCatalog(): Promise<RemoteModel[] | null> {
+  try {
+    const response = await fetch(GRSAI_CATALOG_PROXY_PATH)
+    if (!response.ok || !/application\/json/i.test(response.headers.get('content-type') ?? '')) return null
+    const models = parseRemoteModelCatalog(await response.json() as unknown)
+    return models.length ? models : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * HFSY's OpenAI-compatible `/v1/models` can contain old channel entries after
+ * they have been withdrawn. Its public model plaza is the source of truth for
+ * the currently enabled catalogue, including the media modality.  The special
+ * relay path is deliberately limited server-side to this one public endpoint.
+ */
+async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<RemoteModel[]> {
+  // Always use the documented www model plaza rather than whichever compatible
+  // API host the user chose for generation (www/api/apigo can differ by route).
+  const plazaSettings = { ...settings, baseUrl: 'https://www.hfsyapi.cn/v1' }
+  const response = await fetch('/hfsy/__root__/api/pricing', {
+    headers: providerRelayHeaders(plazaSettings, { Accept: 'application/json' }),
+  })
+  if (!response.ok) throw new Error(await readError(response))
+  const models = parseHfsyMarketplaceCatalog(await response.json() as unknown)
+  if (!models.length) throw new Error('HFSY 模型广场没有返回当前可用模型')
+  return models
+}
+
+export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<RemoteModel[]> {
+  const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
+  if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings)
+  const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
+  // GRS has no standard OpenAI-compatible model endpoint. Do not resurrect a
+  // static fallback when its live proxy is unavailable: stale entries are worse
+  // than showing a retriable refresh error.
+  if (supplement?.catalogOnly) {
+    const models = await fetchGrsaiProxyCatalog()
+    if (!models) throw new Error('GRS AI 当前模型目录不可用，请稍后重新刷新')
+    return models
+  }
+  const response = await fetch(endpoint(settings.baseUrl, 'models'), {
+    headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+  })
+  if (!response.ok) {
+    // A response means the provider evaluated the request. In particular, do
+    // not replace 401/403 credential failures with a local catalog: that makes a
+    // bad key look connected and leaves unusable models visible in the canvas.
+    throw new Error(await readError(response))
+  }
+  // `/models` is the authenticated provider truth for all normal connections.
+  // Never merge local manifests here: those lists cannot prove that a model is
+  // still sold or enabled for this API key today.
+  return parseRemoteModelCatalog(await response.json() as unknown)
+}
+
+/** OpenAI-compatible asynchronous video job. Large media stays as a Blob and is
+ * never converted to base64, keeping React state and canvas snapshots small. */
+async function generateRemoteVideoRequest(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  if (isHfsyBaseUrl(settings.baseUrl)) return generateHfsyVideo(settings, options)
+  if (isEvolinkBaseUrl(settings.baseUrl)) return generateEvolinkVideo(settings, options)
+  if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedance|doubao-seedance/i.test(settings.model)) {
+    return generateApiYiSeedanceVideo(settings, options)
+  }
+  if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /veo-3\.1/i.test(settings.model)) {
+    return generateApiYiVeoVideo(settings, options)
+  }
+  if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /wan2\.|happyhorse/i.test(settings.model)) {
+    return generateApiYiWanVideo(settings, options)
+  }
+  const form = new FormData()
+  form.set('model', settings.model)
+  form.set('prompt', options.prompt)
+  form.set('seconds', String(options.seconds))
+  form.set('size', options.size)
+  if (options.mode) form.set('mode', options.mode)
+  if (typeof options.generateAudio === 'boolean') form.set('generate_audio', String(options.generateAudio))
+  for (const [index, image] of (options.referenceImages ?? []).entries()) {
+    const reference = await fetch(image, { signal: options.signal })
+    if (!reference.ok) throw new GenerationRequestError('platform', '参考图片无法读取', `图片读取失败（${reference.status}）`)
+    form.append('reference_images', await reference.blob(), `reference-${index + 1}.png`)
+  }
+  if (options.firstFrame) {
+    const first = await fetch(options.firstFrame, { signal: options.signal })
+    if (!first.ok) throw new GenerationRequestError('platform', '首帧图片无法读取', `图片读取失败（${first.status}）`)
+    form.set('first_frame', await first.blob(), 'first-frame.png')
+  }
+  if (options.lastFrame) {
+    const last = await fetch(options.lastFrame, { signal: options.signal })
+    if (!last.ok) throw new GenerationRequestError('platform', '尾帧图片无法读取', `图片读取失败（${last.status}）`)
+    form.set('last_frame', await last.blob(), 'last-frame.png')
+  }
+  const referenceVideos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
+  for (const [index, source] of referenceVideos.entries()) {
+    const video = await fetch(source, { signal: options.signal })
+    if (!video.ok) throw new GenerationRequestError('platform', '参考视频无法读取', `视频读取失败（${video.status}）`)
+    if (referenceVideos.length === 1) form.set('reference_video', await video.blob(), 'reference-video.mp4')
+    else form.append('reference_videos', await video.blob(), `reference-video-${index + 1}.mp4`)
+  }
+  if (options.referenceImage) {
+    const reference = await fetch(options.referenceImage, { signal: options.signal })
+    if (!reference.ok) throw new GenerationRequestError('platform', '首帧图片无法读取', `图片读取失败（${reference.status}）`)
+    form.set('input_reference', await reference.blob(), 'start-frame.png')
+  }
+  let createdResponse: Response
+  try {
+    createdResponse = await fetch(endpoint(settings.baseUrl, 'videos'), { method: 'POST', headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), body: form, signal: options.signal })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw createNetworkError(error)
+  }
+  if (!createdResponse.ok) throw await createApiError(createdResponse)
+  const created = await createdResponse.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', '视频服务没有返回任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  const startedAt = Date.now()
+  let progress = Number(created.progress ?? 0)
+  let status = videoTaskStatus(created)
+  let lastJob: unknown = created
+  let consecutivePollErrors = 0
+  options.onProgress?.(progress, status)
+  while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
+    if (Date.now() - startedAt > 30 * 60_000) throw new GenerationRequestError('network', '视频生成等待超时', `任务 ${taskId} 超过 30 分钟仍未完成`, { requestId: taskId })
+    await waitForDelay(2_500, options.signal)
+    let pollResponse: Response
+    try {
+      pollResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}`), { headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), signal: options.signal })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      consecutivePollErrors += 1
+      if (consecutivePollErrors < 3) continue
+      throw new GenerationRequestError('network', '视频任务查询暂时中断', `任务 ID：${taskId}。任务仍可能成功，请勿重新提交。`, { requestId: taskId })
+    }
+    if (!pollResponse.ok) {
+      if (pollResponse.status === 429 || pollResponse.status >= 500) {
+        consecutivePollErrors += 1
+        if (consecutivePollErrors < 3) continue
+        throw new GenerationRequestError('network', '视频任务查询暂时中断', `任务 ID：${taskId}。连续查询失败，任务仍可能成功。`, { requestId: taskId })
+      }
+      throw await createApiError(pollResponse)
+    }
+    consecutivePollErrors = 0
+    const job = await pollResponse.json() as Record<string, unknown>
+    lastJob = job
+    status = videoTaskStatus(job, status)
+    const jobProgress = Number(job.progress)
+    progress = Math.max(progress, Number.isFinite(jobProgress) ? jobProgress : progress)
+    options.onProgress?.(progress, status)
+    if (status === 'failed') throw new GenerationRequestError('api', '视频生成失败', sanitizeAdminLogJson(job), { requestId: taskId })
+    if (status === 'cancelled' || status === 'canceled') throw new DOMException('Generation cancelled', 'AbortError')
+  }
+  const completedUrl = videoResultUrl(lastJob)
+  if (completedUrl) {
+    const mediaResponse = await fetch(/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) ? apiYiGeneratedMediaUrl(completedUrl) : completedUrl, { signal: options.signal })
+    if (!mediaResponse.ok) throw new GenerationRequestError('network', '视频已生成但下载失败', `任务 ${taskId} 的媒体下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [completedUrl] })
+    const mediaBlob = await mediaResponse.blob()
+    if (mediaBlob.size) return { blob: mediaBlob, taskId, progress: 100, sourceUrl: completedUrl }
+  }
+  const contentResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), signal: options.signal })
+  if (!contentResponse.ok) throw await createApiError(contentResponse)
+  const blob = await contentResponse.blob()
+  if (!blob.size) throw new GenerationRequestError('platform', '视频服务返回了空文件', `任务 ${taskId}`)
+  options.onProgress?.(100, 'completed')
+  return { blob, taskId, progress: 100 }
+}
+
+/** HFSY video models use a shared JSON create/query protocol rather than the
+ * OpenAI multipart /videos API. This covers sd-2*, sd-2.5*, Grok and future
+ * compatible entries returned by the HFSY model catalogue. */
+export function publicImageSourceUrl(source?: string): string | undefined {
+  if (!source) return undefined
+  try {
+    let parsed = new URL(source, 'https://local.invalid')
+    if (parsed.pathname === '/apiyi/media' && (parsed.origin === 'https://local.invalid' || typeof window !== 'undefined' && parsed.origin === new URL(window.location.href).origin)) {
+      parsed = new URL(parsed.searchParams.get('url') || '')
+    }
+    if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) return undefined
+    if (/^(localhost|local\.invalid|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[)/i.test(parsed.hostname)) return undefined
+    return parsed.href
+  } catch { return undefined }
+}
+
+function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video') {
+  const url = publicImageSourceUrl(source)
+  if (url) return url
+  const label = kind === 'image' ? '图片' : '视频'
+  throw new GenerationRequestError('platform', 'HFSY 仅支持公网素材链接', `请先将本地${label}上传到可公开访问的地址，再把 URL 用作参考素材。视频生成尚未提交。`)
+}
+
+/** Limits from the HFSY public model docs; unknown IDs are not guessed. */
+export function hfsyVideoLimits(model: string) {
+  if (/^sd-2\.5-(480|720)$/.test(model)) return { minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, prompt: 5000 }
+  if (/^sd-2\.0(?:-mini|-480|-fast|-fast-480)?$/.test(model)) return { minSeconds: 4, maxSeconds: 15, images: 4, videos: 3, prompt: 5000 }
+  if (/^sd-2(?:-vip(?:-720)?|-mini-(480|720))$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 15000 }
+  if (/^sd-2(?:-fast)?$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 5000 }
+  if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 5, videos: 0, prompt: 2000 }
+  if (model === 'sora-2') return { minSeconds: 4, maxSeconds: 12, images: 1, videos: 0, prompt: 10000, durations: [4, 8, 12] }
+  if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, prompt: 5000, durations: [6, 10, 15] }
+  if (model === 'kling-o3') return { minSeconds: 5, maxSeconds: 15, images: 2, videos: 0, prompt: 5000 }
+  return undefined
+}
+
+async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const ratio = options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1'
+    : /^\d+:\d+$/.test(options.size) ? options.size
+    : apiYiVideoRatio(options.size) === 'adaptive' ? '16:9' : apiYiVideoRatio(options.size)
+  const videos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
+  const body: Record<string, unknown> = {
+    model: settings.model,
+    prompt: options.prompt,
+    duration: options.seconds,
+    ratio,
+    orientation: ratio === '9:16' ? 'portrait' : 'landscape',
+    watermark: false,
+  }
+  const images = Array.from(new Set([...(options.referenceImages ?? []), options.referenceImage, options.firstFrame, options.lastFrame].filter((url): url is string => Boolean(url))))
+  const limits = hfsyVideoLimits(settings.model)
+  const invalid = (detail: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', `${detail}。视频生成尚未提交。`) }
+  if (limits) {
+    if (!Number.isInteger(options.seconds) || options.seconds < limits.minSeconds || options.seconds > limits.maxSeconds || (limits.durations && !limits.durations.includes(options.seconds))) invalid(`${settings.model} 时长需为 ${limits.durations?.join(' / ') || `${limits.minSeconds}–${limits.maxSeconds}`} 秒`)
+    if (images.length > limits.images) invalid(`${settings.model} 最多支持 ${limits.images} 张图片`)
+    if (videos.length > limits.videos) invalid(limits.videos ? `${settings.model} 最多支持 ${limits.videos} 个参考视频` : `${settings.model} 不支持视频参考，请选择支持视频参考的模型`)
+    if (options.prompt.length > limits.prompt) invalid(`${settings.model} 提示词不得超过 ${limits.prompt} 字符`)
+  }
+  if (options.mode === 'text2video' && (images.length || videos.length)) invalid('文生视频不能携带图片或视频，请切换参考模式')
+  if (options.mode === 'image2video' && images.length !== 1) invalid('图生视频需要一张首帧图片')
+  if (options.mode === 'first_last_frame' && images.length !== 2) invalid('首尾帧需要两张图片')
+  if (options.mode === 'all_reference' && !images.length && !videos.length) invalid('全能参考需要图片或视频素材')
+  const publicImages: string[] = []
+  const publicVideos: string[] = []
+  for (const image of images) publicImages.push(requireHfsyPublicMediaUrl(image, 'image'))
+  for (const video of videos) publicVideos.push(requireHfsyPublicMediaUrl(video, 'video'))
+  if (publicImages.length) body.images = publicImages
+  if (publicVideos.length) body.videos = publicVideos
+  let createdResponse: Response
+  try {
+    createdResponse = await fetch(endpoint(settings.baseUrl, 'video/create'), {
+      method: 'POST', signal: options.signal,
+      headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw createNetworkError(error)
+  }
+  if (!createdResponse.ok) throw await createApiError(createdResponse)
+  let task = await createdResponse.json() as unknown
+  if (task && typeof task === 'object' && 'success' in task && task.success === false) {
+    const detail = 'message' in task && typeof task.message === 'string' ? task.message : sanitizeAdminLogJson(task)
+    throw new GenerationRequestError('api', '视频接口拒绝了生成参数', detail)
+  }
+  const taskId = extractTaskId(task)
+  if (!taskId) throw new GenerationRequestError('platform', 'HFSY 没有返回视频任务编号', sanitizeAdminLogJson(task))
+  options.onTaskId?.(taskId)
+  const startedAt = Date.now()
+  let pollSettings = settings
+  let consecutiveFailures = 0
+  while (Date.now() - startedAt < 30 * 60_000) {
+    const status = videoTaskStatus(task)
+    const sourceUrl = videoResultUrl(task)
+    if (sourceUrl) {
+      // HFSY returns its completed videos from aixinai.net. The task is already
+      // successful at this point, but that CDN does not expose browser CORS
+      // headers, so download through the same-origin media relay.
+      const media = await fetch(apiYiGeneratedMediaUrl(sourceUrl), { signal: options.signal })
+      if (!media.ok) throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，媒体下载失败（${media.status}）。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+      options.onProgress?.(100, 'completed')
+      return { blob: await media.blob(), taskId, progress: 100, sourceUrl }
+    }
+    if (['failed', 'cancelled', 'canceled'].includes(status)) throw new GenerationRequestError('api', 'HFSY 视频生成失败', sanitizeAdminLogJson(task), { requestId: taskId })
+    options.onProgress?.(Math.min(95, Math.max(1, Number((task as Record<string, unknown>)?.progress) || 0)), status)
+    await waitForDelay(3_000, options.signal)
+    try {
+      const poll = await fetch(`${endpoint(pollSettings.baseUrl, 'video/query')}?id=${encodeURIComponent(taskId)}`, {
+        signal: options.signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
+      })
+      // HFSY's notice specifies api.hfsyapi.cn as the query fallback for 504s.
+      if (poll.status === 504 && /^(?:www\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname)) {
+        pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
+        continue
+      }
+      if (!poll.ok) throw await createApiError(poll)
+      task = await poll.json() as unknown
+      consecutiveFailures = 0
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      consecutiveFailures += 1
+      if (consecutiveFailures >= 3) throw new GenerationRequestError('network', 'HFSY 视频任务查询暂时中断', `任务 ID：${taskId}。任务仍可能成功，请勿重复提交。`, { requestId: taskId })
+    }
+  }
+  throw new GenerationRequestError('network', 'HFSY 视频生成等待超时', `任务 ID：${taskId}。任务可能仍在生成，请在 HFSY 控制台查询。`, { requestId: taskId })
+}
+
+async function waitForEvolinkTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal, onProgress?: (progress: number, status: string) => void) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < 30 * 60_000) {
+    await waitForDelay(3_000, signal)
+    const response = await fetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
+      signal,
+      headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, Accept: 'application/json' }),
+    })
+    if (!response.ok) throw await createApiError(response)
+    const payload = await response.json() as Record<string, unknown>
+    const status = extractProviderTaskStatus(payload) || String(payload.status ?? 'processing').toLowerCase()
+    const progress = Number(payload.progress ?? 0)
+    onProgress?.(Number.isFinite(progress) ? progress : 0, status)
+    if (['failed', 'cancelled', 'canceled', 'expired'].includes(status)) throw new GenerationRequestError('api', 'Evolink 任务失败', sanitizeAdminLogJson(payload), { requestId: taskId })
+    if (status === 'completed' || extractProviderImages(payload).length) return payload
+  }
+  throw new GenerationRequestError('network', 'Evolink 任务查询超时', `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复提交。`, { requestId: taskId })
+}
+
+async function generateEvolinkVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const imageUrls = Array.from(new Set([
+    ...(options.referenceImages ?? []), options.firstFrame, options.lastFrame, options.referenceImage,
+  ].filter((value): value is string => Boolean(value))))
+  const videoUrls = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((value): value is string => Boolean(value))))
+  const response = await fetch(endpoint(settings.baseUrl, 'videos/generations'), {
+    method: 'POST', signal: options.signal,
+    headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      model: settings.model,
+      prompt: options.prompt,
+      duration: Math.max(3, Math.min(15, Math.round(options.seconds))),
+      quality: videoResolutionFromSize(options.size),
+      aspect_ratio: apiYiVideoRatio(options.size),
+      generate_audio: options.generateAudio !== false,
+      ...(imageUrls.length ? { image_urls: imageUrls } : {}),
+      ...(videoUrls.length ? { video_urls: videoUrls } : {}),
+    }),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const created = await response.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', 'Evolink 没有返回视频任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
+  const sourceUrl = extractProviderImages(completed)[0]?.url
+  if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 视频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
+  const mediaResponse = await fetch(sourceUrl, { signal: options.signal })
+  if (!mediaResponse.ok) throw new GenerationRequestError('network', 'Evolink 视频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
+  return { blob: await mediaResponse.blob(), taskId, progress: 100, sourceUrl }
+}
+
+/** Evolink unified asynchronous audio endpoint. Model-specific optional fields
+ * are accepted through `extra` so new documented audio models remain usable
+ * without weakening the generic OpenAI-compatible request paths. */
+export async function generateRemoteAudio(settings: ApiRequestSettings, options: AudioGenerationOptions): Promise<GeneratedAudio> {
+  const response = await fetch(endpoint(settings.baseUrl, 'audios/generations'), {
+    method: 'POST', signal: options.signal,
+    headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      model: settings.model,
+      prompt: options.prompt,
+      ...(options.voice ? { voice: options.voice } : {}),
+      ...(options.language ? { language_type: options.language } : {}),
+      ...(options.duration ? { duration: options.duration } : {}),
+      ...(options.referenceAudioUrl ? { audio_urls: [options.referenceAudioUrl] } : {}),
+      ...(options.referenceImageUrl ? { image_urls: [options.referenceImageUrl] } : {}),
+      ...(options.extra ?? {}),
+    }),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const created = await response.json() as Record<string, unknown>
+  const taskId = extractTaskId(created)
+  if (!taskId) throw new GenerationRequestError('platform', 'Evolink 没有返回音频任务编号', sanitizeAdminLogJson(created))
+  options.onTaskId?.(taskId)
+  const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
+  const sourceUrl = extractProviderImages(completed)[0]?.url
+  if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 音频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
+  const mediaResponse = await fetch(sourceUrl, { signal: options.signal })
+  if (!mediaResponse.ok) throw new GenerationRequestError('network', 'Evolink 音频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
+  return { blob: await mediaResponse.blob(), taskId, progress: 100, sourceUrl, payload: completed }
+}
+
+/**
+ * Video providers do not share one response schema, so keep a compact request
+ * and lifecycle snapshot even when a provider rejects the request. This is
+ * especially useful for APIYI 5xx responses whose actionable detail is only
+ * present in the one-time error body.
+ */
+export async function generateRemoteVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const startedAtMs = Date.now()
+  const startedAt = new Date(startedAtMs).toISOString()
+  const provider = resolveProviderLabel(settings.baseUrl)
+  const requestJson = sanitizeAdminLogJson({
+    model: settings.model,
+    prompt: options.prompt,
+    seconds: options.seconds,
+    size: options.size,
+    mode: options.mode,
+    generateAudio: options.generateAudio,
+    referenceImageCount: (options.referenceImages?.length ?? 0) + (options.referenceImage ? 1 : 0),
+    referenceVideoCount: (options.referenceVideos?.length ?? 0) + (options.referenceVideo ? 1 : 0),
+  })
+  try {
+    const result = await generateRemoteVideoRequest(settings, options)
+    options.captureAdminLog?.({
+      provider,
+      taskId: result.taskId,
+      model: settings.model,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      resultType: 'success',
+      kind: 'video',
+      requestJson,
+      resultJson: sanitizeAdminLogJson({ taskId: result.taskId, status: 'completed', progress: result.progress, contentType: result.blob.type, bytes: result.blob.size }),
+      resultUrls: result.sourceUrl ? [result.sourceUrl] : [],
+    })
+    return result
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    const normalized = normalizeGenerationError(error)
+    options.captureAdminLog?.({
+      provider,
+      taskId: normalized.requestId,
+      model: settings.model,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      resultType: 'failed',
+      kind: 'video',
+      requestJson,
+      resultJson: sanitizeAdminLogJson({ category: normalized.category, summary: normalized.message, detail: normalized.detail, status: normalized.status, requestId: normalized.requestId }),
+      resultUrls: normalized.resultUrls ?? [],
+    })
+    throw error
+  }
+}
+
+export type ProviderCredits = {
+  provider: string
+  amount: number
+  unit: string
+  updatedAt: string
+}
+
+export type CurrencyRate = {
+  base: string
+  target: string
+  rate: number
+  date: string
+  fetchedAt: string
+}
+
+export async function fetchUsdToCnyRate(): Promise<CurrencyRate> {
+  const response = await fetch('https://api.frankfurter.app/latest?from=USD&to=CNY', {
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) throw new Error(`汇率服务暂不可用（${response.status}）`)
+  const payload = await response.json() as { amount?: unknown; base?: unknown; date?: unknown; rates?: { CNY?: unknown } }
+  const rate = Number(payload.rates?.CNY)
+  if (!Number.isFinite(rate) || rate <= 0) throw new Error('汇率服务返回了无效的 USD/CNY 汇率')
+  return {
+    base: String(payload.base ?? 'USD'),
+    target: 'CNY',
+    rate,
+    date: String(payload.date ?? new Date().toISOString().slice(0, 10)),
+    fetchedAt: new Date().toISOString(),
+  }
+}
+
+export type ProviderModelPrice = {
+  modelId: string
+  credits: number
+  billing: 'fixed' | 'token'
+  priceExample?: string
+  unit?: string
+}
+
+export async function fetchProviderModelPrices(baseUrl: string): Promise<ProviderModelPrice[]> {
+  const normalizedBase = normalizedApiBaseUrl(baseUrl)
+  if (/api\.apiyi\.com|apiyi\.com/i.test(normalizedBase)) {
+    const apiYiOrigin = new URL(normalizedBase).origin
+    const response = await fetch(`${apiYiOrigin}/api/pricing`, {
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    const payload = await response.json() as { success?: unknown; data?: unknown }
+    if (payload.success !== true || !Array.isArray(payload.data)) return []
+    return payload.data.flatMap((row): ProviderModelPrice[] => {
+      if (!row || typeof row !== 'object') return []
+      const item = row as Record<string, unknown>
+      const modelId = String(item.model_name ?? '').trim()
+      const quotaType = Number(item.quota_type)
+      const modelPrice = Number(item.model_price)
+      const modelRatio = Number(item.model_ratio)
+      if (!modelId) return []
+      if (quotaType === 1 && Number.isFinite(modelPrice) && modelPrice > 0) {
+        return [{ modelId, credits: modelPrice, billing: 'fixed', unit: 'USD', priceExample: `约 $${modelPrice.toFixed(2)} / 次` }]
+      }
+      if (quotaType === 0 && Number.isFinite(modelRatio) && modelRatio > 0) {
+        return [{ modelId, credits: modelRatio, billing: 'token', unit: '倍率', priceExample: `按 Token · 倍率 ${modelRatio}` }]
+      }
+      return []
+    })
+  }
+  if (!isGrsaiBaseUrl(baseUrl)) return []
+  const origin = new URL(normalizedApiBaseUrl(baseUrl)).origin
+  const response = await fetch(`${origin}/client/serverGrsai/getModelList`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+  if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+  const payload = await response.json() as { code?: unknown; data?: { list?: unknown[] }; msg?: unknown }
+  if (payload.code !== 0) throw new Error(typeof payload.msg === 'string' ? payload.msg : '未能读取 GRS AI 模型价格')
+  return (payload.data?.list ?? []).flatMap((row): ProviderModelPrice[] => {
+    if (!row || typeof row !== 'object') return []
+    const item = row as Record<string, unknown>
+    const modelId = String(item.name ?? item.model ?? '').trim()
+    const credits = Number(item.credits)
+    if (!modelId || !Number.isFinite(credits) || credits < 0) return []
+    return [{
+      modelId,
+      credits,
+      billing: Number(item.cost_type) === 0 ? 'fixed' : 'token',
+      priceExample: typeof item.priceExample === 'string' ? item.priceExample : undefined,
+    }]
+  })
+}
+
+/**
+ * Provider account adapters live here instead of the UI so adding a new vendor
+ * never requires changing the connection screen. OpenAI-compatible APIs do not
+ * have a standard balance endpoint, therefore only documented providers appear.
+ */
+export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'> & { balanceToken?: string }): Promise<ProviderCredits | null> {
+  const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
+  if (isHfsyBaseUrl(normalizedBase)) {
+    throw new Error('HFSY 官方公开 API 暂未提供余额查询接口；请在 HFSY 控制台查看余额。')
+  }
+  if (isEvolinkBaseUrl(normalizedBase)) {
+    const response = await fetch(endpoint(normalizedBase, 'credits'), {
+      headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' }),
+    })
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    const payload = await response.json() as { success?: unknown; message?: unknown; data?: { token?: { remaining_credits?: unknown; unlimited_credits?: unknown } } }
+    if (payload.success !== true) throw new Error(typeof payload.message === 'string' && payload.message ? payload.message : '未能读取 Evolink 积分')
+    if (payload.data?.token?.unlimited_credits === true) return { provider: 'Evolink', amount: Number.POSITIVE_INFINITY, unit: '无限积分', updatedAt: new Date().toISOString() }
+    const amount = Number(payload.data?.token?.remaining_credits)
+    if (!Number.isFinite(amount) || amount < 0) throw new Error('Evolink 返回了无效的 Token 积分余额')
+    return { provider: 'Evolink', amount, unit: '积分', updatedAt: new Date().toISOString() }
+  }
+  if (/api\.apimart\.ai|apimart\.ai/i.test(normalizedBase)) {
+    const response = await fetch('https://api.apimart.ai/v1/balance', {
+      headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' },
+    })
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    const payload = await response.json() as { success?: unknown; message?: unknown; remain_balance?: unknown; unlimited_quota?: unknown }
+    if (payload.success !== true) throw new Error(typeof payload.message === 'string' ? payload.message : '未能读取 APIMart 余额')
+    if (payload.unlimited_quota === true) return { provider: 'APIMart', amount: Number.POSITIVE_INFINITY, unit: '无限额度', updatedAt: new Date().toISOString() }
+    const amount = Number(payload.remain_balance)
+    if (!Number.isFinite(amount) || amount < 0) throw new Error('APIMart 返回了无效的余额')
+    return { provider: 'APIMart', amount, unit: '余额（账户币种）', updatedAt: new Date().toISOString() }
+  }
+  if (/api\.apiyi\.com|apiyi\.com/i.test(normalizedBase)) {
+    const token = settings.balanceToken?.trim()
+    if (!token) throw new Error('请填写 APIYI 个人中心生成的余额查询 AccessToken')
+    const apiYiOrigin = new URL(normalizedBase).origin
+    const response = await fetch(`${apiYiOrigin}/api/user/self`, {
+      headers: { Accept: 'application/json', Authorization: token, 'Content-Type': 'application/json' },
+    })
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    const payload = await response.json() as { success?: unknown; message?: unknown; data?: { quota?: unknown } }
+    if (payload.success !== true) throw new Error(typeof payload.message === 'string' ? payload.message : '未能读取 APIYI 余额')
+    const quota = Number(payload.data?.quota)
+    if (!Number.isFinite(quota) || quota < 0) throw new Error('APIYI 返回了无效的余额')
+    return { provider: 'APIYI', amount: quota / 500_000, unit: 'USD', updatedAt: new Date().toISOString() }
+  }
+  if (!isGrsaiBaseUrl(settings.baseUrl) || !settings.apiKey.trim()) return null
+  const apiKey = settings.apiKey.trim()
+  const nodeOrigin = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
+  const requestCredits = async () => {
+    // Official GRS documentation provides this API-key-authenticated endpoint.
+    // /client/openapi/getCredits is intentionally not used here: it requires the
+    // separate account token from the GRS user-info page, not a generation key.
+    const response = await fetch(`${nodeOrigin}/client/common/getCredits?apikey=${encodeURIComponent(apiKey)}`, {
+      method: 'GET',
+    })
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown }
+    if (payload.code !== 0) throw new Error(typeof payload.msg === 'string' ? payload.msg : '未能读取 GRS AI 积分')
+    const credits = payload.data && typeof payload.data === 'object'
+      ? (payload.data as { credits?: unknown }).credits
+      : undefined
+    const amount = typeof credits === 'number' ? credits : typeof credits === 'string' ? Number(credits) : Number.NaN
+    if (!Number.isFinite(amount) || amount < 0) throw new Error('GRS AI 返回了无效的积分余额')
+    return amount
+  }
+  const amount = await requestCredits()
+  return { provider: 'GRS AI', amount, unit: '积分', updatedAt: new Date().toISOString() }
+}
+
+/** Validate credentials without performing a billable generation request. */
+export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<void> {
+  const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
+  if (!settings.apiKey.trim()) throw new Error('API Key 不能为空')
+  const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
+  if (supplement?.catalogOnly) {
+    // GRS documents this account endpoint specifically for querying an API key's
+    // credit balance. It authenticates the supplied key without starting a
+    // generation, unlike the static local catalog which proves nothing about it.
+    let response: Response
+    try {
+      response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/openapi/getAPIKeyCredits'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: settings.apiKey.trim() }),
+      })
+    } catch (error) {
+      throw new Error(error instanceof Error ? `无法验证 GRS AI API Key：${error.message}` : '无法验证 GRS AI API Key，请检查地址和网络')
+    }
+    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+    try {
+      const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown }
+      if (payload.code !== 0) {
+        throw new Error(typeof payload.msg === 'string' && payload.msg.trim() ? payload.msg : 'GRS AI API Key 无效或已失效')
+      }
+    } catch (error) {
+      if (error instanceof Error) throw error
+      throw new Error('GRS AI 未返回可确认的 API Key 校验结果')
+    }
+    return
+  }
+  let response: Response
+  try {
+    response = await fetch(endpoint(settings.baseUrl, 'models'), {
+      headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey.trim()}` }),
+    })
+  } catch (error) {
+    throw new Error(error instanceof Error ? `无法连接接口：${error.message}` : '无法连接接口，请检查地址和网络')
+  }
+  if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
+}
+
+// Auto-enable current mainstream families when a provider actually exposes
+// them to the user's key. This never invents catalog entries or bypasses the
+// provider's model/group permissions.
+const DEFAULT_TEXT_PATTERN = /gemini|deepseek|gpt/i
+const DEFAULT_IMAGE_PATTERN = /nano(?:-banana)?|seedream|gpt-image/i
+// Video families that should be enabled immediately after a successful model
+// catalog refresh. The match is deliberately based on the provider's returned
+// id/name, so it never creates a model the current key cannot access.
+const DEFAULT_VIDEO_PATTERN = /seedance|veo|wan(?:2\.\d)?|happyhorse/i
+
+export function isModelAutoEnabled(model: { id: string; name: string; capability: ModelCapability }): boolean {
+  const haystack = `${model.id} ${model.name}`
+  if (model.capability === 'text') return DEFAULT_TEXT_PATTERN.test(haystack)
+  if (model.capability === 'image') return DEFAULT_IMAGE_PATTERN.test(haystack)
+  if (model.capability === 'video') return DEFAULT_VIDEO_PATTERN.test(haystack)
+  return false
+}
+
+export function pickPreferredModelId(
+  models: { id: string; name: string; capability: ModelCapability; enabled: boolean }[],
+  kind: 'text' | 'image',
+): string | undefined {
+  const enabled = models.filter((model) => model.enabled && model.capability === kind)
+  if (enabled.length === 0) return undefined
+  if (kind === 'text') {
+    return enabled.find((model) => /gpt/i.test(`${model.id} ${model.name}`))?.id
+      ?? enabled.find((model) => /gemini/i.test(`${model.id} ${model.name}`))?.id
+      ?? enabled[0].id
+  }
+  return enabled.find((model) => /gpt-image|image2/i.test(`${model.id} ${model.name}`))?.id
+    ?? enabled.find((model) => /nano/i.test(`${model.id} ${model.name}`))?.id
+    ?? enabled[0].id
+}
+
+const extractGeneratedImages = extractProviderImages
+
+/** Visionary can echo request reference URLs while a task is processing. Only
+ * documented result containers count as generated output. */
+function extractVisionaryGeneratedImages(payload: unknown): GeneratedImage[] {
+  if (!payload || typeof payload !== 'object') return []
+  const root = payload as Record<string, unknown>
+  const candidates: unknown[] = [root.results, root.result, root.output]
+  const dataItems = Array.isArray(root.data) ? root.data : [root.data]
+  for (const item of dataItems) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    candidates.push(record.result, record.results, record.output)
+  }
+  return candidates.flatMap((candidate) => extractGeneratedImages(candidate))
+}
+
+async function resolveGrsaiImageResult(
+  settings: ApiRequestSettings,
+  initialPayload: unknown,
+  signal?: AbortSignal,
+) {
+  const initial = initialPayload && typeof initialPayload === 'object'
+    ? initialPayload as Record<string, unknown>
+    : {}
+  const taskId = String(initial.id ?? initial.taskId ?? initial.task_id ?? '').trim()
+  const initialStatus = String(initial.status ?? '').toLowerCase()
+  if (extractGeneratedImages(initialPayload).length) return initialPayload
+  if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(initialStatus)) {
+    throw new GenerationRequestError(
+      'api',
+      initialStatus === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
+      String(initial.error ?? initial.message ?? `任务状态：${initialStatus}`),
+      { requestId: taskId || undefined },
+    )
+  }
+  if (!taskId) return initialPayload
+
+  const startedAt = Date.now()
+  let consecutiveErrors = 0
+  let succeededWithoutResultCount = 0
+  while (Date.now() - startedAt < GRSAI_IMAGE_POLL_TIMEOUT_MS) {
+    await waitForDelay(GRSAI_IMAGE_POLL_INTERVAL_MS, signal)
+    let response: Response
+    try {
+      response = await fetch(`${endpoint(settings.baseUrl, 'api/result')}?id=${encodeURIComponent(taskId)}`, {
+        signal,
+        headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+      })
+      if (!response.ok) {
+        const errorPayload = await response.clone().json().catch(() => null) as Record<string, unknown> | null
+        const nestedError = errorPayload?.data && typeof errorPayload.data === 'object'
+          ? errorPayload.data as Record<string, unknown>
+          : null
+        const errorRecord = nestedError ?? errorPayload
+        const errorStatus = String(errorRecord?.status ?? '').toLowerCase()
+        if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(errorStatus)) {
+          throw new GenerationRequestError(
+            'api',
+            errorStatus === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
+            String(errorRecord?.error ?? errorRecord?.message ?? `任务状态：${errorStatus}`),
+            { requestId: taskId },
+          )
+        }
+        if (response.status === 401 || response.status === 403) throw await createApiError(response)
+        throw new Error(`结果查询失败（${response.status}）`)
+      }
+      const payload = await response.json() as unknown
+      consecutiveErrors = 0
+      const images = extractGeneratedImages(payload)
+      if (images.length) return payload
+      const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+      const status = String(record.status ?? '').toLowerCase()
+      if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(status)) {
+        throw new GenerationRequestError(
+          'api',
+          status === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
+          String(record.error ?? record.message ?? `任务状态：${status}`),
+          { requestId: taskId },
+        )
+      }
+      if (/^(?:succeeded|success|completed|complete)$/.test(status)) {
+        succeededWithoutResultCount += 1
+        // A successful status can arrive just before the result URL is replicated.
+        if (succeededWithoutResultCount >= 20) {
+          throw new GenerationRequestError(
+            'platform',
+            'GRS AI 显示生成成功，但暂未返回图片地址',
+            `任务 ${taskId} 已成功。Disy 已额外查询多次，但结果地址仍为空；请稍后从 GRS AI 日志找回，避免重复扣费。`,
+            { requestId: taskId },
+          )
+        }
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      if (error instanceof GenerationRequestError) throw error
+      consecutiveErrors += 1
+      if (consecutiveErrors >= GRSAI_MAX_CONSECUTIVE_POLL_ERRORS) {
+        throw new GenerationRequestError(
+          'network',
+          'GRS AI 任务已提交，但结果查询暂时中断',
+          `任务 ID：${taskId}。连续 ${consecutiveErrors} 次查询失败，任务仍可能在服务端成功完成；请勿直接重试。`,
+          { requestId: taskId },
+        )
+      }
+    }
+  }
+  throw new GenerationRequestError(
+    'network',
+    'GRS AI 任务仍在生成或结果查询超时',
+    `任务 ID：${taskId}。Disy 已持续查询 15 分钟，任务仍可能稍后成功；请勿直接重复生成。`,
+    { requestId: taskId },
+  )
+}
+
+async function resolveVisionaryImageResult(
+  settings: ApiRequestSettings,
+  initialPayload: unknown,
+  signal?: AbortSignal,
+) {
+  if (extractVisionaryGeneratedImages(initialPayload).length) return initialPayload
+  const taskId = extractTaskId(initialPayload)
+  if (!taskId) return initialPayload
+  if (classifyProviderPayload(initialPayload) === 'failed') {
+    throw new GenerationRequestError('api', 'Visionary 图像任务生成失败', sanitizeAdminLogJson(initialPayload), { requestId: taskId })
+  }
+
+  const startedAt = Date.now()
+  let consecutiveErrors = 0
+  let successWithoutResultCount = 0
+  while (Date.now() - startedAt < VISIONARY_POLL_TIMEOUT_MS) {
+    await waitForDelay(VISIONARY_POLL_INTERVAL_MS, signal)
+    try {
+      const response = await fetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
+        signal,
+        headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+      })
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) throw await createApiError(response)
+        // A newly submitted task can briefly be absent while it propagates.
+        if (response.status === 404 && Date.now() - startedAt < 30_000) continue
+        if (response.status === 429 || response.status >= 500) throw new Error(`任务查询暂时失败（${response.status}）`)
+        throw await createApiError(response)
+      }
+      const payload = await response.json() as unknown
+      consecutiveErrors = 0
+      if (extractVisionaryGeneratedImages(payload).length) return payload
+      const state = classifyProviderPayload(payload)
+      if (state === 'failed') {
+        throw new GenerationRequestError('api', 'Visionary 图像任务生成失败', sanitizeAdminLogJson(payload), { requestId: taskId })
+      }
+      if (state === 'success_without_result') {
+        successWithoutResultCount += 1
+        if (successWithoutResultCount >= VISIONARY_SUCCESS_WITHOUT_URL_RETRIES) {
+          throw new GenerationRequestError(
+            'platform',
+            'Visionary 显示生成成功，但暂未返回图片地址',
+            `任务 ${taskId} 已成功，但结果地址仍未同步；请从任务记录恢复，不要重新生成。`,
+            { requestId: taskId },
+          )
+        }
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      if (error instanceof GenerationRequestError) throw error
+      consecutiveErrors += 1
+      if (consecutiveErrors >= VISIONARY_MAX_CONSECUTIVE_POLL_ERRORS) {
+        throw new GenerationRequestError(
+          'network',
+          'Visionary 任务已提交，但结果查询暂时中断',
+          `任务 ID：${taskId}。任务仍可能成功，请从任务记录恢复，不要重新生成。`,
+          { requestId: taskId },
+        )
+      }
+    }
+  }
+  throw new GenerationRequestError(
+    'network',
+    'Visionary 任务查询超时',
+    `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复生成。`,
+    { requestId: taskId },
+  )
+}
+
+function genericProviderPollCandidates(settings: ApiRequestSettings, initialPayload: unknown, taskId: string) {
+  const candidates: string[] = []
+  const baseOrigin = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
+  const visited = new WeakSet<object>()
+  const addExplicit = (value: unknown) => {
+    if (typeof value !== 'string' || !value.trim()) return
+    try {
+      const url = new URL(value.trim(), normalizedApiBaseUrl(settings.baseUrl) + '/')
+      // Never forward a user's API key to a host other than the configured
+      // provider. Cross-origin result media is handled after JSON extraction.
+      if (url.origin === baseOrigin) candidates.push(url.toString())
+    } catch { /* ignore malformed provider hints */ }
+  }
+  const visit = (value: unknown, depth = 0) => {
+    if (!value || depth > 4 || typeof value !== 'object' || visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) { value.forEach((item) => visit(item, depth + 1)); return }
+    const record = value as Record<string, unknown>
+    for (const key of ['status_url', 'statusUrl', 'task_url', 'taskUrl', 'poll_url', 'pollUrl']) addExplicit(record[key])
+    for (const key of ['data', 'result', 'output']) visit(record[key], depth + 1)
+  }
+  visit(initialPayload)
+  if (isHfsyBaseUrl(settings.baseUrl)) candidates.push(endpoint(settings.baseUrl, `images/generations/${encodeURIComponent(taskId)}`))
+  for (const path of providerTaskPollPaths(taskId)) candidates.push(endpoint(settings.baseUrl, path))
+  return Array.from(new Set(candidates))
+}
+
+/**
+ * Conservative fallback for OpenAI-shaped providers that submit an async job.
+ * It performs GET-only discovery, never retries the billable POST, and only
+ * sends credentials to the configured provider origin.
+ */
+async function resolveGenericProviderImageResult(
+  settings: ApiRequestSettings,
+  initialPayload: unknown,
+  signal?: AbortSignal,
+) {
+  if (extractProviderImages(initialPayload).length) return initialPayload
+  const taskId = extractProviderTaskId(initialPayload)
+  if (!taskId) return initialPayload
+  if (classifyProviderPayload(initialPayload) === 'failed') {
+    throw new GenerationRequestError('api', '图像任务生成失败', sanitizeAdminLogJson(initialPayload), { requestId: taskId })
+  }
+
+  const candidates = genericProviderPollCandidates(settings, initialPayload, taskId)
+  const headers = providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, Accept: 'application/json' })
+  const startedAt = Date.now()
+  let selectedEndpoint = ''
+  let consecutiveErrors = 0
+  let successWithoutResultCount = 0
+  while (Date.now() - startedAt < GENERIC_PROVIDER_POLL_TIMEOUT_MS) {
+    await waitForDelay(GENERIC_PROVIDER_POLL_INTERVAL_MS, signal)
+    const roundCandidates = selectedEndpoint ? [selectedEndpoint] : candidates
+    let foundEndpointThisRound = false
+    let transientFailureThisRound = false
+    for (const candidate of roundCandidates) {
+      try {
+        const response = await fetch(candidate, { signal, headers })
+        if (response.status === 404 && !selectedEndpoint) continue
+        if (response.status === 401 || response.status === 403) throw await createApiError(response)
+        if (response.status === 429 || response.status >= 500) {
+          transientFailureThisRound = true
+          continue
+        }
+        if (!response.ok) throw await createApiError(response)
+        foundEndpointThisRound = true
+        selectedEndpoint = candidate
+        const payload = await response.json() as unknown
+        consecutiveErrors = 0
+        if (extractProviderImages(payload).length) return payload
+        const state = classifyProviderPayload(payload)
+        if (state === 'failed') {
+          throw new GenerationRequestError('api', '图像任务生成失败', sanitizeAdminLogJson(payload), { requestId: taskId })
+        }
+        if (state === 'success_without_result') {
+          successWithoutResultCount += 1
+          if (successWithoutResultCount >= GENERIC_PROVIDER_SUCCESS_WITHOUT_URL_RETRIES) {
+            throw new GenerationRequestError(
+              'platform',
+              '厂商显示生成成功，但暂未返回图片地址',
+              `任务 ID：${taskId}。结果可能仍在同步，请从厂商任务记录恢复，不要重新生成。`,
+              { requestId: taskId },
+            )
+          }
+        }
+        break
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        if (error instanceof GenerationRequestError) throw error
+        transientFailureThisRound = true
+      }
+    }
+    if (foundEndpointThisRound) continue
+    if (!selectedEndpoint && !transientFailureThisRound) {
+      if (Date.now() - startedAt < 30_000) continue
+    }
+    if (!selectedEndpoint && Date.now() - startedAt >= 30_000 && !transientFailureThisRound) {
+      throw new GenerationRequestError(
+        'platform',
+        '已收到任务编号，但无法识别厂商的查询接口',
+        `任务 ID：${taskId}。已安全尝试常见 tasks、jobs、requests 查询路径，未重新提交生成请求。请从厂商后台恢复。`,
+        { requestId: taskId },
+      )
+    }
+    consecutiveErrors += 1
+    if (consecutiveErrors >= GENERIC_PROVIDER_MAX_CONSECUTIVE_POLL_ERRORS) {
+      throw new GenerationRequestError(
+        'network',
+        '任务已提交，但结果查询暂时中断',
+        `任务 ID：${taskId}。任务仍可能在厂商服务器完成，请勿重新生成。`,
+        { requestId: taskId },
+      )
+    }
+  }
+  throw new GenerationRequestError(
+    'network',
+    '任务查询超时',
+    `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复生成。`,
+    { requestId: taskId },
+  )
+}
+
+export function resolveImageRequestSize(model: string, aspectRatio = '1:1', resolution: '1K' | '2K' | '4K' = '1K') {
+  const compatibleSize = (() => {
+    const [width, height] = String(aspectRatio).split(':').map(Number)
+    if (!Number.isFinite(width) || !Number.isFinite(height) || height === 0) return '1024x1024'
+    const ratio = width / height
+    if (ratio > 1.15) return '1536x1024'
+    if (ratio < 0.87) return '1024x1536'
+    return '1024x1024'
+  })()
+  // GPT Image 2 accepts flexible dimensions. Preserve the requested canvas
+  // ratio instead of collapsing portrait work (for example 9:16) into the
+  // legacy 2:3 bucket used by earlier image APIs.
+  if (!/(?:^|\b)gpt-image-2(?:\b|$)/i.test(model)) return compatibleSize
+  const [rawWidth, rawHeight] = String(aspectRatio).split(':').map(Number)
+  if (!Number.isFinite(rawWidth) || !Number.isFinite(rawHeight) || rawWidth <= 0 || rawHeight <= 0) return compatibleSize
+  const ratio = Math.min(3, Math.max(1 / 3, rawWidth / rawHeight))
+  const shortEdge = resolution === '4K' ? 2160 : resolution === '2K' ? 1440 : 1024
+  const roundTo16 = (value: number) => Math.max(16, Math.round(value / 16) * 16)
+  const width = ratio >= 1 ? roundTo16(shortEdge * ratio) : roundTo16(shortEdge)
+  const height = ratio >= 1 ? roundTo16(shortEdge) : roundTo16(shortEdge / ratio)
+  return `${Math.min(3840, width)}x${Math.min(3840, height)}`
+}
+
+export async function generateRemoteImages(
+  settings: ApiRequestSettings,
+  options: ImageGenerationOptions,
+): Promise<GeneratedImage[]> {
+  const startedAtMs = Date.now()
+  const startedAt = new Date(startedAtMs).toISOString()
+  const requestSize = resolveImageRequestSize(settings.model, options.aspectRatio, options.resolution)
+  const isApiYiSeedream = /api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedream/i.test(settings.model)
+  const body: Record<string, unknown> = {
+    model: settings.model,
+    prompt: options.prompt,
+    ...(isApiYiSeedream ? {} : { n: options.count }),
+    size: requestSize,
+  }
+  // APIYI's Seedream endpoint uses resolution presets. A 1024x1024 OpenAI
+  // default is invalid for Seedream 5.x (and pro requires 1K/2K presets).
+  if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedream/i.test(settings.model)) {
+    const requested = options.resolution ?? '2K'
+    body.size = /pro/i.test(settings.model)
+      ? (requested === '4K' ? '2K' : requested)
+      : (requested === '1K' || requested === '4K' ? '2K' : requested)
+    body.watermark = false
+    body.output_format = 'png'
+  }
+  if (options.aspectRatio && options.aspectRatio !== 'auto' && !isApiYiSeedream) body.aspect_ratio = options.aspectRatio
+  if (options.resolution && !isApiYiSeedream) body.resolution = options.resolution
+  if (options.detail && !isApiYiSeedream) body.quality = options.detail
+  if (!/gpt-image/i.test(settings.model)) body.response_format = 'url'
+  const referenceImages = options.referenceImages?.filter(Boolean) ?? []
+  if (isHfsyBaseUrl(settings.baseUrl) && /^nano-banana-(?:2|pro)$/i.test(settings.model)) {
+    const betaSettings = { ...settings, baseUrl: new URL(normalizedApiBaseUrl(settings.baseUrl)).origin + '/v1beta' }
+    const parts: Array<Record<string, unknown>> = [{ text: options.prompt }]
+    for (const fileUri of referenceImages.slice(0, 7)) parts.push({ fileData: { mimeType: /^data:image\/jpeg/i.test(fileUri) ? 'image/jpeg' : 'image/png', fileUri } })
+    const response = await fetch(endpoint(betaSettings.baseUrl, `models/${settings.model}:generateContent`), {
+      method: 'POST', signal: options.signal,
+      headers: providerRelayHeaders(betaSettings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ contents: [{ parts }], generationConfig: { imageConfig: { imageSize: options.resolution ?? '1K', aspectRatio: options.aspectRatio ?? '1:1' } } }),
+    })
+    if (!response.ok) throw await createApiError(response)
+    const payload = await response.json() as unknown
+    const rows = extractGeneratedImages(payload)
+    if (!rows.length) throw new GenerationRequestError('platform', 'HFSY Nano Banana 没有返回图片地址', sanitizeAdminLogJson(payload))
+    return rows
+  }
+  const useGrsaiUnifiedImage = isGrsaiBaseUrl(settings.baseUrl)
+  const useVisionaryTaskImage = isVisionaryBaseUrl(settings.baseUrl)
+  const useEvolinkTaskImage = isEvolinkBaseUrl(settings.baseUrl)
+  const useStandardImageEdit = !useGrsaiUnifiedImage && !useEvolinkTaskImage && referenceImages.length > 0 && /(?:gpt-image|chatgpt-image)/i.test(settings.model)
+  // GRS documents `images` as raw Base64 or URL values. A browser Data URL
+  // includes a MIME header that its upload worker does not decode reliably.
+  const grsaiReferenceImages = referenceImages.map((source) => {
+    const dataUrl = /^data:image\/(?:png|jpe?g);base64,([\s\S]+)$/i.exec(source)
+    return dataUrl ? dataUrl[1].replace(/\s/g, '') : source
+  })
+  const isGrsaiGptImage = /(?:gpt-image|chatgpt-image)/i.test(settings.model)
+  const grsaiRequestBody: Record<string, unknown> = {
+    model: settings.model,
+    prompt: options.prompt,
+    images: grsaiReferenceImages,
+    // GRS uses two schemas on this unified endpoint: GPT Image expects pixel
+    // dimensions, while Nano Banana expects a ratio plus imageSize.
+    aspectRatio: isGrsaiGptImage
+      ? requestSize
+      : options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : '1:1',
+    // Async mode returns a task ID immediately. Polling that ID avoids losing
+    // successful images when a long-lived synchronous connection is interrupted.
+    replyType: 'async',
+  }
+  if (!isGrsaiGptImage) grsaiRequestBody.imageSize = options.resolution ?? '1K'
+  const clientRequestId = crypto.randomUUID()
+  const visionaryRequestBody: Record<string, unknown> = {
+    model: settings.model,
+    prompt: options.prompt,
+    images: referenceImages,
+      size: options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : requestSize,
+    resolution: options.resolution ?? '1K',
+    ...(options.detail ? { quality: options.detail } : {}),
+    client_request_id: clientRequestId,
+  }
+  const evolinkRequestBody: Record<string, unknown> = {
+    model: settings.model,
+    prompt: options.prompt,
+    size: options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : 'auto',
+    // Nano Banana 2 Lite currently documents only the 1K quality preset.
+    quality: /gemini-3\.1-flash-lite-image/i.test(settings.model) ? '1K' : (options.resolution ?? '1K'),
+    ...(referenceImages.length ? { image_urls: referenceImages } : {}),
+  }
+  const requestForLog: Record<string, unknown> = useGrsaiUnifiedImage
+    ? grsaiRequestBody
+    : useEvolinkTaskImage
+      ? evolinkRequestBody
+    : useVisionaryTaskImage
+      ? visionaryRequestBody
+    : useStandardImageEdit
+      ? { model: settings.model, prompt: options.prompt, n: options.count, size: requestSize, quality: options.detail, images: `[multipart × ${referenceImages.length}]` }
+      : body
+  let taskId = ''
+  let lastPayload: unknown = null
+
+  const providerLabel = resolveProviderLabel(settings.baseUrl)
+
+  const emitAdminLog = (resultType: 'success' | 'failed', resultPayload: unknown) => {
+    if (!options.captureAdminLog) return
+    const finishedAt = new Date().toISOString()
+    const payload = resultPayload ?? lastPayload ?? {}
+    options.captureAdminLog({
+      provider: providerLabel,
+      taskId: taskId || extractTaskId(payload) || undefined,
+      model: settings.model,
+      startedAt,
+      finishedAt,
+      durationMs: Date.now() - startedAtMs,
+      resultType,
+      kind: 'image',
+      requestJson: sanitizeAdminLogJson(requestForLog),
+      resultJson: sanitizeAdminLogJson(payload),
+      resultUrls: collectRecoverableResultUrls(payload),
+    })
+  }
+
+  const failWithAdminLog = (error: unknown): never => {
+    if (error instanceof GenerationRequestError) {
+      if (!error.adminLog && options.captureAdminLog) {
+        const payload = lastPayload ?? { error: error.detail, summary: error.message }
+        const log: GenerationAdminLog = {
+          provider: providerLabel,
+          taskId: taskId || error.requestId || extractTaskId(payload) || undefined,
+          model: settings.model,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAtMs,
+          resultType: 'failed',
+          kind: 'image',
+          requestJson: sanitizeAdminLogJson(requestForLog),
+          resultJson: sanitizeAdminLogJson(payload),
+          resultUrls: collectRecoverableResultUrls(payload),
+        }
+        error.adminLog = log
+        options.captureAdminLog(log)
+      }
+      throw error
+    }
+    emitAdminLog('failed', { error: error instanceof Error ? error.message : String(error) })
+    throw error
+  }
+
+  let response: Response
+  try {
+    if (useGrsaiUnifiedImage) {
+      response = await fetch(endpoint(settings.baseUrl, 'api/generate'), {
+        method: 'POST',
+        signal: options.signal,
+        headers: {
+          ...Object.fromEntries(apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }).entries()),
+          'Content-Type': 'application/json',
+          ...(isApiYiSeedream ? { 'Accept-Encoding': 'identity' } : {}),
+        },
+        body: JSON.stringify(grsaiRequestBody),
+      })
+    } else if (useVisionaryTaskImage || useEvolinkTaskImage) {
+      response = await fetch(endpoint(settings.baseUrl, 'images/generations'), {
+        method: 'POST',
+        signal: options.signal,
+        headers: providerRelayHeaders(settings, {
+          Authorization: `Bearer ${settings.apiKey}`,
+          'Content-Type': 'application/json',
+          ...(useVisionaryTaskImage ? { 'Idempotency-Key': clientRequestId } : {}),
+        }),
+        body: JSON.stringify(useEvolinkTaskImage ? evolinkRequestBody : visionaryRequestBody),
+      })
+    } else if (useStandardImageEdit) {
+      const form = new FormData()
+      form.append('model', settings.model)
+      form.append('prompt', options.prompt)
+      form.append('n', String(options.count))
+      form.append('size', requestSize)
+      if (options.detail) form.append('quality', options.detail)
+
+      for (const [index, imageSource] of referenceImages.entries()) {
+        let imageResponse: Response
+        const imageController = new AbortController()
+        const abortImageRead = () => imageController.abort()
+        options.signal?.addEventListener('abort', abortImageRead, { once: true })
+        const imageTimeout = window.setTimeout(() => imageController.abort(), REFERENCE_IMAGE_READ_TIMEOUT_MS)
+        try {
+          imageResponse = await fetch(imageSource, { signal: imageController.signal })
+        } catch (error) {
+          if (options.signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
+          throw new GenerationRequestError(
+            'platform',
+            error instanceof DOMException && error.name === 'AbortError' ? '参考图片读取超时' : '参考图片无法转换为模型输入',
+            `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。为避免产生无效计费，本次请求尚未发送到图像生成接口。`,
+          )
+        } finally {
+          window.clearTimeout(imageTimeout)
+          options.signal?.removeEventListener('abort', abortImageRead)
+        }
+        if (!imageResponse.ok) {
+          throw new GenerationRequestError(
+            'platform',
+            '参考图片无法转换为模型输入',
+            `图片读取失败（${imageResponse.status}）。为避免产生无效计费，本次请求尚未发送到图像生成接口。`,
+          )
+        }
+        const imageBlob = await imageResponse.blob()
+        if (!imageBlob.type.startsWith('image/')) {
+          throw new GenerationRequestError(
+            'platform',
+            '参考图片格式无法识别',
+            `第 ${index + 1} 张参考图的文件类型为 ${imageBlob.type || 'unknown'}，本次生成请求未发送。`,
+          )
+        }
+        const extension = imageBlob.type.includes('webp') ? 'webp' : imageBlob.type.includes('jpeg') ? 'jpg' : 'png'
+        // GPT Image edit APIs represent an image array by repeating the same
+        // multipart `image` field. The upload order is the prompt's 图1/图2/... order.
+        form.append('image', imageBlob, `reference-${index + 1}.${extension}`)
+      }
+
+      response = await fetch(endpoint(settings.baseUrl, 'images/edits'), {
+        method: 'POST',
+        headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+        body: form,
+        signal: options.signal,
+      })
+    } else {
+      if (referenceImages.length) {
+        // APIYI Seedream uses `image` URL/base64 array on the same generations
+        // endpoint; `image_urls` is not part of its documented schema.
+        if (isApiYiSeedream) {
+          body.image = referenceImages
+          if (!/pro/i.test(settings.model)) body.sequential_image_generation = 'disabled'
+        } else if (isHfsyBaseUrl(settings.baseUrl)) {
+          // HFSY documents this field as `reference_images` (not OpenAI's
+          // `image_urls`). apigo accepts the data-URL values prepared above.
+          body.reference_images = referenceImages
+        } else body.image_urls = referenceImages
+      }
+      response = await fetch(endpoint(settings.baseUrl, 'images/generations'), {
+        method: 'POST',
+        signal: options.signal,
+        headers: {
+          ...Object.fromEntries(apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }).entries()),
+          'Content-Type': 'application/json',
+          ...(isApiYiSeedream ? { 'Accept-Encoding': 'identity' } : {}),
+        },
+        body: JSON.stringify(body),
+      })
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof GenerationRequestError) return failWithAdminLog(error)
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    return failWithAdminLog(new GenerationRequestError(
+      'network',
+      '请求可能已送达并扣费，但浏览器没有收到生成结果',
+      `${detail}。请先检查中转服务的消费记录、任务详情或生成历史，不要直接重复生成。常见原因是中转响应缺少跨域许可、连接中途断开或代理没有把图片响应返回给浏览器。`,
+    ))
+  }
+  // Paid generation requests are never retried or split automatically. A rejected
+  // batch stops here so one click can produce at most one billable API request.
+  if (!response.ok) return failWithAdminLog(await createApiError(response))
+  let payload: unknown
+  try {
+    payload = await response.json()
+    lastPayload = payload
+    taskId = extractTaskId(payload) || taskId
+    if (taskId) {
+      try { options.onTaskId?.(taskId) } catch { /* persistence must not interrupt a paid task */ }
+    }
+  } catch (error) {
+    return failWithAdminLog(new GenerationRequestError(
+      'platform',
+      '请求可能已经扣费，但 API 返回了无法识别的数据',
+      `${error instanceof Error ? error.message : String(error)}。请检查中转任务或生成历史，不要直接重试。`,
+    ))
+  }
+  try {
+    if (useGrsaiUnifiedImage) {
+      payload = await resolveGrsaiImageResult(settings, payload, options.signal)
+      lastPayload = payload
+      taskId = extractTaskId(payload) || taskId
+    } else if (useVisionaryTaskImage) {
+      payload = await resolveVisionaryImageResult(settings, payload, options.signal)
+      lastPayload = payload
+    } else if (extractProviderTaskId(payload) && !extractProviderImages(payload).length) {
+      payload = await resolveGenericProviderImageResult(settings, payload, options.signal)
+      lastPayload = payload
+      taskId = extractProviderTaskId(payload) || taskId
+    }
+    const rows = (useVisionaryTaskImage ? extractVisionaryGeneratedImages(payload) : extractGeneratedImages(payload))
+      .map((image) => ({ ...image, url: browserReadableImageResult(image.url, settings) }))
+    if (!rows.length) {
+      throw new GenerationRequestError(
+        'platform',
+        '请求可能已经扣费，但没有收到图片结果',
+        '接口请求成功，但响应中没有可识别的图片。请检查中转任务或生成历史，不要直接重试。',
+        { requestId: taskId || undefined },
+      )
+    }
+    emitAdminLog('success', payload)
+    // Preserve response order and cardinality. Some gateways intentionally reuse the
+    // same proxy URL for separate batch items, so URL-based deduplication can lose images.
+    return rows
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    return failWithAdminLog(error)
+  }
+}
+
+export async function generateRemoteText(
+  settings: ApiRequestSettings,
+  prompt: string,
+  options: TextGenerationOptions = {},
+) {
+  const startedAtMs = Date.now()
+  const startedAt = new Date(startedAtMs).toISOString()
+  const providerLabel = resolveProviderLabel(settings.baseUrl)
+  const referenceImages = options.referenceImages?.map((source) => source.trim()).filter(Boolean) ?? []
+  const userContent = referenceImages.length
+    ? [
+        { type: 'text' as const, text: prompt },
+        ...referenceImages.map((url) => ({
+          type: 'image_url' as const,
+          image_url: { url },
+        })),
+      ]
+    : prompt
+  const requestForLog = {
+    model: settings.model,
+    messages: [{ role: 'user', content: typeof userContent === 'string' ? userContent : '[multimodal text + images]' }],
+    stream: false,
+    referenceImageCount: referenceImages.length,
+  }
+
+  const emitTextAdminLog = (resultType: 'success' | 'failed', resultPayload: unknown, taskId?: string) => {
+    if (!options.captureAdminLog) return
+    options.captureAdminLog({
+      provider: providerLabel,
+      taskId,
+      model: settings.model,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      resultType,
+      kind: 'text',
+      requestJson: sanitizeAdminLogJson(requestForLog),
+      resultJson: sanitizeAdminLogJson(resultPayload),
+      resultUrls: [],
+    })
+  }
+
+  let response: Response
+  try {
+    response = await fetch(endpoint(settings.baseUrl, 'chat/completions'), {
+      method: 'POST',
+      signal: options.signal,
+      headers: {
+        ...Object.fromEntries(providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }).entries()),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: settings.model,
+        messages: [{ role: 'user', content: userContent }],
+        stream: false,
+      }),
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    const networkError = createNetworkError(error)
+    emitTextAdminLog('failed', { error: networkError.detail, summary: networkError.message })
+    throw networkError
+  }
+  if (!response.ok) {
+    const apiError = await createApiError(response)
+    emitTextAdminLog('failed', { error: apiError.detail, summary: apiError.message, status: apiError.status }, apiError.requestId)
+    throw apiError
+  }
+  let payload: {
+    id?: string
+    choices?: Array<{ message?: { content?: string }; text?: string }>
+    output_text?: string
+    text?: string
+  }
+  try {
+    payload = await response.json() as typeof payload
+  } catch (error) {
+    const parseError = new GenerationRequestError('platform', 'API 返回了无法识别的数据', error instanceof Error ? error.message : String(error))
+    emitTextAdminLog('failed', { error: parseError.detail, summary: parseError.message })
+    throw parseError
+  }
+  const content = payload.choices?.[0]?.message?.content
+    ?? payload.choices?.[0]?.text
+    ?? payload.output_text
+    ?? payload.text
+    ?? ''
+  if (!content.trim()) {
+    const emptyError = new GenerationRequestError('platform', '模型没有返回文本内容', '接口请求成功，但响应中没有可用的文本字段。')
+    emitTextAdminLog('failed', payload, extractTaskId(payload))
+    throw emptyError
+  }
+  emitTextAdminLog('success', {
+    id: payload.id,
+    content: content.trim().slice(0, 8_000),
+    truncated: content.trim().length > 8_000,
+  }, extractTaskId(payload))
+  return content.trim()
+}

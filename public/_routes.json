@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "include": [
+    "/apiyi/*",
+    "/visionary/*",
+    "/evolink/*",
+    "/hfsy/*"
+  ],
+  "exclude": []
+}

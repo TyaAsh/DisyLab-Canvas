@@ -1,0 +1,152 @@
+/*!
+ * Copyright (c) 2026 DisyLab. All rights reserved.
+ * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
+ * Unauthorized commercial use, redistribution, white-labeling, relicensing,
+ * or removal of this copyright notice is prohibited.
+ * Repository: https://github.com/TyaAsh/DisyLab-Canvas
+ * SPDX-FileCopyrightText: 2026 DisyLab
+ * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
+ */
+/*
+ * Disy 界面自定义层
+ * -----------------
+ * 这个文件最后加载，适合修改颜色、字体、圆角和局部尺寸。
+ * 功能布局与交互逻辑仍保留在 App.tsx / styles.css 中。
+ * 修改前建议保留一份副本，详细说明见：docs/Disy-样式与文案修改指南.md
+ */
+
+:root {
+  /* 全局字体。中文字体放在后面作为回退。 */
+  --disy-font-family: 'Manrope', 'DM Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  /* 品牌与状态色 */
+  --brand-cyan: #70e8f1;
+  --brand-blue: #70b5ff;
+  --brand-violet: #a793ff;
+  --brand-pink: #f0a8d3;
+  --brand-gradient: linear-gradient(135deg, var(--brand-cyan) 0%, var(--brand-blue) 36%, var(--brand-violet) 68%, var(--brand-pink) 100%);
+  --brand-gradient-hover: linear-gradient(135deg, #8cf2f7 0%, #8cc5ff 36%, #b9a9ff 68%, #f5badd 100%);
+  --accent: #8ab9ff;
+  --accent-strong: #6f9fff;
+  --accent-soft: rgba(126, 170, 255, .13);
+  --accent-border: rgba(143, 188, 255, .36);
+  --danger: #ff827a;
+  --danger-soft: rgba(255, 130, 122, .11);
+  --success: #70d394;
+
+  /* 画布与文字 */
+  --canvas: #070908;
+  --surface: rgba(29, 31, 30, .88);
+  --surface-strong: #1c1f1d;
+  --ink: #f3f4f0;
+  --muted: #989d97;
+  --line: rgba(245, 247, 242, .105);
+  --canvas-dot: rgba(227, 232, 224, .17);
+}
+
+html,
+body,
+button,
+input,
+textarea,
+select {
+  font-family: var(--disy-font-family);
+}
+
+/*
+ * 全局可读性基线
+ * 所有可见界面文字保持在 12–16px。两个 font-size: 0 的按钮是纯图标控件，
+ * 必须排除，否则隐藏的字符会再次显示。
+ */
+.disy-shell :where(*:not(svg):not(path):not(.atomic-reference-remove):not(.api-chip)) {
+  font-size: 12px !important;
+}
+
+.disy-shell .api-chip {
+  font-size: 12px !important;
+}
+
+.disy-shell :where(input, textarea, select, .node-body, .modal-copy, .output-record-prompt) {
+  font-size: 13px !important;
+}
+
+.disy-shell :where(h1, h2, h3, .modal-heading h2, .api-manager-heading h2, .asset-library-header h2, .output-history-header h2) {
+  font-size: 16px !important;
+}
+
+.disy-shell :where(.brand-word, .project-settings-header strong, .node-heading, .empty-canvas-heading) {
+  font-size: 14px !important;
+}
+
+.disy-shell :where(small, time, code, kbd, figcaption) {
+  line-height: 1.35;
+}
+
+/* 空画布主文案 */
+.empty-canvas-heading {
+  font-size: 14px;
+}
+
+.empty-canvas-heading > button,
+.empty-canvas-actions button {
+  min-height: 40px;
+  padding-inline: 14px;
+}
+
+/* 原本为小字号设计的紧凑控件，随 12px 基线同步增加高度。 */
+.settings-suffix-heading button,
+.canvas-reference-picker-pill button,
+.variant-selected,
+.library-batch-actions button {
+  min-height: 30px;
+}
+
+.image-reference-badge,
+.variant-index,
+.output-kind-badge,
+.output-record-meta span {
+  min-height: 26px;
+}
+
+.output-history-pill small,
+.output-history-pill em,
+.asset-count-badge,
+.api-model-tabs span {
+  min-width: 22px;
+  min-height: 22px;
+  height: auto;
+}
+
+.tool-rail button[data-tooltip]::after,
+.zoom-slider-wrap::after {
+  font-size: 12px !important;
+}
+
+@media (max-width: 720px) {
+  .disy-shell .api-chip {
+    font-size: 0 !important;
+  }
+}
+
+/*
+ * 常用可选覆盖示例（删除注释即可启用）
+ *
+ * 1. 放大空画布文案：
+ * .empty-canvas-heading { font-size: 16px !important; font-weight: 650; }
+ *
+ * 2. 调整节点圆角：
+ * .disy-node { border-radius: 20px; }
+ *
+ * 3. 调整弹窗圆角：
+ * .asset-library-modal,
+ * .project-modal,
+ * .api-modal { border-radius: 26px; }
+ *
+ * 4. 使用本地字体：
+ * @font-face {
+ *   font-family: 'MyBrandFont';
+ *   src: url('/fonts/my-brand-font.woff2') format('woff2');
+ *   font-display: swap;
+ * }
+ * :root { --disy-font-family: 'MyBrandFont', 'PingFang SC', sans-serif; }
+ */
