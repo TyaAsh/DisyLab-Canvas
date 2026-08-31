@@ -1697,6 +1697,10 @@ button { border: 0; cursor: pointer; }
 .image-node-editor:has(.prompt-optimize-model-menu),
 .video-floating-editor:has(.prompt-optimize-model-menu) { overflow: visible; }
 .image-prompt-field { position: relative; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.inline-active-skill-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 190px; height: 30px; padding: 0 7px 0 9px; border: 1px solid color-mix(in srgb, var(--accent) 58%, transparent); border-radius: 6px; color: var(--ink); background: color-mix(in srgb, var(--surface-strong) 86%, transparent); font-size: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; }
+.inline-active-skill-chip > span { overflow: hidden; text-overflow: ellipsis; }
+.inline-active-skill-chip button { display: grid; place-items: center; width: 16px; height: 20px; padding: 0; border: 0; color: var(--muted); background: transparent; cursor: pointer; }
+.inline-active-skill-chip button:hover { color: var(--ink); }
 .image-prompt-field > textarea {
   width: 100%;
   height: auto;
@@ -1838,7 +1842,7 @@ button { border: 0; cursor: pointer; }
 .image-reference-chip button { width: 24px; height: 24px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); background: transparent; }
 .image-reference-chip button:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 8%, transparent); }
 .text-editor-footer { min-height: 48px; padding: 8px 5px 0; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.image-editor-footer { min-width: 0; min-height: 48px; flex: none; padding: 8px 5px 0; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.image-editor-footer { position: relative; min-width: 0; min-height: 48px; flex: none; padding: 8px 5px 0; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .image-editor-resize-handle,
 .node-editor-resize-handle { position: absolute; z-index: 12; left: 50%; bottom: 1px; width: 72px; height: 10px; display: grid; place-items: center; transform: translateX(-50%); cursor: ns-resize; touch-action: none; }
 .image-editor-resize-handle > span,

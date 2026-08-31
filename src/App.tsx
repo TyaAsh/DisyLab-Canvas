@@ -7400,7 +7400,7 @@ function App() {
     const prompt = prepared.prompt
     setNodes((current) => current.map((node) => node.id === activeGenerationNode.id ? {
       ...node,
-      data: { ...node.data, body: prompt, promptText: undefined, activeSkillId: `${skill.id}@${skill.version}`, activeSkillName: skill.name, ...(prepared.aspectRatio ? { imageAspectRatio: prepared.aspectRatio as ImageAspectRatio } : {}) },
+      data: { ...node.data, body: '', promptText: undefined, activeSkillId: `${skill.id}@${skill.version}`, activeSkillName: skill.name, ...(prepared.aspectRatio ? { imageAspectRatio: prepared.aspectRatio as ImageAspectRatio } : {}) },
     } : node))
     setImageSkillMenuOpen(false)
     const missingReference = skill.capability.requiresReference && !activeImageReferences.some((reference) => Boolean(reference.url))
@@ -7422,7 +7422,7 @@ function App() {
       return
     }
     const prompt = renderSkillPrompt(skill, subject)
-    setNodes((current) => current.map((node) => node.id === activeTextNode.id ? { ...node, data: { ...node.data, promptText: prompt, activeSkillId: `${skill.id}@${skill.version}`, activeSkillName: skill.name } } : node))
+    setNodes((current) => current.map((node) => node.id === activeTextNode.id ? { ...node, data: { ...node.data, promptText: '', activeSkillId: `${skill.id}@${skill.version}`, activeSkillName: skill.name } } : node))
     setToastMessage(`正在执行 Skill：${skill.name}`)
     window.requestAnimationFrame(() => void generateFromActiveTextNode({ prompt }))
   }
@@ -14500,6 +14500,7 @@ function App() {
                     ref={imagePromptEditorRef}
                     value={activeGenerationNode.data.body}
                     references={activeGenerationReferences}
+                    placeholder={activeGenerationNode.data.activeSkillName ? `点击生成，直接执行“${activeGenerationNode.data.activeSkillName}”` : '描述任何你想生成的图像，按 @ 引用参考素材'}
                     onChange={handleImagePromptChange}
                     onRemoveToken={(start, end) => {
                       const nodeId = activeGenerationNode.id
@@ -14640,8 +14641,8 @@ function App() {
                     </button>
                   </div>
                   <div className="image-editor-options">
-                    {activeGenerationNode.data.activeSkillName && <div className="image-active-skill-chip"><button type="button" className="image-active-skill-open" title="打开当前 Skill" onClick={() => activeGenerationNode.data.comicWorkflow ? setComicWorkflowOpen(true) : undefined}><Sparkles size={12}/><span>{activeGenerationNode.data.activeSkillName}</span></button><button type="button" className="image-active-skill-clear" aria-label="清除当前 Skill" title="清除当前 Skill" onClick={() => setNodes((current) => current.map((node) => node.id === activeGenerationNode.id ? { ...node, data: { ...node.data, activeSkillId: undefined, activeSkillName: undefined } } : node))}><X size={11}/></button></div>}
                     {renderPromptOptimizeControl(activeGenerationNode.id)}
+                    {activeGenerationNode.data.activeSkillName && <span className="inline-active-skill-chip"><span>{activeGenerationNode.data.activeSkillName}</span><button type="button" aria-label="清除当前 Skill" title="清除当前 Skill" onClick={() => setNodes((current) => current.map((node) => node.id === activeGenerationNode.id ? { ...node, data: { ...node.data, activeSkillId: undefined, activeSkillName: undefined } } : node))}><X size={11} /></button></span>}
                     {activeGenerationNode.data.promptOptimizationBackup !== undefined && <button type="button" className="prompt-optimize-undo" title="撤回到优化前" onClick={() => undoNodePromptOptimization(activeGenerationNode.id)}><RefreshCw size={13} /><span>撤回</span></button>}
                     <div className="image-parameter-control">
                       <AnimatePresence>
@@ -14889,7 +14890,7 @@ function App() {
                     value={activeTextNode.data.promptText ?? ''}
                     references={activeTextReferences}
                     ariaLabel="文本模型指令"
-                    placeholder="描述希望文本模型完成的任务，按 @ 引用节点"
+                    placeholder={activeTextNode.data.activeSkillName ? `点击生成，直接执行“${activeTextNode.data.activeSkillName}”` : '描述希望文本模型完成的任务，按 @ 引用节点'}
                     onChange={handleTextPromptChange}
                     onRemoveToken={(start, end) => {
                       const promptText = activeTextNode.data.promptText ?? ''
@@ -15005,7 +15006,6 @@ function App() {
                     </button>
                   </div>
                   <div className="editor-footer-actions">
-                    {activeTextNode.data.activeSkillName && <span className="image-active-skill-chip"><Sparkles size={12} /><span>{activeTextNode.data.activeSkillName}</span></span>}
                     {renderPromptOptimizeControl(activeTextNode.id)}
                     {activeTextNode.data.promptOptimizationBackup !== undefined && <button type="button" className="prompt-optimize-undo" title="撤回到优化前" onClick={() => undoNodePromptOptimization(activeTextNode.id)}><RefreshCw size={13} /><span>撤回</span></button>}
                     <div className="generation-quantity-control">
@@ -15353,34 +15353,7 @@ function App() {
             </motion.section>
           </motion.div>
         )}
-      </AnimatePresence>
-
-      {activeGenerationNode && <StoryboardComicWorkflow
-        open={comicWorkflowOpen}
-        initialContent={activeGenerationNode.data.body}
-        initialState={activeGenerationNode.data.comicWorkflow}
-        requestedViewStage={comicWorkflowViewStage}
-        imageModels={enabledImageModels.map(({ connection, model }) => ({ key: `${connection.id}::${model.id}`, label: `${formatImageModelName(model.name)}${groupImageModelsByProvider ? ` · ${connection.name}` : ''}` }))}
-        imageModelKey={displayedActiveNodeImageModel ? `${displayedActiveNodeImageModel.connection.id}::${displayedActiveNodeImageModel.model.id}` : ''}
-        onImageModelChange={(key) => {
-          const [connectionId, modelId] = key.split('::')
-          const selected = enabledImageModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
-          if (!selected) return
-          updateNodeData(activeGenerationNode.id, { imageModelConnectionId: connectionId, imageModelId: modelId, imageModelName: selected.model.name })
-        }}
-        textModels={enabledTextModels.map(({ connection, model }) => ({ key: `${connection.id}::${model.id}`, name: formatModelDisplayName(model.name), connectionName: connection.name }))}
-        selectedTextModelKey={effectiveOptimizeTextModel ? `${effectiveOptimizeTextModel.connection.id}::${effectiveOptimizeTextModel.model.id}` : ''}
-        onSelectTextModel={setOptimizeTextModelKey}
-        onConfigureTextModels={openApiSettings}
-        recoveredCompositions={recoveredComicCompositions}
-        generating={activeImageGenerationRunning}
-        onClose={() => setComicWorkflowOpen(false)}
-        onUpdate={updateActiveComicWorkflow}
-        onFork={forkActiveComicWorkflow}
-        onGenerate={runActiveComicStage}
-        onOptimize={optimizeWorkbenchText}
-      />}
-      <CompositeSkillWorkbench
+      </AnimatePresence>`r`n      <CompositeSkillWorkbench
         skill={activeCompositeSkill}
         onClose={() => setActiveCompositeSkill(null)}
         onCreate={createCompositeWorkflow}
@@ -16423,3 +16396,6 @@ function App() {
 }
 
 export default App
+
+
+
