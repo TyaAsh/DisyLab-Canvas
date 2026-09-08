@@ -9,6 +9,7 @@
  */
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
@@ -290,9 +291,20 @@ const apiYiMediaRelayPlugin: Plugin = {
           response.end('media host not allowed')
           return
         }
-        const relayHeaders = new Headers({ 'Accept-Encoding': 'identity' })
         let upstream: Awaited<ReturnType<typeof requestThroughLocalProxy>> | null = null
         for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+          const relayHeaders = new Headers({
+            'Accept-Encoding': 'identity',
+            Accept: 'video/*,image/*,application/octet-stream;q=0.9,*/*;q=0.5',
+          })
+          if (/(?:^|\.)aixinai\.net$/i.test(targetUrl.hostname)) {
+            relayHeaders.set('Referer', 'https://www.hfsyapi.cn/')
+            relayHeaders.set('Origin', 'https://www.hfsyapi.cn')
+            relayHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36')
+            const authorization = request.headers['x-disylab-media-authorization']
+            const value = Array.isArray(authorization) ? authorization[0] : authorization
+            if (value?.startsWith('Bearer ')) relayHeaders.set('Authorization', value)
+          }
           const proxyAvailable = await localProxyIsAvailable()
           const currentUpstream = proxyAvailable
             ? await requestThroughLocalProxy(targetUrl, 'GET', relayHeaders)
@@ -315,6 +327,8 @@ const apiYiMediaRelayPlugin: Plugin = {
         if (contentType) response.setHeader('content-type', contentType)
         const contentLength = upstream.headers['content-length']
         if (contentLength) response.setHeader('content-length', contentLength)
+        if (upstream.status === 401 || upstream.status === 403) response.setHeader('x-disylab-media-error', 'upstream-forbidden')
+        response.setHeader('x-disylab-media-host', targetUrl.hostname)
         response.setHeader('content-length', upstream.body.length)
         response.end(upstream.body)
       } catch (error) {
@@ -326,7 +340,7 @@ const apiYiMediaRelayPlugin: Plugin = {
 }
 
 export default defineConfig({
-  plugins: [react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin],
+  plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin],
   server: {
     port: 1420,
     host: '127.0.0.1',

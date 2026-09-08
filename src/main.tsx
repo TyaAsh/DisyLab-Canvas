@@ -12,6 +12,7 @@ import { createRoot } from 'react-dom/client'
 import { ReactFlowProvider } from '@xyflow/react'
 import App from './App'
 import { installProductionSourceShield } from './sourceShield'
+import './tailwind.css'
 import './styles.css'
 import './theme-custom.css'
 
@@ -42,10 +43,16 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error
   render() {
     if (!this.state.error) return this.props.children
     return (
-      <main className="app-crash-fallback">
-        <strong>DisyLab 加载失败</strong>
-        <span>页面运行时遇到异常，请重新加载后继续。</span>
-        <button type="button" onClick={() => window.location.reload()}>重新加载</button>
+      <main className="grid h-full w-full place-content-center justify-items-center gap-3 bg-canvas p-8 text-center text-ink">
+        <strong className="text-lg">DisyLab 加载失败</strong>
+        <span className="text-[13px] text-muted">页面运行时遇到异常，请重新加载后继续。</span>
+        <button
+          className="min-h-[38px] rounded-lg border border-[var(--accent-border)] bg-[var(--accent-soft)] px-4 text-ink"
+          type="button"
+          onClick={() => window.location.reload()}
+        >
+          重新加载
+        </button>
       </main>
     )
   }

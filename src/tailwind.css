@@ -1,0 +1,27 @@
+/*!
+ * Copyright (c) 2026 DisyLab. All rights reserved.
+ * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
+ * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
+ */
+
+/*
+ * Tailwind migration entry point.
+ *
+ * Preflight is intentionally omitted during the incremental migration so the
+ * existing global element styles keep their current rendering. Components can
+ * now move to utilities independently without destabilising the canvas UI.
+ */
+@layer theme, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@theme {
+  --font-sans: "Manrope", "DM Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-danger: var(--danger);
+  --color-success: var(--success);
+}

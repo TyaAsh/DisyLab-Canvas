@@ -33,13 +33,22 @@ function readDeclaredCapability(item: Record<string, unknown>, modelId: string):
 }
 
 export function parseRemoteModelCatalog(payload: unknown): CatalogModel[] {
-  const container = payload && typeof payload === 'object' ? payload as { data?: unknown[]; models?: unknown[] } : {}
-  const rows = Array.isArray(payload) ? payload : container.data ?? container.models ?? []
+  const findRows = (value: unknown, depth = 0): unknown[] => {
+    if (Array.isArray(value)) return value
+    if (!value || typeof value !== 'object' || depth > 4) return []
+    const record = value as Record<string, unknown>
+    for (const key of ['data', 'models', 'items', 'result', 'list', 'model_list', 'modelList']) {
+      const rows = findRows(record[key], depth + 1)
+      if (rows.length) return rows
+    }
+    return []
+  }
+  const rows = findRows(payload)
   const models = rows.map((model) => {
     if (typeof model === 'string') return { id: model.trim(), name: model.trim(), capability: inferModelCapability(model) }
     if (!model || typeof model !== 'object') return { id: '', name: '', capability: 'unknown' as const }
     const item = model as Record<string, unknown>
-    const id = String(item.id ?? item.model ?? item.model_id ?? item.slug ?? item.key ?? '').trim()
+    const id = String(item.id ?? item.model ?? item.model_id ?? item.model_name ?? item.slug ?? item.key ?? '').trim()
     const name = String(item.name ?? item.display_name ?? item.displayName ?? item.title ?? id).trim()
     return readModelAvailability(item) ? { id, name, capability: readDeclaredCapability(item, id) } : { id: '', name: '', capability: 'unknown' as const }
   }).filter((model) => model.id)

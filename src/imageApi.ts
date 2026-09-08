@@ -7,7 +7,7 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
-import type { ModelCapability } from './store'
+import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
 import { inferModelCapability, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
 
@@ -17,6 +17,7 @@ export type ApiRequestSettings = {
   baseUrl: string
   apiKey: string
   model: string
+  authMode?: ApiAuthMode
 }
 
 export type RemoteModel = {
@@ -48,6 +49,7 @@ export type VideoGenerationOptions = {
   prompt: string
   seconds: number
   size: string
+  resolution?: '480p' | '720p' | '1080p' | '4k'
   mode?: 'text2video' | 'image2video' | 'first_last_frame' | 'image_reference' | 'all_reference'
   referenceImage?: string
   referenceImages?: string[]
@@ -339,6 +341,11 @@ function normalizedApiBaseUrl(baseUrl: string) {
   }
   if (!/^https?:$/i.test(url.protocol)) throw new Error('接口地址只支持 http:// 或 https://')
   let host = url.hostname.toLowerCase()
+  // Accept a copied full OpenAI endpoint and normalize it back to its API base.
+  // This prevents accidental paths such as /v1/chat/completions/models.
+  const copiedEndpoint = /\/(?:models|chat\/completions|responses|messages|images\/(?:generations|edits)|videos(?:\/generations)?)\/?$/i.test(url.pathname)
+  url.pathname = url.pathname.replace(/\/(?:models|chat\/completions|responses|messages|images\/(?:generations|edits)|videos(?:\/generations)?)\/?$/i, '') || '/'
+  if (copiedEndpoint) url.hash = ''
   // `visionary.beer` is the website/result-media host. Users commonly copy it
   // from task history, but generation endpoints live on api.visionary.beer/v1.
   // Canonicalize only a bare website base; preserve explicit custom paths.
@@ -348,7 +355,7 @@ function normalizedApiBaseUrl(baseUrl: string) {
     host = 'api.visionary.beer'
   }
   if (!url.pathname || url.pathname === '/') {
-    const defaultPath = host === 'api.openai.com' || host === 'api.deepseek.com' || /siliconflow\.cn$/i.test(host)
+    const defaultPath = host === 'api.openai.com' || host === 'api.anthropic.com' || host === 'api.deepseek.com' || /siliconflow\.cn$/i.test(host)
       ? '/v1'
       : /(?:api\.apiyi\.com|apiyi\.com|apimart\.ai)$/i.test(host)
         ? '/v1'
@@ -385,7 +392,9 @@ function endpoint(baseUrl: string, path: string) {
   if (typeof window !== 'undefined' && isEvolinkBaseUrl(baseUrl)) {
     return `/evolink/${path.replace(/^\//, '')}`
   }
-  return `${normalizedApiBaseUrl(baseUrl)}/${path.replace(/^\//, '')}`
+  const url = new URL(normalizedApiBaseUrl(baseUrl))
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/${path.replace(/^\//, '')}`
+  return url.toString()
 }
 
 function apiYiRelayHeaders(settings: Pick<ApiRequestSettings, 'baseUrl'>, init?: HeadersInit) {
@@ -438,6 +447,21 @@ function providerRelayHeaders(settings: Pick<ApiRequestSettings, 'baseUrl'>, ini
   if (typeof window !== 'undefined' && isEvolinkBaseUrl(settings.baseUrl)) {
     headers.set('X-DisyLab-Evolink-Base', normalizedApiBaseUrl(settings.baseUrl))
   }
+  return headers
+}
+
+function compatibleApiHeaders(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>, init?: HeadersInit) {
+  const headers = providerRelayHeaders(settings, init)
+  const nativeAnthropic = /api\.anthropic\.com/i.test(settings.baseUrl) || /\/messages\/?(?:[?#].*)?$/i.test(settings.baseUrl.trim())
+  const authMode = settings.authMode && settings.authMode !== 'auto'
+    ? settings.authMode
+    : nativeAnthropic ? 'x-api-key'
+      : /(?:^|\.)openai\.azure\.com$/i.test(new URL(normalizedApiBaseUrl(settings.baseUrl)).hostname) ? 'api-key'
+        : 'bearer'
+  for (const name of ['Authorization', 'x-api-key', 'api-key', 'x-goog-api-key']) headers.delete(name)
+  if (authMode === 'bearer') headers.set('Authorization', `Bearer ${settings.apiKey}`)
+  else headers.set(authMode, settings.apiKey)
+  if (nativeAnthropic) headers.set('anthropic-version', '2023-06-01')
   return headers
 }
 
@@ -576,7 +600,7 @@ async function waitForReplicatedVideoUrl(taskUrl: string, headers: HeadersInit, 
   return { url: '', payload }
 }
 
-function apiYiGeneratedMediaUrl(source: string) {
+export function apiYiGeneratedMediaUrl(source: string) {
   // Result/CDN URLs are often missing CORS headers. Keep browser downloads on
   // the app origin; server-side callers continue to use the provider URL.
   return typeof window === 'undefined' ? source : `/apiyi/media?url=${encodeURIComponent(source)}`
@@ -620,6 +644,7 @@ function apiYiVideoRatio(size: string) {
 }
 
 async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const defaults = seedanceVideoDefaults(settings.model)!
   const origin = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
   const taskPath = '/seedance/api/v3/contents/generations/tasks'
   // APIYI documents that browsers cannot read this endpoint's response because
@@ -643,7 +668,10 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
   for (const source of referenceVideos) {
     content.push({ type: 'video_url', video_url: { url: await mediaSourceForApiYi(source, options.signal) } })
   }
-  const requestedResolution = /fast|mini/i.test(settings.model) && options.size.endsWith('x1080') ? '720p' : options.size.endsWith('x480') ? '480p' : options.size.endsWith('x1080') ? '1080p' : '720p'
+  const requestedResolution = defaults.resolutions.includes(options.resolution as typeof defaults.resolutions[number])
+    ? options.resolution
+    : defaults.defaultResolution
+  const requestedDuration = Math.max(defaults.minDuration, Math.min(defaults.maxDuration, Math.round(options.seconds)))
   let response: Response
   const requestHeaders = new Headers({
     Authorization: `Bearer ${settings.apiKey}`,
@@ -661,8 +689,8 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
         content,
         resolution: requestedResolution,
         ratio: apiYiVideoRatio(options.size),
-        duration: Math.max(4, Math.min(15, Math.round(options.seconds))),
-        generate_audio: options.generateAudio !== false,
+        duration: requestedDuration,
+        ...(defaults.defaultGenerateAudio ? { generate_audio: options.generateAudio !== false } : {}),
       }),
     })
   } catch (error) {
@@ -676,26 +704,13 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
   options.onTaskId?.(taskId)
   options.onProgress?.(1, 'queued')
   const startedAt = Date.now()
-  let status = 'queued'
-  while (!['succeeded', 'completed', 'success', 'failed', 'expired', 'cancelled', 'canceled'].includes(status)) {
-    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Seedance 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`)
-    await waitForDelay(20_000, options.signal)
-    let poll: Response
-    try {
-      poll = await fetch(`${taskEndpoint}/${encodeURIComponent(taskId)}`, {
-        signal: options.signal,
-        headers: requestHeaders,
-      })
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') throw error
-      throw new GenerationRequestError('network', 'Seedance 任务查询请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}`, { requestId: taskId })
-    }
-    if (!poll.ok) throw await createApiError(poll)
-    const job = await poll.json() as Record<string, unknown>
-    status = videoTaskStatus(job, status)
-    options.onProgress?.(status === 'running' || status === 'processing' ? 50 : ['succeeded', 'completed', 'success'].includes(status) ? 90 : 10, status)
+  let status = videoTaskStatus(created, 'queued')
+  let job: Record<string, unknown> = created
+  while (true) {
+    const sourceUrl = videoResultUrl(job)
+    options.onProgress?.(status === 'running' || status === 'processing' ? 50 : ['succeeded', 'completed', 'success'].includes(status) || sourceUrl ? 90 : 10, status)
     if (['failed', 'expired', 'cancelled', 'canceled'].includes(status)) throw new GenerationRequestError('api', `Seedance 任务${status === 'expired' ? '已过期' : '失败'}`, sanitizeAdminLogJson(job), { requestId: taskId })
-    if (['succeeded', 'completed', 'success'].includes(status)) {
+    if (['succeeded', 'completed', 'success'].includes(status) || sourceUrl) {
       const replicated = await waitForReplicatedVideoUrl(`${taskEndpoint}/${encodeURIComponent(taskId)}`, requestHeaders, job, options.signal)
       const videoUrl = replicated.url
       if (!videoUrl) throw new GenerationRequestError('platform', 'Seedance 成功但没有返回视频地址', sanitizeAdminLogJson(replicated.payload), { requestId: taskId })
@@ -712,8 +727,22 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
       options.onProgress?.(100, 'completed')
       return { blob, taskId, progress: 100, sourceUrl: videoUrl }
     }
+    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Seedance 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`)
+    await waitForDelay(20_000, options.signal)
+    let poll: Response
+    try {
+      poll = await fetch(`${taskEndpoint}/${encodeURIComponent(taskId)}`, {
+        signal: options.signal,
+        headers: requestHeaders,
+      })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new GenerationRequestError('network', 'Seedance 任务查询请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}`, { requestId: taskId })
+    }
+    if (!poll.ok) throw await createApiError(poll)
+    job = await poll.json() as Record<string, unknown>
+    status = videoTaskStatus(job, status)
   }
-  throw new GenerationRequestError('platform', 'Seedance 任务未完成', `任务 ${taskId}`, { requestId: taskId })
 }
 
 function videoResolutionFromSize(size: string) {
@@ -853,12 +882,70 @@ async function generateApiYiWanVideo(settings: ApiRequestSettings, options: Vide
 }
 
 async function readError(response: Response) {
+  const text = await response.text().catch(() => '')
+  if (!text) return `请求失败（${response.status}）`
   try {
-    const payload = await response.json() as { error?: { message?: string } | string; message?: string }
-    if (typeof payload.error === 'string') return payload.error
-    return payload.error?.message || payload.message || `请求失败（${response.status}）`
+    const payload = JSON.parse(text) as Record<string, unknown>
+    const error = payload.error
+    const errors = Array.isArray(payload.errors) ? payload.errors : []
+    const candidates = [
+      typeof error === 'string' ? error : error && typeof error === 'object' ? (error as Record<string, unknown>).message : undefined,
+      error && typeof error === 'object' ? (error as Record<string, unknown>).detail : undefined,
+      payload.message, payload.msg, payload.detail, payload.title,
+      ...errors.map((item) => typeof item === 'string' ? item : item && typeof item === 'object' ? ((item as Record<string, unknown>).message ?? (item as Record<string, unknown>).detail) : undefined),
+    ]
+    const message = candidates.find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    return message?.trim().slice(0, 4_000) || text.slice(0, 4_000)
   } catch {
-    return `请求失败（${response.status}）`
+    return text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4_000) || `请求失败（${response.status}）`
+  }
+}
+
+export type SeedanceVideoDefaults = {
+  resolutions: readonly ('480p' | '720p' | '1080p' | '4k')[]
+  ratios: readonly ('auto' | '16:9' | '4:3' | '1:1' | '3:4' | '9:16' | '21:9')[]
+  minDuration: number
+  maxDuration: number
+  defaultDuration: number
+  defaultRatio: 'auto' | '16:9'
+  defaultImageRatio?: 'auto'
+  defaultResolution: '720p'
+  defaultGenerateAudio: boolean
+}
+
+/** Shared defaults for Volcengine, BytePlus and gateway Seedance model IDs. */
+export function seedanceVideoDefaults(model: string): SeedanceVideoDefaults | undefined {
+  const normalized = model.toLowerCase().replace(/_/g, '-')
+  if (!/(?:seedance|doubao-seedance|dreamina-seedance)/.test(normalized)) return undefined
+  const versionMatch = normalized.match(/seedance(?:[- ]?v)?[- ]?([12])(?:[. -]?([025]))/)
+  const version = versionMatch ? `${versionMatch[1]}.${versionMatch[2]}` : ''
+  const allRatios = ['auto', '16:9', '4:3', '1:1', '3:4', '9:16', '21:9'] as const
+  if (version === '2.5') return {
+    resolutions: ['480p', '720p'], ratios: allRatios,
+    minDuration: 4, maxDuration: 30, defaultDuration: 5,
+    defaultRatio: 'auto', defaultResolution: '720p', defaultGenerateAudio: true,
+  }
+  if (version === '2.0') return {
+    resolutions: /(?:fast|mini)/.test(normalized) ? ['480p', '720p'] : ['480p', '720p', '1080p', '4k'],
+    ratios: allRatios,
+    minDuration: 4, maxDuration: 15, defaultDuration: 5,
+    defaultRatio: 'auto', defaultResolution: '720p', defaultGenerateAudio: true,
+  }
+  if (version === '1.5') return {
+    resolutions: ['480p', '720p', '1080p'], ratios: allRatios,
+    minDuration: 4, maxDuration: 12, defaultDuration: 5,
+    defaultRatio: 'auto', defaultResolution: '720p', defaultGenerateAudio: true,
+  }
+  if (version === '1.0') return {
+    resolutions: /lite/.test(normalized) ? ['480p', '720p'] : ['480p', '720p', '1080p'],
+    ratios: allRatios,
+    minDuration: 2, maxDuration: 12, defaultDuration: 5,
+    defaultRatio: '16:9', ...(!/lite/.test(normalized) ? { defaultImageRatio: 'auto' as const } : {}), defaultResolution: '720p', defaultGenerateAudio: false,
+  }
+  return {
+    resolutions: ['480p', '720p'], ratios: allRatios,
+    minDuration: 4, maxDuration: 15, defaultDuration: 5,
+    defaultRatio: 'auto', defaultResolution: '720p', defaultGenerateAudio: true,
   }
 }
 
@@ -875,7 +962,8 @@ function apiErrorSummary(status: number) {
 
 async function createApiError(response: Response) {
   const detail = await readError(response)
-  const responseRequestId = response.headers.get('x-request-id') ?? response.headers.get('x-shellapi-request-id') ?? undefined
+  const responseRequestId = ['x-request-id', 'openai-request-id', 'request-id', 'x-correlation-id', 'x-ms-request-id', 'cf-ray', 'traceparent']
+    .map((name) => response.headers.get(name)).find(Boolean) ?? undefined
   if (response.status === 502 && response.headers.get('x-disylab-relay-error') === 'upstream-fetch-failed') {
     return new GenerationRequestError('network', '没有连接到 APIYI 视频服务', `${detail}。请检查当前网络是否能访问所配置的 APIYI 节点，或在接口设置中切换 APIYI 官方备用节点。`, {
       status: response.status,
@@ -970,7 +1058,7 @@ async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'b
   return models
 }
 
-export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<RemoteModel[]> {
+export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<RemoteModel[]> {
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings)
   const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
@@ -982,7 +1070,7 @@ export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'base
     return models
   }
   const response = await fetch(endpoint(settings.baseUrl, 'models'), {
-    headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+    headers: compatibleApiHeaders(settings),
   })
   if (!response.ok) {
     // A response means the provider evaluated the request. In particular, do
@@ -1046,7 +1134,7 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   }
   let createdResponse: Response
   try {
-    createdResponse = await fetch(endpoint(settings.baseUrl, 'videos'), { method: 'POST', headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), body: form, signal: options.signal })
+    createdResponse = await fetch(endpoint(settings.baseUrl, 'videos'), { method: 'POST', headers: compatibleApiHeaders(settings), body: form, signal: options.signal })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw createNetworkError(error)
@@ -1067,7 +1155,7 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
     await waitForDelay(2_500, options.signal)
     let pollResponse: Response
     try {
-      pollResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}`), { headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), signal: options.signal })
+      pollResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}`), { headers: compatibleApiHeaders(settings), signal: options.signal })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       consecutivePollErrors += 1
@@ -1099,7 +1187,7 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
     const mediaBlob = await mediaResponse.blob()
     if (mediaBlob.size) return { blob: mediaBlob, taskId, progress: 100, sourceUrl: completedUrl }
   }
-  const contentResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }), signal: options.signal })
+  const contentResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: compatibleApiHeaders(settings), signal: options.signal })
   if (!contentResponse.ok) throw await createApiError(contentResponse)
   const blob = await contentResponse.blob()
   if (!blob.size) throw new GenerationRequestError('platform', '视频服务返回了空文件', `任务 ${taskId}`)
@@ -1118,7 +1206,16 @@ export function publicImageSourceUrl(source?: string): string | undefined {
       parsed = new URL(parsed.searchParams.get('url') || '')
     }
     if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) return undefined
-    if (/^(localhost|local\.invalid|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[)/i.test(parsed.hostname)) return undefined
+    const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '')
+    if (/^(?:localhost|local\.invalid)$|\.(?:localhost|local|internal)$/i.test(hostname)) return undefined
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname)?.slice(1).map(Number)
+    if (ipv4) {
+      const [a, b] = ipv4
+      if (ipv4.some((part) => part > 255) || a === 0 || a === 10 || a === 127 || a >= 224
+        || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168
+        || a === 100 && b >= 64 && b <= 127 || a === 198 && (b === 18 || b === 19)) return undefined
+    }
+    if (/^\[(?:::1|::|f[cd]|fe[89ab]|::ffff:)/i.test(hostname)) return undefined
     return parsed.href
   } catch { return undefined }
 }
@@ -1132,11 +1229,11 @@ function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video') {
 
 /** Limits from the HFSY public model docs; unknown IDs are not guessed. */
 export function hfsyVideoLimits(model: string) {
-  if (/^sd-2\.5-(480|720)$/.test(model)) return { minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, prompt: 5000 }
-  if (/^sd-2\.0(?:-mini|-480|-fast|-fast-480)?$/.test(model)) return { minSeconds: 4, maxSeconds: 15, images: 4, videos: 3, prompt: 5000 }
-  if (/^sd-2(?:-vip(?:-720)?|-mini-(480|720))$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 15000 }
-  if (/^sd-2(?:-fast)?$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 5000 }
-  if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 5, videos: 0, prompt: 2000 }
+  if (/^sd-2\.5-(480|720)$/.test(model)) return { minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, prompt: 5000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9'] }
+  if (/^sd-2\.0(?:-mini|-480|-fast|-fast-480)?$/.test(model)) return { minSeconds: 4, maxSeconds: 15, images: 4, videos: 3, prompt: 5000, ratios: ['9:16', '16:9', '1:1', '21:9', '4:3', '3:4'] }
+  if (/^sd-2(?:-vip(?:-720)?|-mini-(480|720)|-1080-cheap)$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 15000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'] }
+  if (/^sd-2(?:-fast)?$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 5000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'] }
+  if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 0, prompt: 2000, ratios: ['9:16', '16:9'] }
   if (model === 'sora-2') return { minSeconds: 4, maxSeconds: 12, images: 1, videos: 0, prompt: 10000, durations: [4, 8, 12] }
   if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, prompt: 5000, durations: [6, 10, 15] }
   if (model === 'kling-o3') return { minSeconds: 5, maxSeconds: 15, images: 2, videos: 0, prompt: 5000 }
@@ -1147,16 +1244,26 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   const ratio = options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1'
     : /^\d+:\d+$/.test(options.size) ? options.size
     : apiYiVideoRatio(options.size) === 'adaptive' ? '16:9' : apiYiVideoRatio(options.size)
+  const [ratioWidth, ratioHeight] = ratio.split(':').map(Number)
   const videos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
   const body: Record<string, unknown> = {
     model: settings.model,
     prompt: options.prompt,
     duration: options.seconds,
     ratio,
-    orientation: ratio === '9:16' ? 'portrait' : 'landscape',
+    orientation: ratioWidth < ratioHeight ? 'portrait' : 'landscape',
     watermark: false,
   }
-  const images = Array.from(new Set([...(options.referenceImages ?? []), options.referenceImage, options.firstFrame, options.lastFrame].filter((url): url is string => Boolean(url))))
+  const imageSources = options.mode === 'first_last_frame'
+    ? [options.firstFrame, options.lastFrame]
+    : options.mode === 'image2video'
+      ? [options.firstFrame ?? options.referenceImage]
+      : [...(options.referenceImages ?? []), options.referenceImage, options.firstFrame, options.lastFrame]
+  // First and last frame may intentionally be the same source; preserve both
+  // positions while still deduplicating unordered reference-image modes.
+  const images = options.mode === 'first_last_frame'
+    ? imageSources.filter((url): url is string => Boolean(url))
+    : Array.from(new Set(imageSources.filter((url): url is string => Boolean(url))))
   const limits = hfsyVideoLimits(settings.model)
   const invalid = (detail: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', `${detail}。视频生成尚未提交。`) }
   if (limits) {
@@ -1164,6 +1271,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     if (images.length > limits.images) invalid(`${settings.model} 最多支持 ${limits.images} 张图片`)
     if (videos.length > limits.videos) invalid(limits.videos ? `${settings.model} 最多支持 ${limits.videos} 个参考视频` : `${settings.model} 不支持视频参考，请选择支持视频参考的模型`)
     if (options.prompt.length > limits.prompt) invalid(`${settings.model} 提示词不得超过 ${limits.prompt} 字符`)
+    if ('ratios' in limits && limits.ratios && !limits.ratios.includes(ratio)) invalid(`${settings.model} 不支持 ${ratio} 比例`)
   }
   if (options.mode === 'text2video' && (images.length || videos.length)) invalid('文生视频不能携带图片或视频，请切换参考模式')
   if (options.mode === 'image2video' && images.length !== 1) invalid('图生视频需要一张首帧图片')
@@ -1205,12 +1313,31 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
       // HFSY returns its completed videos from aixinai.net. The task is already
       // successful at this point, but that CDN does not expose browser CORS
       // headers, so download through the same-origin media relay.
-      const media = await fetch(apiYiGeneratedMediaUrl(sourceUrl), { signal: options.signal })
+      let media: Response
+      try {
+        media = await fetch(apiYiGeneratedMediaUrl(sourceUrl), {
+          signal: options.signal,
+          headers: typeof window !== 'undefined' ? { 'X-DisyLab-Media-Authorization': `Bearer ${settings.apiKey}` } : undefined,
+        })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，但媒体下载请求失败：${error instanceof Error ? error.message : String(error)}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+      }
       if (!media.ok) throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，媒体下载失败（${media.status}）。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+      let blob: Blob
+      try {
+        blob = await media.blob()
+      } catch (error) {
+        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，但媒体数据读取中断：${error instanceof Error ? error.message : String(error)}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+      }
+      const contentType = blob.type || media.headers.get('content-type') || ''
+      if (!blob.size || /^(?:text\/|image\/|audio\/)|application\/(?:json|problem\+json)|image\/svg\+xml/i.test(contentType)) {
+        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载内容无效', `任务已成功，但媒体地址返回了${!blob.size ? '空文件' : contentType || '非视频内容'}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+      }
       options.onProgress?.(100, 'completed')
-      return { blob: await media.blob(), taskId, progress: 100, sourceUrl }
+      return { blob, taskId, progress: 100, sourceUrl }
     }
-    if (['failed', 'cancelled', 'canceled'].includes(status)) throw new GenerationRequestError('api', 'HFSY 视频生成失败', sanitizeAdminLogJson(task), { requestId: taskId })
+    if (['failed', 'failure', 'error', 'expired', 'cancelled', 'canceled', 'violation', 'rejected'].includes(status)) throw new GenerationRequestError('api', 'HFSY 视频生成失败', sanitizeAdminLogJson(task), { requestId: taskId })
     options.onProgress?.(Math.min(95, Math.max(1, Number((task as Record<string, unknown>)?.progress) || 0)), status)
     await waitForDelay(3_000, options.signal)
     try {
@@ -1224,9 +1351,14 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
       }
       if (!poll.ok) throw await createApiError(poll)
       task = await poll.json() as unknown
+      if (task && typeof task === 'object' && 'success' in task && task.success === false) {
+        const detail = 'message' in task && typeof task.message === 'string' ? task.message : sanitizeAdminLogJson(task)
+        throw new GenerationRequestError('api', 'HFSY 视频任务查询失败', detail, { requestId: taskId })
+      }
       consecutiveFailures = 0
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
+      if (error instanceof GenerationRequestError && (error.status === undefined || error.status < 500 && ![408, 429].includes(error.status))) throw error
       consecutiveFailures += 1
       if (consecutiveFailures >= 3) throw new GenerationRequestError('network', 'HFSY 视频任务查询暂时中断', `任务 ID：${taskId}。任务仍可能成功，请勿重复提交。`, { requestId: taskId })
     }
@@ -1333,7 +1465,7 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
     size: options.size,
     mode: options.mode,
     generateAudio: options.generateAudio,
-    referenceImageCount: (options.referenceImages?.length ?? 0) + (options.referenceImage ? 1 : 0),
+    referenceImageCount: (options.referenceImages?.length ?? 0) + (options.referenceImage ? 1 : 0) + (options.firstFrame ? 1 : 0) + (options.lastFrame ? 1 : 0),
     referenceVideoCount: (options.referenceVideos?.length ?? 0) + (options.referenceVideo ? 1 : 0),
   })
   try {
@@ -1355,6 +1487,7 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     const normalized = normalizeGenerationError(error)
+    const generatedButDownloadPending = Boolean(normalized.resultUrls?.length && /^HFSY 视频已生成但下载/.test(normalized.message))
     options.captureAdminLog?.({
       provider,
       taskId: normalized.requestId,
@@ -1362,10 +1495,10 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
       startedAt,
       finishedAt: new Date().toISOString(),
       durationMs: Date.now() - startedAtMs,
-      resultType: 'failed',
+      resultType: generatedButDownloadPending ? 'success' : 'failed',
       kind: 'video',
       requestJson,
-      resultJson: sanitizeAdminLogJson({ category: normalized.category, summary: normalized.message, detail: normalized.detail, status: normalized.status, requestId: normalized.requestId }),
+      resultJson: sanitizeAdminLogJson({ category: normalized.category, summary: normalized.message, detail: normalized.detail, status: generatedButDownloadPending ? 'download_pending' : normalized.status, requestId: normalized.requestId }),
       resultUrls: normalized.resultUrls ?? [],
     })
     throw error
@@ -1377,6 +1510,7 @@ export type ProviderCredits = {
   amount: number
   unit: string
   updatedAt: string
+  scope?: 'account' | 'api-key'
 }
 
 export type CurrencyRate = {
@@ -1514,30 +1648,34 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
   }
   if (!isGrsaiBaseUrl(settings.baseUrl) || !settings.apiKey.trim()) return null
   const apiKey = settings.apiKey.trim()
-  const nodeOrigin = new URL(normalizedApiBaseUrl(settings.baseUrl)).origin
   const requestCredits = async () => {
-    // Official GRS documentation provides this API-key-authenticated endpoint.
-    // /client/openapi/getCredits is intentionally not used here: it requires the
-    // separate account token from the GRS user-info page, not a generation key.
-    const response = await fetch(`${nodeOrigin}/client/common/getCredits?apikey=${encodeURIComponent(apiKey)}`, {
-      method: 'GET',
+    // Query the generation key itself. The common getCredits endpoint reports
+    // the owning account's pool and ignores a per-key credit limit.
+    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/openapi/getAPIKeyCredits'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey }),
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
     const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown }
     if (payload.code !== 0) throw new Error(typeof payload.msg === 'string' ? payload.msg : '未能读取 GRS AI 积分')
-    const credits = payload.data && typeof payload.data === 'object'
-      ? (payload.data as { credits?: unknown }).credits
-      : undefined
+    const data = payload.data
+    const record = data && typeof data === 'object' ? data as Record<string, unknown> : null
+    const credits = record
+      ? ['remainingCredits', 'remaining_credits', 'apiKeyCredits', 'keyCredits', 'credits', 'quota', 'balance']
+          .map((field) => record[field])
+          .find((value) => typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+      : data
     const amount = typeof credits === 'number' ? credits : typeof credits === 'string' ? Number(credits) : Number.NaN
-    if (!Number.isFinite(amount) || amount < 0) throw new Error('GRS AI 返回了无效的积分余额')
+    if (!Number.isFinite(amount) || amount < 0) throw new Error('GRS AI 返回了无效的 API Key 积分余额')
     return amount
   }
   const amount = await requestCredits()
-  return { provider: 'GRS AI', amount, unit: '积分', updatedAt: new Date().toISOString() }
+  return { provider: 'GRS AI', amount, unit: '积分', updatedAt: new Date().toISOString(), scope: 'api-key' }
 }
 
 /** Validate credentials without performing a billable generation request. */
-export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<void> {
+export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<void> {
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   if (!settings.apiKey.trim()) throw new Error('API Key 不能为空')
   const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
@@ -1570,7 +1708,7 @@ export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 
   let response: Response
   try {
     response = await fetch(endpoint(settings.baseUrl, 'models'), {
-      headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey.trim()}` }),
+      headers: compatibleApiHeaders({ ...settings, apiKey: settings.apiKey.trim() }),
     })
   } catch (error) {
     throw new Error(error instanceof Error ? `无法连接接口：${error.message}` : '无法连接接口，请检查地址和网络')
@@ -2104,8 +2242,7 @@ export async function generateRemoteImages(
       response = await fetch(endpoint(settings.baseUrl, 'images/generations'), {
         method: 'POST',
         signal: options.signal,
-        headers: providerRelayHeaders(settings, {
-          Authorization: `Bearer ${settings.apiKey}`,
+        headers: compatibleApiHeaders(settings, {
           'Content-Type': 'application/json',
           ...(useVisionaryTaskImage ? { 'Idempotency-Key': clientRequestId } : {}),
         }),
@@ -2161,7 +2298,7 @@ export async function generateRemoteImages(
 
       response = await fetch(endpoint(settings.baseUrl, 'images/edits'), {
         method: 'POST',
-        headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+        headers: compatibleApiHeaders(settings),
         body: form,
         signal: options.signal,
       })
@@ -2182,7 +2319,7 @@ export async function generateRemoteImages(
         method: 'POST',
         signal: options.signal,
         headers: {
-          ...Object.fromEntries(apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }).entries()),
+          ...Object.fromEntries(compatibleApiHeaders(settings).entries()),
           'Content-Type': 'application/json',
           ...(isApiYiSeedream ? { 'Accept-Encoding': 'identity' } : {}),
         },
@@ -2294,18 +2431,33 @@ export async function generateRemoteText(
 
   let response: Response
   try {
-    response = await fetch(endpoint(settings.baseUrl, 'chat/completions'), {
+    const nativeAnthropic = /api\.anthropic\.com/i.test(settings.baseUrl) || /\/messages\/?(?:[?#].*)?$/i.test(settings.baseUrl.trim())
+    const openAiResponses = !nativeAnthropic && /\/responses\/?(?:[?#].*)?$/i.test(settings.baseUrl.trim())
+    const requestPath = nativeAnthropic ? 'messages' : openAiResponses ? 'responses' : 'chat/completions'
+    const requestBody = nativeAnthropic
+      ? {
+          model: settings.model,
+          max_tokens: 4096,
+          messages: [{
+            role: 'user',
+            content: referenceImages.length
+              ? [{ type: 'text', text: prompt }, ...referenceImages.map((url) => ({ type: 'image', source: { type: 'url', url } }))]
+              : prompt,
+          }],
+        }
+      : openAiResponses
+        ? {
+            model: settings.model,
+            input: referenceImages.length
+              ? [{ role: 'user', content: [{ type: 'input_text', text: prompt }, ...referenceImages.map((image_url) => ({ type: 'input_image', image_url }))] }]
+              : prompt,
+          }
+        : { model: settings.model, messages: [{ role: 'user', content: userContent }], stream: false }
+    response = await fetch(endpoint(settings.baseUrl, requestPath), {
       method: 'POST',
       signal: options.signal,
-      headers: {
-        ...Object.fromEntries(providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }).entries()),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        messages: [{ role: 'user', content: userContent }],
-        stream: false,
-      }),
+      headers: compatibleApiHeaders(settings, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(requestBody),
     })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
@@ -2318,31 +2470,60 @@ export async function generateRemoteText(
     emitTextAdminLog('failed', { error: apiError.detail, summary: apiError.message, status: apiError.status }, apiError.requestId)
     throw apiError
   }
-  let payload: {
-    id?: string
-    choices?: Array<{ message?: { content?: string }; text?: string }>
-    output_text?: string
-    text?: string
-  }
+  let payload: unknown
   try {
-    payload = await response.json() as typeof payload
+    const contentType = response.headers.get('content-type') || ''
+    if (/text\/event-stream/i.test(contentType)) {
+      const events = (await response.text()).split(/\r?\n\r?\n/).map((event) => event.split(/\r?\n/)
+        .filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n'))
+        .filter((event) => event && event !== '[DONE]')
+      payload = events.flatMap((event) => { try { return [JSON.parse(event)] } catch { return [] } })
+    } else if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) {
+      payload = await response.json()
+    } else {
+      const text = await response.text()
+      try { payload = JSON.parse(text) } catch { payload = text }
+    }
   } catch (error) {
     const parseError = new GenerationRequestError('platform', 'API 返回了无法识别的数据', error instanceof Error ? error.message : String(error))
     emitTextAdminLog('failed', { error: parseError.detail, summary: parseError.message })
     throw parseError
   }
-  const content = payload.choices?.[0]?.message?.content
-    ?? payload.choices?.[0]?.text
-    ?? payload.output_text
-    ?? payload.text
-    ?? ''
+  const extractText = (value: unknown, depth = 0): string => {
+    if (typeof value === 'string') return value
+    if (!value || typeof value !== 'object' || depth > 7) return ''
+    if (Array.isArray(value)) return value.map((item) => extractText(item, depth + 1)).filter(Boolean).join('')
+    const record = value as Record<string, unknown>
+    for (const key of ['output_text', 'text']) {
+      const text = extractText(record[key], depth + 1)
+      if (text) return text
+    }
+    const choices = Array.isArray(record.choices) ? record.choices : []
+    if (choices.length) {
+      const choice = choices[0]
+      const text = choice && typeof choice === 'object' ? (() => {
+        const item = choice as Record<string, unknown>
+        return extractText((item.message as Record<string, unknown> | undefined)?.content ?? item.delta ?? item.text, depth + 1)
+      })() : ''
+      if (text) return text
+    }
+    for (const key of ['output', 'content', 'result', 'data', 'message', 'delta']) {
+      const text = extractText(record[key], depth + 1)
+      if (text) return text
+    }
+    return ''
+  }
+  const responseEvents = Array.isArray(payload) ? payload.filter((event): event is Record<string, unknown> => Boolean(event) && typeof event === 'object') : []
+  const completedResponseText = [...responseEvents].reverse().find((event) => event.type === 'response.output_text.done' && typeof event.text === 'string')?.text
+  const responseDeltaText = responseEvents.filter((event) => event.type === 'response.output_text.delta' && typeof event.delta === 'string').map((event) => event.delta).join('')
+  const content = (typeof completedResponseText === 'string' ? completedResponseText : responseDeltaText) || extractText(payload)
   if (!content.trim()) {
     const emptyError = new GenerationRequestError('platform', '模型没有返回文本内容', '接口请求成功，但响应中没有可用的文本字段。')
     emitTextAdminLog('failed', payload, extractTaskId(payload))
     throw emptyError
   }
   emitTextAdminLog('success', {
-    id: payload.id,
+    id: payload && typeof payload === 'object' && !Array.isArray(payload) ? (payload as Record<string, unknown>).id : undefined,
     content: content.trim().slice(0, 8_000),
     truncated: content.trim().length > 8_000,
   }, extractTaskId(payload))

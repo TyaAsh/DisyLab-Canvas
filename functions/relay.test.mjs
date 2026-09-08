@@ -28,6 +28,24 @@ test('Cloudflare media relay rejects lookalike hosts without fetching', async ()
   } finally { globalThis.fetch = originalFetch }
 })
 
+test('Cloudflare media relay sends HFSY anti-hotlink and scoped authorization headers to aixinai', async () => {
+  const originalFetch = globalThis.fetch
+  let capturedHeaders
+  globalThis.fetch = async (_url, init) => {
+    capturedHeaders = new Headers(init.headers)
+    return new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'video/mp4' } })
+  }
+  try {
+    const response = await mediaRelay({ request: new Request('https://app.test/apiyi/media?url=https%3A%2F%2Fcdn.aixinai.net%2Fresult.mp4', {
+      headers: { 'x-disylab-media-authorization': 'Bearer hfsy-key' },
+    }) })
+    assert.equal(response.status, 200)
+    assert.equal(capturedHeaders.get('authorization'), 'Bearer hfsy-key')
+    assert.equal(capturedHeaders.get('referer'), 'https://www.hfsyapi.cn/')
+    assert.match(capturedHeaders.get('accept'), /video/)
+  } finally { globalThis.fetch = originalFetch }
+})
+
 test('Cloudflare HFSY relay keeps the configured version path exactly once', async () => {
   const originalFetch = globalThis.fetch
   let capturedUrl = ''

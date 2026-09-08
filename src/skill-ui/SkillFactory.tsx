@@ -46,6 +46,17 @@ export function SkillFactory({ open, onClose, onLaunch }: Props) {
   const selectForEdit = (item: SkillCategory) => { setSelectedId(item.id); setCategoryName(item.label); setPendingDelete('') }
 
   useEffect(() => { if (open) { setView('browse'); setNotice(''); setPendingDelete(''); void refresh() } }, [open])
+  useEffect(() => {
+    if (!open) return
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      onClose()
+    }
+    window.addEventListener('keydown', closeWithEscape, true)
+    return () => window.removeEventListener('keydown', closeWithEscape, true)
+  }, [onClose, open])
   const upload = async (files: FileList | null) => {
     if (!files?.length) return
     const manifests = Array.from(files).filter((file) => /\.json$/i.test(file.name)); let imported = 0; const errors: string[] = []

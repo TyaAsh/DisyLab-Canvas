@@ -9,12 +9,11 @@
  */
 import { createContext, forwardRef, lazy, memo, Suspense, useCallback, useContext, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { readImageSourceBlob, publicImageSourceUrl, hfsyVideoLimits } from './imageApi'
+import { GenerationRequestError, apiYiGeneratedMediaUrl, readImageSourceBlob, publicImageSourceUrl, hfsyVideoLimits, seedanceVideoDefaults } from './imageApi'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import gsap from 'gsap'
 import { useGSAP } from '@gsap/react'
 const LightingSpherePreview = lazy(() => import('./LightingSpherePreview'))
-const SvgMotionNode = lazy(() => import('./SvgMotionNode'))
 const WorkflowTemplatePanel = lazy(() => import('./WorkflowTemplatePanel').then((module) => ({ default: module.WorkflowTemplatePanel })))
 import {
   ArrowUp,
@@ -128,7 +127,7 @@ import {
   type OnConnectEnd,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { useDisyStore, isConnectionUsable, type ApiConnection, type ApiModelConfig, type ModelCapability, type ModelSelection } from './store'
+import { useDisyStore, isConnectionUsable, type ApiAuthMode, type ApiConnection, type ApiModelConfig, type ModelCapability, type ModelSelection } from './store'
 import { appendWorkspaceProjects, createWorkspaceCanvas, createWorkspaceProject, deleteAgentSession, deleteHistoryMedia, deleteWorkspaceCanvas, deleteWorkspaceProject, exportWorkspaceSnapshot, listAgentSessions, listHistoryMedia, listWorkspaceCanvases, listWorkspaceProjects, loadHistoryMedia, loadLocalAssets, loadLocalProject, loadWorkspaceAuxiliaryData, loadWorkspaceCanvas, loadWorkspaceImportBackup, makeUniqueWorkspaceName, mergeWorkspaceIntoProject, renameWorkspaceProject, replaceWorkspaceProject, restoreWorkspaceImportBackup, saveAgentSession, saveHistoryMedia, saveLocalAssets, saveWorkspaceAuxiliaryData, saveWorkspaceCanvas, saveWorkspaceProject, validateWorkspaceSnapshot, type StylePresetRecord, type StyleReferenceRecord, type WorkspaceCanvas, type WorkspaceProject } from './localDb'
 import { collectReferencedMediaIds, extractMediaIntoBundle, isWorkspaceBundle, packWorkspaceBundle, reinflateBundleMedia, triggerBlobDownload, unpackWorkspaceBundle, type BundleMediaEntry } from './workspaceBundle'
 import { ToolboxPanel } from './ToolboxPanel'
@@ -151,7 +150,6 @@ import { useProjectDialog } from './ProjectDialog'
 import type { PromptLibraryCase } from './PromptLibraryPanel'
 import type { WorkflowTemplate } from './WorkflowTemplatePanel'
 import { compactReferenceName, getRequestedAgentPlanCount, messageExpectsImagePlans, messageExpectsVideoPlans, messageRequestsDirectImagePlan, normalizeAgentMessageContent, parseAgentReply, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
-import { DEFAULT_SVG_MOTION, type SvgMotionSettings } from './svgMotion'
 
 const PromptLibraryPanel = lazy(() => import('./PromptLibraryPanel').then((module) => ({ default: module.PromptLibraryPanel })))
 
@@ -178,7 +176,7 @@ function pickValidSelections(connections: ApiConnection[], previous: { selectedT
   return { selectedTextModel, selectedImageModel }
 }
 
-type NodeKind = 'text' | 'image' | 'upload' | 'video' | 'svg-motion' | 'group'
+type NodeKind = 'text' | 'image' | 'upload' | 'video' | 'group'
 type CreatableNodeKind = Exclude<NodeKind, 'group'>
 type ImageAspectRatio = 'auto' | `${number}:${number}`
 type ImageResolution = '1K' | '2K' | '4K'
@@ -335,9 +333,6 @@ type CanvasNode = Node<{
   gridAspectRatio?: number
   imageEditorHeight?: number
   textEditorHeight?: number
-  svgSource?: string
-  svgSourceName?: string
-  svgMotion?: SvgMotionSettings
 }>
 
 type ActiveImageReference = Omit<ImageReference, 'url'> & {
@@ -510,6 +505,17 @@ type VideoResolution = NonNullable<CanvasNode['data']['videoResolution']>
 type VideoModelCapabilities = {
   resolutions: readonly VideoResolution[]
   ratios: readonly VideoAspectRatio[]
+  minDuration?: number
+  maxDuration?: number
+  defaultDuration?: number
+  defaultRatio?: VideoAspectRatio
+  defaultImageRatio?: VideoAspectRatio
+  defaultResolution?: VideoResolution
+  defaultGenerateAudio?: boolean
+}
+
+function apiCredentialKey(baseUrl: string, apiKey: string, authMode: ApiAuthMode = 'auto') {
+  return `${baseUrl.trim().replace(/\/$/, '')}\n${apiKey.trim()}\n${authMode}`
 }
 
 const ALL_VIDEO_RESOLUTIONS: readonly VideoResolution[] = ['480p', '720p', '1080p', '4k']
@@ -518,11 +524,41 @@ const ALL_VIDEO_RATIOS: readonly VideoAspectRatio[] = VIDEO_ASPECT_OPTIONS.map((
 /** Provider-specific constraints for the video adapters implemented in imageApi.ts. */
 function getVideoModelCapabilities(modelName = ''): VideoModelCapabilities {
   const normalized = modelName.toLowerCase()
-  if (/seedance.*(?:fast|mini)|(?:fast|mini).*seedance/.test(normalized)) {
-    return { resolutions: ['480p', '720p'], ratios: ALL_VIDEO_RATIOS }
+  if (/minimax[-_ ]?h3/.test(normalized)) {
+    return {
+      resolutions: ['720p'],
+      ratios: ['9:16', '16:9'],
+      minDuration: 5,
+      maxDuration: 15,
+      defaultDuration: 5,
+      defaultRatio: '9:16',
+      defaultResolution: '720p',
+      defaultGenerateAudio: false,
+    }
   }
-  if (/seedance|doubao-seedance/.test(normalized)) {
-    return { resolutions: ['480p', '720p', '1080p'], ratios: ALL_VIDEO_RATIOS }
+  if (/(?:^|\s)sd-2\.5-(?:480|720)(?:\s|$)/.test(normalized)) {
+    return { resolutions: [/-480/.test(normalized) ? '480p' : '720p'], ratios: ['9:16', '3:4', '1:1', '4:3', '16:9'], minDuration: 4, maxDuration: 30, defaultDuration: 4, defaultRatio: '9:16', defaultResolution: /-480/.test(normalized) ? '480p' : '720p' }
+  }
+  if (/(?:^|\s)sd-2\.0(?:-fast)?(?:-480)?(?:\s|$)/.test(normalized)) {
+    return { resolutions: [/-480/.test(normalized) ? '480p' : '720p'], ratios: ['9:16', '16:9', '1:1', '21:9', '4:3', '3:4'], minDuration: 4, maxDuration: 15, defaultDuration: 4, defaultRatio: '9:16', defaultResolution: /-480/.test(normalized) ? '480p' : '720p' }
+  }
+  if (/(?:^|\s)sd-2(?:-(?:vip(?:-720)?|mini-(?:480|720)|1080-cheap|fast))?(?:\s|$)/.test(normalized)) {
+    const resolution: VideoResolution = /1080/.test(normalized) ? '1080p' : /(?:-480|vip(?:\s|$))/.test(normalized) ? '480p' : '720p'
+    return { resolutions: [resolution], ratios: ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'], minDuration: 5, maxDuration: 15, defaultDuration: 5, defaultRatio: '9:16', defaultResolution: resolution }
+  }
+  const seedance = seedanceVideoDefaults(normalized)
+  if (seedance) {
+    return {
+      resolutions: seedance.resolutions,
+      ratios: seedance.ratios,
+      minDuration: seedance.minDuration,
+      maxDuration: seedance.maxDuration,
+      defaultDuration: seedance.defaultDuration,
+      defaultRatio: seedance.defaultRatio,
+      defaultImageRatio: seedance.defaultImageRatio,
+      defaultResolution: seedance.defaultResolution,
+      defaultGenerateAudio: seedance.defaultGenerateAudio,
+    }
   }
   if (/veo[-_ ]?3(?:\.1)?/.test(normalized)) {
     return { resolutions: ['720p', '1080p', '4k'], ratios: ['16:9', '9:16'] }
@@ -1981,7 +2017,7 @@ const NodeCard = memo(function NodeCard({
   width?: number
   height?: number
 }) {
-  const Icon = data.kind === 'text' ? Type : data.kind === 'upload' ? Upload : data.kind === 'svg-motion' ? Activity : WandSparkles
+  const Icon = data.kind === 'text' ? Type : data.kind === 'upload' ? Upload : WandSparkles
   const updateNodeText = useContext(NodeTextUpdateContext)
   const activateTextNode = useContext(NodeTextActivateContext)
   const updateNodeTitle = useContext(NodeTitleUpdateContext)
@@ -2391,7 +2427,7 @@ const NodeCard = memo(function NodeCard({
 
   return (
     <div
-      className={`disy-node ${data.kind === 'text' ? 'resizable-text-node' : ''} ${data.kind === 'svg-motion' ? 'svg-motion-node' : ''} ${data.kind === 'image' || data.kind === 'video' ? 'image-generation-node' : ''} ${(data.kind === 'image' || data.kind === 'video') && isActivelyGenerating ? 'is-generating' : ''} ${selected ? 'is-selected' : ''}`}
+      className={`disy-node ${data.kind === 'text' ? 'resizable-text-node' : ''} ${data.kind === 'image' || data.kind === 'video' ? 'image-generation-node' : ''} ${(data.kind === 'image' || data.kind === 'video') && isActivelyGenerating ? 'is-generating' : ''} ${selected ? 'is-selected' : ''}`}
       style={data.kind === 'text'
         ? { width: width || 275, height: height || 126 }
         : data.kind === 'image' || data.kind === 'video'
@@ -2421,11 +2457,7 @@ const NodeCard = memo(function NodeCard({
         {nodeTitle}
       </div>
 
-      {data.kind === 'svg-motion' ? (
-        <Suspense fallback={<div className="svg-motion-loading"><LoaderCircle className="is-spinning" size={20} />加载动效编辑器…</div>}>
-          <SvgMotionNode title={getNodeDisplayTitle(data)} sourceSvg={data.svgSource} sourceName={data.svgSourceName} settings={data.svgMotion ?? DEFAULT_SVG_MOTION} onChange={(patch) => updateNodeData(id, { ...(patch.sourceSvg ? { svgSource: patch.sourceSvg } : {}), ...(patch.sourceName ? { svgSourceName: patch.sourceName } : {}), ...(patch.settings ? { svgMotion: patch.settings } : {}) })} onNotice={(message) => window.dispatchEvent(new CustomEvent('disy-motion-notice', { detail: message }))} />
-        </Suspense>
-      ) : data.kind === 'upload' ? (
+      {data.kind === 'upload' ? (
         <label
           className={`upload-placeholder nowheel ${uploadDragging ? 'is-dragging' : ''}`}
           onDragEnter={(event) => { event.preventDefault(); event.stopPropagation(); setUploadDragging(true) }}
@@ -2599,7 +2631,40 @@ const nodeTypes = {
   ),
 }
 
+function useMobileCanvasMode() {
+  const [matches, setMatches] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches)
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 720px)')
+    const update = () => setMatches(query.matches)
+    update()
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [])
+  return matches
+}
+
+function useTouchCanvasMode() {
+  const [matches, setMatches] = useState(() => typeof window !== 'undefined' && (
+    window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(max-width: 1100px)').matches
+  ))
+  useEffect(() => {
+    const coarse = window.matchMedia('(pointer: coarse)')
+    const compact = window.matchMedia('(max-width: 1100px)')
+    const update = () => setMatches(coarse.matches || compact.matches)
+    update()
+    coarse.addEventListener('change', update)
+    compact.addEventListener('change', update)
+    return () => {
+      coarse.removeEventListener('change', update)
+      compact.removeEventListener('change', update)
+    }
+  }, [])
+  return matches
+}
+
 function App() {
+  const mobileCanvasMode = useMobileCanvasMode()
+  const touchCanvasMode = useTouchCanvasMode()
   const { confirm: projectConfirm, dialogNode: projectDialogNode } = useProjectDialog()
   const {
     apiConfigured,
@@ -2797,6 +2862,7 @@ function App() {
   const [showGrid, setShowGrid] = useState(true)
   const [canvasZoom, setCanvasZoom] = useState(1)
   const [canvasViewport, setCanvasViewport] = useState({ x: 0, y: 0 })
+  const [isCanvasInteracting, setIsCanvasInteracting] = useState(false)
   const [activeEditorNodeId, setActiveEditorNodeId] = useState<string | null>(null)
   const [activeImageNodeId, setActiveImageNodeId] = useState<string | null>(null)
   const [activeGenerationNodeId, setActiveGenerationNodeId] = useState<string | null>(null)
@@ -3137,9 +3203,12 @@ function App() {
   }])
   const [projectPromptSuffix, setProjectPromptSuffix] = useState('')
   const [editingConnectionId, setEditingConnectionId] = useState<string>(apiSettings.connections[0]?.id ?? 'new')
-  const [apiDraft, setApiDraft] = useState({ name: '', baseUrl: '', apiKey: '', balanceToken: '' })
+  const [apiDraft, setApiDraft] = useState<{ name: string; baseUrl: string; apiKey: string; balanceToken: string; authMode: ApiAuthMode }>({ name: '', baseUrl: '', apiKey: '', balanceToken: '', authMode: 'auto' })
   const [apiKeyVisible, setApiKeyVisible] = useState(false)
   const [draftModels, setDraftModels] = useState<ApiModelConfig[]>([])
+  const [manualModelIds, setManualModelIds] = useState<string[]>([])
+  const [draftModelsCredentialKey, setDraftModelsCredentialKey] = useState('')
+  const [manualModelId, setManualModelId] = useState('')
   const [apiModelTab, setApiModelTab] = useState<ModelCapability>('text')
   const [apiAlert, setApiAlert] = useState<string | null>(null)
   const [providerCreditsByConnection, setProviderCreditsByConnection] = useState<Record<string, ProviderCredits>>({})
@@ -3384,10 +3453,14 @@ function App() {
       return
     }
     if (connection) {
-      setApiDraft({ name: connection.name, baseUrl: connection.baseUrl, apiKey: connection.apiKey, balanceToken: connection.balanceToken ?? '' })
+      setApiDraft({ name: connection.name, baseUrl: connection.baseUrl, apiKey: connection.apiKey, balanceToken: connection.balanceToken ?? '', authMode: connection.authMode ?? 'auto' })
+      setDraftModelsCredentialKey(apiCredentialKey(connection.baseUrl, connection.apiKey, connection.authMode))
+      setManualModelIds([])
       setDraftModels(connection.models)
     } else {
-      setApiDraft({ name: '', baseUrl: '', apiKey: '', balanceToken: '' })
+      setApiDraft({ name: '', baseUrl: '', apiKey: '', balanceToken: '', authMode: 'auto' })
+      setDraftModelsCredentialKey('')
+      setManualModelIds([])
       setDraftModels([])
     }
     const focusTimer = window.setTimeout(() => firstApiInputRef.current?.focus(), 40)
@@ -3414,7 +3487,7 @@ function App() {
     if (connection.disconnected) return
     let cancelled = false
     setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'checking' }))
-    void validateApiCredentials({ baseUrl: connection.baseUrl, apiKey: connection.apiKey })
+    void validateApiCredentials({ baseUrl: connection.baseUrl, apiKey: connection.apiKey, authMode: connection.authMode })
       .then(() => {
         if (!cancelled) setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'online' }))
       })
@@ -3830,6 +3903,7 @@ function App() {
     const credentialsChanged = Boolean(savedConnection && (
       savedConnection.apiKey.trim() !== apiDraft.apiKey.trim()
       || savedConnection.baseUrl.replace(/\/$/, '') !== apiDraft.baseUrl.trim().replace(/\/$/, '')
+      || (savedConnection.authMode ?? 'auto') !== apiDraft.authMode
     ))
     if (credentialsChanged && savedConnection) {
       const connections = apiSettings.connections.map((connection) => connection.id === savedConnection.id
@@ -3838,12 +3912,14 @@ function App() {
       const { selectedTextModel, selectedImageModel } = pickValidSelections(connections, apiSettings)
       saveApiSettings({ connections, selectedTextModel, selectedImageModel })
       setDraftModels([])
+      setDraftModelsCredentialKey('')
+      setManualModelIds([])
     }
     setModelsLoading(true)
     const requestId = ++modelFetchRequestRef.current
     try {
-      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim() })
-      const models = await fetchRemoteModels({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim() })
+      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
+      const models = await fetchRemoteModels({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
       if (requestId !== modelFetchRequestRef.current) return
       const mapped = models.map((model) => ({ ...model, enabled: isModelAutoEnabled(model) }))
       const nextDraftModels = models.map((model) => {
@@ -3853,6 +3929,8 @@ function App() {
         return { ...model, enabled: shouldAutoEnable || existing?.enabled === true }
       })
       setDraftModels(nextDraftModels)
+      setDraftModelsCredentialKey(apiCredentialKey(apiDraft.baseUrl, apiDraft.apiKey, apiDraft.authMode))
+      setManualModelIds([])
       const preferredText = pickPreferredModelId(mapped, 'text')
       const preferredImage = pickPreferredModelId(mapped, 'image')
       if (editingConnectionId !== 'new') {
@@ -3865,12 +3943,11 @@ function App() {
       if (!models.length) showApiAlert('接口没有返回可用模型')
     } catch (error) {
       if (requestId !== modelFetchRequestRef.current) return
-      setDraftModels([])
       showApiAlert(error instanceof Error ? error.message : '模型列表读取失败')
     } finally {
       if (requestId === modelFetchRequestRef.current) setModelsLoading(false)
     }
-  }, [apiDraft.apiKey, apiDraft.baseUrl, apiSettings, draftModels, editingConnectionId, saveApiSettings, showApiAlert])
+  }, [apiDraft.apiKey, apiDraft.authMode, apiDraft.baseUrl, apiSettings, draftModels, editingConnectionId, saveApiSettings, showApiAlert])
 
   const refreshProviderCredits = useCallback(async () => {
     if (!apiDraft.baseUrl.trim() || !apiDraft.apiKey.trim()) {
@@ -4761,14 +4838,12 @@ function App() {
       image: '图像',
       upload: '新上传',
       video: '视频',
-      'svg-motion': 'SVG 动效',
     }
     const bodies: Record<CreatableNodeKind, string> = {
       text: '',
       image: '',
       upload: '上传一张参考图。',
       video: '',
-      'svg-motion': '上传 SVG 或使用示例图形创建轻量动效。',
     }
     const id = `${kind}-${Date.now()}`
     const connectionSourceId = positionOverride ? undefined : nodeMenu?.connectionSourceId
@@ -4797,6 +4872,11 @@ function App() {
       imageResolution: '1K' as ImageResolution,
       imageDetail: 'medium' as ImageDetail,
     }
+    const defaultVideoModel = enabledVideoModels[0]
+    const defaultVideoCapabilities = getVideoModelCapabilities(`${defaultVideoModel?.model.id ?? ''} ${defaultVideoModel?.model.name ?? ''}`)
+    const defaultVideoRatio = upstreamImageNode
+      ? defaultVideoCapabilities.defaultImageRatio ?? defaultVideoCapabilities.defaultRatio ?? '16:9'
+      : defaultVideoCapabilities.defaultRatio ?? '16:9'
     const inheritedVideoOptions = upstreamVideoNode ? {
       videoAspectRatio: upstreamVideoNode.data.videoAspectRatio ?? '16:9' as VideoAspectRatio,
       videoDuration: upstreamVideoNode.data.videoDuration ?? 4 as VideoDuration,
@@ -4806,10 +4886,15 @@ function App() {
       ...(upstreamVideoNode.data.videoModelId ? { videoModelId: upstreamVideoNode.data.videoModelId } : {}),
       ...(upstreamVideoNode.data.videoModelName ? { videoModelName: upstreamVideoNode.data.videoModelName } : {}),
     } : {
-      videoAspectRatio: '16:9' as VideoAspectRatio,
-      videoDuration: 4 as VideoDuration,
-      videoResolution: '720p' as const,
-      videoGenerateAudio: true,
+      videoAspectRatio: defaultVideoRatio as VideoAspectRatio,
+      videoDuration: (defaultVideoCapabilities.defaultDuration ?? 4) as VideoDuration,
+      videoResolution: defaultVideoCapabilities.defaultResolution ?? '720p' as const,
+      videoGenerateAudio: defaultVideoCapabilities.defaultGenerateAudio ?? true,
+      ...(defaultVideoModel ? {
+        videoModelConnectionId: defaultVideoModel.connection.id,
+        videoModelId: defaultVideoModel.model.id,
+        videoModelName: defaultVideoModel.model.name,
+      } : {}),
     }
     const menuAnchor = { x: nodeMenu?.flowX ?? 360, y: nodeMenu?.flowY ?? 260 }
     const imageSize = getImageGenerationNodeSize(inheritedImageOptions.imageAspectRatio)
@@ -4817,8 +4902,6 @@ function App() {
       ? { x: menuAnchor.x - 137.5, y: menuAnchor.y - 63 }
       : kind === 'image'
         ? { x: menuAnchor.x - imageSize.width / 2, y: menuAnchor.y - imageSize.height / 2 }
-          : kind === 'svg-motion'
-            ? { x: menuAnchor.x - 170, y: menuAnchor.y - 235 }
           : kind === 'video'
             ? { x: menuAnchor.x - 150, y: menuAnchor.y - 95 }
           : { x: menuAnchor.x - 130, y: menuAnchor.y - 110 }
@@ -4836,9 +4919,7 @@ function App() {
           ? { style: { width: 275, height: 126 } }
           : kind === 'image'
             ? { style: imageSize }
-            : kind === 'svg-motion'
-              ? { style: { width: 360, height: 660 } }
-          : kind === 'video'
+            : kind === 'video'
                 ? { style: getVideoNodeSize(inheritedVideoOptions.videoAspectRatio) }
             : {}),
         data: {
@@ -4851,7 +4932,6 @@ function App() {
             ...inheritedImageOptions,
           } : {}),
           ...(kind === 'video' ? { status: '待生成', promptText: '', ...inheritedVideoOptions, videoQuality: 'professional' as const, videoGenerationMethod: upstreamImageNode ? 'image' as const : 'text' as const, videoGenerateCount: 1 as const } : {}),
-          ...(kind === 'svg-motion' ? { svgMotion: DEFAULT_SVG_MOTION } : {}),
         },
       },
     ])
@@ -5482,7 +5562,12 @@ function App() {
     }
     try {
       const media = node.data.videoMediaId ? await loadHistoryMedia(node.data.videoMediaId) : null
-      const blob = media?.blob ?? (node.data.videoUrl ? await fetch(node.data.videoUrl).then((response) => {
+      const selectedConnection = apiSettings.connections.find((connection) => connection.id === node.data.videoModelConnectionId)
+      const sourceUrl = node.data.videoUrl || ''
+      const requiresHfsyRelay = /(?:^|\.)aixinai\.net$/i.test(new URL(sourceUrl || 'https://invalid.local').hostname)
+      const blob = media?.blob ?? (sourceUrl ? await fetch(requiresHfsyRelay ? apiYiGeneratedMediaUrl(sourceUrl) : sourceUrl, {
+        headers: requiresHfsyRelay && selectedConnection?.apiKey ? { 'X-DisyLab-Media-Authorization': `Bearer ${selectedConnection.apiKey}` } : undefined,
+      }).then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         return response.blob()
       }) : null)
@@ -5710,32 +5795,37 @@ function App() {
       return
     }
     setApiKeyVisible(false)
+    const currentCredentialKey = apiCredentialKey(apiDraft.baseUrl, apiDraft.apiKey, apiDraft.authMode)
+    const modelsMatchCredentials = draftModelsCredentialKey === currentCredentialKey
+    const modelsForCredentials = modelsMatchCredentials
+      ? draftModels
+      : draftModels.filter((model) => manualModelIds.includes(model.id))
+    let validationWarning = ''
     try {
-      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim() })
+      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
     } catch (error) {
-      showApiAlert(error instanceof Error ? error.message : 'API Key 校验失败')
-      return
+      if (!modelsForCredentials.length) {
+        showApiAlert(error instanceof Error ? error.message : 'API Key 校验失败')
+        return
+      }
+      validationWarning = error instanceof Error ? error.message : '该厂商不提供模型目录，API Key 尚未通过只读接口验证'
     }
 
     const connectionId = editingConnectionId === 'new' ? `connection-${crypto.randomUUID()}` : editingConnectionId
     const existingConnection = apiSettings.connections.find((connection) => connection.id === connectionId)
     const hasKey = apiDraft.apiKey.trim() !== ''
-    const credentialsChanged = Boolean(existingConnection && (
-      existingConnection.apiKey.trim() !== apiDraft.apiKey.trim()
-      || existingConnection.baseUrl.replace(/\/$/, '') !== apiDraft.baseUrl.trim().replace(/\/$/, '')
-    ))
-    // Models returned for a previous key must never remain selectable after the
-    // connection credentials change. Catalog-only providers cannot validate a
-    // key by listing models, so preserve an explicit disconnected state.
-    const keepDisconnected = existingConnection?.disconnected === true || credentialsChanged || !hasKey
+    // A manually declared model keeps providers without `/models` usable. The
+    // connection still needs a key and at least one explicit model.
+    const keepDisconnected = !hasKey || !modelsForCredentials.length
     const nextConnection: ApiConnection = {
       id: connectionId,
       name: apiDraft.name.trim() || `连接 ${apiSettings.connections.length + 1}`,
       baseUrl: apiDraft.baseUrl.trim().replace(/\/$/, ''),
       apiKey: apiDraft.apiKey.trim(),
+      authMode: apiDraft.authMode,
       balanceToken: apiDraft.balanceToken.trim(),
-      models: keepDisconnected ? [] : draftModels,
-      modelsFetchedAt: keepDisconnected || !draftModels.length ? undefined : new Date().toISOString(),
+      models: keepDisconnected ? [] : modelsForCredentials,
+      modelsFetchedAt: keepDisconnected || !modelsMatchCredentials ? undefined : new Date().toISOString(),
       enabled: existingConnection?.enabled === false ? false : true,
       disconnected: keepDisconnected,
     }
@@ -5754,21 +5844,21 @@ function App() {
       return
     }
     setEditingConnectionId(connectionId)
-    if (credentialsChanged) {
-      setDraftModels([])
-      showApiAlert('API Key 或接口地址已变更。为避免旧模型继续出现在节点中，连接已保存为断开状态且模型目录已清空；请确认新凭据有效后再重新链接。')
-      return
-    }
-    setToastMessage('API 连接已保存')
+    setDraftModels(modelsForCredentials)
+    setDraftModelsCredentialKey(currentCredentialKey)
+    setManualModelIds([])
+    setToastMessage(validationWarning ? `连接已保存；模型目录不可验证：${validationWarning}` : 'API 连接已保存')
   }
 
   const beginNewApiConnection = () => {
     modelFetchRequestRef.current += 1
     setModelsLoading(false)
     setEditingConnectionId('new')
-    setApiDraft({ name: '', baseUrl: '', apiKey: '', balanceToken: '' })
+    setApiDraft({ name: '', baseUrl: '', apiKey: '', balanceToken: '', authMode: 'auto' })
     setApiKeyVisible(false)
     setDraftModels([])
+    setDraftModelsCredentialKey('')
+    setManualModelIds([])
     setApiModelTab('text')
     window.setTimeout(() => firstApiInputRef.current?.focus(), 20)
   }
@@ -5777,9 +5867,11 @@ function App() {
     modelFetchRequestRef.current += 1
     setModelsLoading(false)
     setEditingConnectionId('new')
-    setApiDraft({ name: preset.name, baseUrl: preset.baseUrl, apiKey: '', balanceToken: '' })
+    setApiDraft({ name: preset.name, baseUrl: preset.baseUrl, apiKey: '', balanceToken: '', authMode: 'auto' })
     setApiKeyVisible(false)
     setDraftModels([])
+    setDraftModelsCredentialKey('')
+    setManualModelIds([])
     window.setTimeout(() => firstApiInputRef.current?.focus(), 20)
   }
 
@@ -5787,9 +5879,11 @@ function App() {
     modelFetchRequestRef.current += 1
     setModelsLoading(false)
     setEditingConnectionId(connection.id)
-    setApiDraft({ name: connection.name, baseUrl: connection.baseUrl, apiKey: connection.apiKey, balanceToken: connection.balanceToken ?? '' })
+    setApiDraft({ name: connection.name, baseUrl: connection.baseUrl, apiKey: connection.apiKey, balanceToken: connection.balanceToken ?? '', authMode: connection.authMode ?? 'auto' })
     setApiKeyVisible(false)
     setDraftModels(connection.models)
+    setDraftModelsCredentialKey(apiCredentialKey(connection.baseUrl, connection.apiKey, connection.authMode))
+    setManualModelIds([])
   }
 
   const removeCurrentApiConnection = async () => {
@@ -5848,10 +5942,10 @@ function App() {
     }
     setConnectionHealthByConnection((current) => ({ ...current, [editingConnectionId]: 'checking' }))
     try {
-      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim() })
+      await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
       const connections = apiSettings.connections.map((connection) =>
         connection.id === editingConnectionId
-          ? { ...connection, baseUrl: apiDraft.baseUrl.trim().replace(/\/$/, ''), apiKey: apiDraft.apiKey.trim(), disconnected: false }
+          ? { ...connection, baseUrl: apiDraft.baseUrl.trim().replace(/\/$/, ''), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode, disconnected: false }
           : connection,
       )
       const { selectedTextModel, selectedImageModel } = pickValidSelections(connections, apiSettings)
@@ -6800,7 +6894,6 @@ function App() {
   const activeVideoNode = nodes.find(
     (node) => node.id === activeVideoNodeId && node.data.kind === 'video',
   )
-  const activeVideoMaxDuration = hfsyVideoLimits(activeVideoNode?.data.videoModelId || '')?.maxSeconds ?? 15
   const selectedLocalVideoNode = nodes.find((node) => node.selected && node.data.kind === 'video' && (
     node.data.videoSource === 'local-upload'
     || (node.data.status === '已上传' && Boolean(node.data.videoUrl) && !node.data.videoMediaId && !node.data.videoGeneratedAt)
@@ -6821,6 +6914,7 @@ function App() {
     : [], [activeVideoNode, edges, nodes])
   const activeVideoReferences = useMemo<ActiveNodeReference[]>(() => {
     if (!activeVideoNode) return []
+    const modelImageLimit = hfsyVideoLimits(activeVideoNode.data.videoModelId || '')?.images ?? 4
     const promptText = activeVideoNode.data.body
     const connected = activeVideoIncomingNodes.flatMap<ActiveNodeReference>((sourceNode): ActiveNodeReference[] => {
       const edge = edges.find((item) => item.source === sourceNode.id && item.target === activeVideoNode.id)
@@ -6890,8 +6984,8 @@ function App() {
         disabledReason = '首尾帧模式只使用排序前两张图片，可拖拽调整顺序'
       } else if (mode === 'reference' && reference.kind === 'video') {
         disabledReason = '图片参考模式只允许图片素材'
-      } else if (mode === 'reference' && reference.kind === 'image' && imageIndex > 3) {
-        disabledReason = '图片参考模式最多使用 4 张图片，可拖拽调整顺序'
+      } else if (mode === 'reference' && reference.kind === 'image' && imageIndex >= modelImageLimit) {
+        disabledReason = `图片参考模式最多使用 ${modelImageLimit} 张图片，可拖拽调整顺序`
       }
       if (reference.kind === 'image') imageIndex += 1
       return {
@@ -7869,7 +7963,7 @@ function App() {
     setImageTool({ nodeId, mode })
   }, [nodes])
 
-  const imageToolZoomable = imageTool?.mode === 'crop' || imageTool?.mode === 'expand'
+  const imageToolZoomable = imageTool?.mode === 'expand'
   const imageToolViewRef = useRef(imageToolView)
   useEffect(() => { imageToolViewRef.current = imageToolView }, [imageToolView])
 
@@ -8437,6 +8531,7 @@ function App() {
     const raw = await generateRemoteText({
       baseUrl: reverseTextModel.connection.baseUrl,
       apiKey: reverseTextModel.connection.apiKey,
+      authMode: reverseTextModel.connection.authMode,
       model: reverseTextModel.model.id,
     }, instruction, { referenceImages: [preparedImage] })
     const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
@@ -8513,7 +8608,7 @@ function App() {
         ? '图像生成提示词。强化主体、构图、环境、光线、材质、镜头与风格，同时保留用户的硬性要求。'
         : '文本生成提示词。明确任务、背景、约束、输出结构和验收标准。'
     try {
-      const optimized = await generateRemoteText({ baseUrl: textModel.connection.baseUrl, apiKey: textModel.connection.apiKey, model: textModel.model.id }, `你是专业提示词导演。请优化下面这段${kindGuide}\n要求：保留原意和所有明确约束；不要解释；不要使用 Markdown 代码块；只输出可直接使用的最终提示词。\n\n原提示词：\n${source}`)
+      const optimized = await generateRemoteText({ baseUrl: textModel.connection.baseUrl, apiKey: textModel.connection.apiKey, authMode: textModel.connection.authMode, model: textModel.model.id }, `你是专业提示词导演。请优化下面这段${kindGuide}\n要求：保留原意和所有明确约束；不要解释；不要使用 Markdown 代码块；只输出可直接使用的最终提示词。\n\n原提示词：\n${source}`)
       const clean = optimized.replace(/^```[^\n]*\n?|```$/g, '').trim()
       setNodes((current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, promptOptimizationBackup: source, promptOptimizedAt: new Date().toISOString(), promptText: clean, body: clean } } : item))
       setToastMessage('提示词已优化，可随时撤回')
@@ -8552,7 +8647,7 @@ function App() {
             ? `你是漫画成稿编辑。把下面内容改写成读者可以直接看到的一条具体知识点或结论，必须包含实际信息，不能是“介绍、说明、对比、讲清楚、呈现”等写作任务。保留原意和事实，不编造数字。只输出一条简洁完整的要点，不加项目符号，不解释。\n\n原内容：\n${value}`
             : `你是专业创意制片与提示词编辑。请优化微型工作台中的“${field}”。\n要求：保留原意、事实和所有硬性约束；补足必要的可执行细节，消除含糊、空话、冲突和重复；内容必须适合直接传递给后续文本、图像或视频生成节点；不要臆造品牌事实、数据或用户没有表达的核心设定；不要解释修改过程，不使用 Markdown 代码块，只输出优化后的字段内容。\n\n原内容：\n${value}`
       const optimized = await generateRemoteText(
-        { baseUrl: textModel.connection.baseUrl, apiKey: textModel.connection.apiKey, model: textModel.model.id },
+        { baseUrl: textModel.connection.baseUrl, apiKey: textModel.connection.apiKey, authMode: textModel.connection.authMode, model: textModel.model.id },
         instruction,
       )
       const clean = optimized.replace(/^```[^\n]*\n?|```$/g, '').trim()
@@ -8680,6 +8775,44 @@ function App() {
       const record = generationHistory.find((item) => item.imageUrl === url || Boolean(owner?.data.imageMediaId && item.mediaId === owner.data.imageMediaId))
       return publicImageSourceUrl(variant?.sourceUrl) || publicImageSourceUrl(record?.sourceUrl) || url
     }
+    const publicImageEntrySource = (entry: { id: string; url?: string; mediaId?: string }) => {
+      const preferred: Array<string | undefined> = []
+      const fallback: Array<string | undefined> = [entry.url]
+      for (const item of nodes) {
+        const ownsMedia = Boolean(entry.mediaId && (
+          item.data.imageMediaId === entry.mediaId
+          || item.data.referenceImageMediaId === entry.mediaId
+          || item.data.videoReferenceImageMediaId === entry.mediaId
+          || item.data.videoFirstFrameMediaId === entry.mediaId
+          || item.data.videoLastFrameMediaId === entry.mediaId
+        ))
+        if (ownsMedia || item.data.imageUrl === entry.url || item.data.referenceImageUrl === entry.url) {
+          fallback.push(item.data.imageUrl, item.data.referenceImageUrl)
+        }
+        for (const variant of item.data.imageVariants ?? []) {
+          if ((entry.mediaId && variant.mediaId === entry.mediaId) || variant.url === entry.url) { preferred.push(variant.sourceUrl); fallback.push(variant.url) }
+        }
+      }
+      for (const record of generationHistory) {
+        if ((entry.mediaId && record.mediaId === entry.mediaId) || record.imageUrl === entry.url) { preferred.push(record.sourceUrl); fallback.push(record.imageUrl) }
+      }
+      return [...preferred, ...fallback].map((source) => publicImageSourceUrl(source)).find((source): source is string => Boolean(source))
+    }
+    const publicVideoEntrySource = (entry: { id: string; url?: string; mediaId?: string }) => {
+      const preferred: Array<string | undefined> = []
+      const fallback: Array<string | undefined> = [entry.url]
+      for (const item of nodes) {
+        if (item.data.kind !== 'video') continue
+        if ((entry.mediaId && item.data.videoMediaId === entry.mediaId) || item.data.videoUrl === entry.url) fallback.push(item.data.videoUrl)
+        for (const variant of item.data.videoVariants ?? []) {
+          if ((entry.mediaId && variant.mediaId === entry.mediaId) || variant.sourceUrl === entry.url) preferred.push(variant.sourceUrl)
+        }
+      }
+      for (const record of generationHistory) {
+        if (record.kind === 'video' && ((entry.mediaId && record.mediaId === entry.mediaId) || record.imageUrl === entry.url)) { preferred.push(record.sourceUrl); fallback.push(record.imageUrl) }
+      }
+      return [...preferred, ...fallback].map((source) => publicImageSourceUrl(source)).find((source): source is string => Boolean(source))
+    }
     const incomingVideoNodes = edges
       .filter((edge) => edge.target === node.id)
       .flatMap((edge) => nodes.filter((item) => item.id === edge.source))
@@ -8758,6 +8891,11 @@ function App() {
     setNodes((current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '排队中', videoProgress: 0, generationError: undefined, videoModelConnectionId: selected.connection.id, videoModelId: selected.model.id, videoModelName: selected.model.name } } : item))
     try {
       const resolvedImageReferences = await Promise.all(selectedImageEntries.map(async (entry) => {
+        if (requiresPublicImages) {
+          const publicUrl = publicImageEntrySource(entry)
+          if (publicUrl) return publicUrl
+          throw new GenerationRequestError('platform', 'HFSY 参考图片没有公网源地址', `参考图“${entry.id}”仅保存在本机。请使用带公网 sourceUrl 的生成图片，或先把本地图片上传到可公开访问的 HTTPS 地址。视频生成尚未提交。`)
+        }
         if (!entry.mediaId) return entry.url!
         const media = await loadHistoryMedia(entry.mediaId)
         if (!media) {
@@ -8771,6 +8909,12 @@ function App() {
       const connectedVideoEntries: Array<{ id: string; url: string }> = []
       for (const item of selectedIncomingVideoNodes) {
         if (item.data.kind !== 'video') continue
+        if (requiresPublicImages) {
+          const publicUrl = publicVideoEntrySource({ id: `connection-${item.id}`, url: item.data.videoUrl, mediaId: item.data.videoMediaId })
+          if (publicUrl) connectedVideoEntries.push({ id: `connection-${item.id}`, url: publicUrl })
+          else throw new GenerationRequestError('platform', 'HFSY 参考视频没有公网源地址', `参考视频“${getNodeDisplayTitle(item.data)}”仅保存在本机，无法作为 HFSY 公网素材提交。`)
+          continue
+        }
         if (item.data.videoUrl) connectedVideoEntries.push({ id: `connection-${item.id}`, url: item.data.videoUrl })
         else if (item.data.videoMediaId) {
           const media = await loadHistoryMedia(item.data.videoMediaId)
@@ -8783,6 +8927,12 @@ function App() {
       }
       const resolvedLocalVideoEntries: Array<{ id: string; url: string }> = []
       for (const entry of localVideoEntries) {
+        if (requiresPublicImages) {
+          const publicUrl = publicVideoEntrySource(entry)
+          if (publicUrl) resolvedLocalVideoEntries.push({ id: entry.id, url: publicUrl })
+          else throw new GenerationRequestError('platform', 'HFSY 参考视频没有公网源地址', `参考视频“${entry.id}”仅保存在本机，无法作为 HFSY 公网素材提交。`)
+          continue
+        }
         if (entry.mediaId) {
           const media = await loadHistoryMedia(entry.mediaId)
           if (media) {
@@ -8811,17 +8961,20 @@ function App() {
       const ratioOption = VIDEO_ASPECT_OPTIONS.find((item) => item.value === ratio)
       const ratioNumber = ratioOption && ratio !== 'auto' ? ratioOption.width / ratioOption.height : 16 / 9
       const baseHeight = resolution === '4k' ? 2160 : resolution === '1080p' ? 1080 : resolution === '720p' ? 720 : 480
-      const size = `${Math.round(ratioNumber * baseHeight)}x${baseHeight}`
+      const size = ratio === 'auto' && /api\.apiyi\.com|apiyi\.com/i.test(selected.connection.baseUrl) && /seedance/i.test(selected.model.id)
+        ? 'adaptive'
+        : `${Math.round(ratioNumber * baseHeight)}x${baseHeight}`
       const generateCount = node.data.videoGenerateCount ?? 1
       let lastTaskId: string | undefined
       let lastMediaId = ''
       let lastFileName = ''
       const generatedVideoVariants: VideoVariant[] = []
       for (let index = 0; index < generateCount; index += 1) {
-        const result = await generateRemoteVideo({ baseUrl: selected.connection.baseUrl, apiKey: selected.connection.apiKey, model: selected.model.id }, {
+        const result = await generateRemoteVideo({ baseUrl: selected.connection.baseUrl, apiKey: selected.connection.apiKey, authMode: selected.connection.authMode, model: selected.model.id }, {
           prompt,
           seconds: node.data.videoDuration ?? 4,
           size,
+          resolution,
           mode: modeApi,
           referenceImages: requestReferenceImages,
           firstFrame: mode === 'image' || mode === 'frames' ? videoImageSource(resolvedImageReferences[0]) : undefined,
@@ -8862,6 +9015,7 @@ function App() {
           projectId: origin.projectId,
           mediaId: lastMediaId,
           kind: 'video',
+          sourceUrl: result.sourceUrl,
         }])
       }
       const activeVariant = generatedVideoVariants.at(-1)
@@ -8872,7 +9026,13 @@ function App() {
         await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '已停止' } } : item))
       } else {
         const normalized = normalizeGenerationError(error)
-        await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '生成失败', generationError: normalized.message } } : item))
+        const generatedButDownloadFailed = normalized.resultUrls?.length && /^HFSY 视频已生成但下载/.test(normalized.message)
+        await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: {
+          ...item.data,
+          status: generatedButDownloadFailed ? '生成成功·下载待恢复' : '生成失败',
+          generationError: normalized.message,
+          ...(generatedButDownloadFailed ? { videoTaskId: normalized.requestId, videoUrl: normalized.resultUrls?.[0], videoMediaId: undefined, activeVideoVariantId: undefined } : {}),
+        } } : item))
         setToastMessage(normalized.message)
       }
     } finally {
@@ -8894,6 +9054,11 @@ function App() {
         changed = true
         agentPlanLocksRef.current.delete(plan.id)
         return { ...plan, status: 'completed' as const, error: undefined }
+      }
+      if (node.data.status === '生成成功·下载待恢复') {
+        changed = true
+        agentPlanLocksRef.current.delete(plan.id)
+        return { ...plan, status: 'completed' as const, error: node.data.generationError }
       }
       if (node.data.status === '生成失败') {
         changed = true
@@ -8971,9 +9136,14 @@ function App() {
     // output-history path, so its provider log becomes the canonical record.
     if (log.kind === 'video') {
       const isSuccess = log.resultType === 'success'
+      let downloadPending = false
       let videoError: { category: 'api' | 'network' | 'platform'; summary: string; detail: string; requestId?: string } = {
         category: 'api', summary: '视频任务失败', detail: log.resultJson, requestId: log.taskId,
       }
+      try {
+        const parsed = JSON.parse(log.resultJson)
+        downloadPending = parsed?.status === 'download_pending'
+      } catch { /* Keep the ordinary success/failure state for non-JSON provider logs. */ }
       if (!isSuccess) {
         try {
           const parsed = JSON.parse(log.resultJson)
@@ -8995,8 +9165,8 @@ function App() {
         modelName: meta.modelName || log.model,
         connectionName: meta.connectionName || log.provider || 'Custom API',
         requestedCount: 1,
-        outputCount: isSuccess ? 1 : 0,
-        preview: isSuccess ? '视频任务完成 · 已保存到本地项目' : '视频任务失败 · 已保留厂商错误日志',
+        outputCount: isSuccess && !downloadPending ? 1 : 0,
+        preview: downloadPending ? '视频已生成 · 下载待恢复（已保留原始地址）' : isSuccess ? '视频任务完成 · 已保存到本地项目' : '视频任务失败 · 已保留厂商错误日志',
         error: isSuccess ? undefined : videoError,
       }, meta.projectId)
     }
@@ -9193,9 +9363,10 @@ function App() {
       const videoFrames = (await Promise.all(selectedVideoReferences.map((reference) => captureVideoReferenceFrames(reference, controller.signal)))).flat()
       const referenceImages = [...visualImages, ...videoFrames]
       const output = await generateRemoteText({
-        baseUrl: selectedTextModel.connection.baseUrl,
-        apiKey: selectedTextModel.connection.apiKey,
-        model: selectedTextModel.model.id,
+      baseUrl: selectedTextModel.connection.baseUrl,
+      apiKey: selectedTextModel.connection.apiKey,
+      authMode: selectedTextModel.connection.authMode,
+      model: selectedTextModel.model.id,
       }, prompt, {
         referenceImages,
         signal: controller.signal,
@@ -9369,6 +9540,7 @@ function App() {
           const batch = await generateRemoteImages({
             baseUrl: activeNodeImageModel.connection.baseUrl,
             apiKey: activeNodeImageModel.connection.apiKey,
+            authMode: activeNodeImageModel.connection.authMode,
             model: activeNodeImageModel.model.id,
           }, {
             prompt,
@@ -9955,7 +10127,7 @@ function App() {
         ? '用户本次明确不要再选择多个方案。若上下文中的媒体目标已经足够清楚，直接把用户要求整合成唯一一项对应的 imagePlans 或 videoPlans，供界面创建待确认卡；不要再追问创作方向，也不要返回多个备选。仍然不得直接声称已经生成。'
         : '用户未明确跳过方案选择时，按正常流程提出可选方向。'
       const instruction = `你是 Disy 创意画布助手。请和用户中文对话、脑暴。${orchestrationGuide} ${textNodeGuide} ${directPlanGuide} 禁止直接生成媒体，也禁止声称图片或视频已经生成；必须先提出对应确认方案。严格只返回 JSON，不要 Markdown：{"reply":"自然对话回复；文本/脚本请用清晰标题、列表与可复制内容组织","textNode":{"title":"仅最终交付物标题","content":"仅最终整合正文"},"imagePlans":[{"label":"图像方案一","prompt":"可直接用于生图的完整中文提示词","aspectRatio":"1:1","resolution":"1K","detail":"medium","count":1}],"videoPlans":[{"label":"视频方案一","prompt":"包含主体动作、镜头运动、场景和节奏的完整中文视频提示词","aspectRatio":"16:9","resolution":"720p","duration":4,"count":1}]}。只返回任务需要的字段；不满足最终文本交付条件时省略 textNode；不需要图像时省略 imagePlans，不需要视频时省略 videoPlans。需要图像或视频时，对应 plans 必须恰好返回 ${requestedPlanCount} 项。每个方向必须是独立项目，禁止把多个方向合并进同一个 prompt。count 只表示同一方案生成几份结果，不表示方案数量。用户提到图1、图片1或参考图1时，都表示下方编号中的同一张图片；每份方案必须保留用户指定的图片编号及其用途，不得交换顺序。${resolvedContextGuide}${referenceUsageGuide ? `\n\n${referenceUsageGuide}` : ''}\n\n${agentReferenceGuide || '本次对话没有参考图。'}\n\n${styleInvocationWords.length ? `用户本次已调用风格预设：${invokedStylePresets.map((preset) => `${preset.name}（${preset.keyword}）`).join('、')}，确认卡会自动附带对应风格图。` : availableStyleKeywords.length ? `可用风格预设为：${availableStyleKeywords.join('；')}。仅当用户本次消息包含对应调用词时才附带风格图。` : '项目未设置可用的风格调用词。'}\n\n${transcript}`
-      let raw = await generateRemoteText({ baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, model: selection.model.id }, instruction, { referenceImages: images, signal: controller.signal })
+      let raw = await generateRemoteText({ baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id }, instruction, { referenceImages: images, signal: controller.signal })
       if (controller.signal.aborted || requestVersion !== agentRequestVersionRef.current) return
       let parsed = parseAgentReply(raw)
       let parsedPlans = parsed.imagePlans ?? (parsed.imagePlan ? [parsed.imagePlan] : [])
@@ -9964,7 +10136,7 @@ function App() {
         || ((expectsVideoPlans || parsedVideoPlans.length > 0) && parsedVideoPlans.length !== requestedPlanCount)
       if (planCountsInvalid()) {
         raw = await generateRemoteText(
-          { baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, model: selection.model.id },
+          { baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id },
           `${instruction}\n\n你上一次返回的方案数量不符合要求。请为本次实际需要的每种媒体重新返回恰好 ${requestedPlanCount} 个彼此独立的 plans。`,
           { referenceImages: images, signal: controller.signal },
         )
@@ -10020,29 +10192,34 @@ function App() {
       }))
       if (parsedVideoPlans.length) {
         const [videoConnectionId, videoModelId] = agentVideoModelKey.split('::')
+        const selectedVideoModel = enabledVideoModels.find(({ connection, model }) => connection.id === videoConnectionId && model.id === videoModelId)
+        const videoCapabilities = getVideoModelCapabilities(`${selectedVideoModel?.model.id ?? ''} ${selectedVideoModel?.model.name ?? ''}`)
         const createdAt = new Date().toISOString()
-        setAgentVideoPlans((current) => [...current, ...parsedVideoPlans.map((draft, index): AgentVideoPlan => ({
-          id: `agent-video-plan-${crypto.randomUUID()}`,
-          mediaKind: 'video',
-          status: 'ready',
-          label: draft.label || `视频方案${index + 1}`,
-          prompt: draft.prompt,
-          referenceNodeIds: sentReferences.map((item) => item.nodeId),
-          references: sentReferences,
-          contextReferences: resolvedContextReferences,
-          invokedStyleReferences,
-          styleInvocationWord: styleInvocationWords.length ? styleInvocationWords.join('、') : undefined,
-          invokedStylePresets,
-          aspectRatio: agentVideoDefaults.aspectRatio,
-          resolution: agentVideoDefaults.resolution,
-          duration: agentVideoDefaults.duration,
-          count: agentVideoDefaults.count,
-          generationMode: videoGenerationMode ?? (sentReferences.some((reference) => reference.kind === 'video') ? 'omni' : sentReferences.length ? 'reference' : 'text'),
-          videoConnectionId,
-          videoModelId,
-          assistantMessageId: assistantMessage.id,
-          createdAt,
-        }))])
+        setAgentVideoPlans((current) => [...current, ...parsedVideoPlans.map((draft, index): AgentVideoPlan => {
+          const generationMode = videoGenerationMode ?? (sentReferences.some((reference) => reference.kind === 'video') ? 'omni' : sentReferences.length ? 'reference' : 'text')
+          return {
+            id: `agent-video-plan-${crypto.randomUUID()}`,
+            mediaKind: 'video',
+            status: 'ready',
+            label: draft.label || `视频方案${index + 1}`,
+            prompt: draft.prompt,
+            referenceNodeIds: sentReferences.map((item) => item.nodeId),
+            references: sentReferences,
+            contextReferences: resolvedContextReferences,
+            invokedStyleReferences,
+            styleInvocationWord: styleInvocationWords.length ? styleInvocationWords.join('、') : undefined,
+            invokedStylePresets,
+            aspectRatio: generationMode !== 'text' && videoCapabilities.defaultImageRatio ? videoCapabilities.defaultImageRatio : agentVideoDefaults.aspectRatio,
+            resolution: agentVideoDefaults.resolution,
+            duration: agentVideoDefaults.duration,
+            count: agentVideoDefaults.count,
+            generationMode,
+            videoConnectionId,
+            videoModelId,
+            assistantMessageId: assistantMessage.id,
+            createdAt,
+          }
+        })])
       }
       if (parsed.textNode) {
         setAgentTextPlans((current) => [...current, {
@@ -10112,8 +10289,8 @@ function App() {
       return
     }
     const capabilities = getVideoModelCapabilities(`${model.model.id} ${model.model.name}`)
-    const aspectRatio = capabilities.ratios.includes(plan.aspectRatio as VideoAspectRatio) ? plan.aspectRatio as VideoAspectRatio : capabilities.ratios[0] ?? '16:9'
-    const resolution = capabilities.resolutions.includes(plan.resolution as VideoResolution) ? plan.resolution as VideoResolution : capabilities.resolutions[0] ?? '720p'
+    const aspectRatio = capabilities.ratios.includes(plan.aspectRatio as VideoAspectRatio) ? plan.aspectRatio as VideoAspectRatio : capabilities.defaultRatio ?? capabilities.ratios[0] ?? '16:9'
+    const resolution = capabilities.resolutions.includes(plan.resolution as VideoResolution) ? plan.resolution as VideoResolution : capabilities.defaultResolution ?? capabilities.resolutions[0] ?? '720p'
     const savedReferences = new Map((plan.references ?? []).map((reference) => [reference.nodeId, reference]))
     const references = plan.referenceNodeIds
       .map((nodeId) => savedReferences.get(nodeId) ?? agentImageCandidates.find((item) => item.nodeId === nodeId))
@@ -10153,9 +10330,9 @@ function App() {
         status: '待生成',
         videoAspectRatio: aspectRatio,
         videoResolution: resolution,
-        videoDuration: Math.min(15, Math.max(4, plan.duration || 4)),
+        videoDuration: Math.min(capabilities.maxDuration ?? 15, Math.max(capabilities.minDuration ?? 1, plan.duration || capabilities.defaultDuration || 5)),
         videoGenerateCount: Math.min(4, Math.max(1, plan.count || 1)) as 1 | 2 | 3 | 4,
-        videoGenerateAudio: true,
+        videoGenerateAudio: capabilities.defaultGenerateAudio ?? true,
         videoQuality: 'professional',
         videoGenerationMethod: generationMode,
         videoReferenceImageUrl: generationMode === 'image' ? referenceImages[0]?.url : undefined,
@@ -10290,7 +10467,7 @@ function App() {
         try {
           if (controller.signal.aborted) throw new DOMException('Generation interrupted', 'AbortError')
           const batch = await generateRemoteImages(
-            { baseUrl: model.connection.baseUrl, apiKey: model.connection.apiKey, model: model.model.id },
+            { baseUrl: model.connection.baseUrl, apiKey: model.connection.apiKey, authMode: model.connection.authMode, model: model.model.id },
             {
               prompt: requestPrompt,
               count: 1,
@@ -10643,7 +10820,7 @@ function App() {
   const multipleNodeToolbarAllowed = marqueeSelectionCommitted && selectedNodeIds.length > 1
   const selectionToolbarAllowed = multipleNodeToolbarAllowed || Boolean(selectedGroupNode)
   // Enable the lightweight canvas path before dense workflows become janky.
-  const automaticPerformanceMode = nodes.length >= 12 || edges.length >= 20
+  const automaticPerformanceMode = nodes.length >= (mobileCanvasMode ? 8 : 12) || edges.length >= (mobileCanvasMode ? 12 : 20)
   const performanceModeActive = manualPerformanceMode || automaticPerformanceMode
   const canvasLoad = Math.min(100, Math.round(Math.max(nodes.length / 16, edges.length / 28) * 100))
   const performanceStatus = automaticPerformanceMode ? '自动保护' : manualPerformanceMode ? '手动开启' : '运行流畅'
@@ -11912,21 +12089,41 @@ function App() {
     ?? enabledVideoModels[0]
   const agentVideoCapabilities = getVideoModelCapabilities(`${selectedAgentVideoModel?.model.id ?? ''} ${selectedAgentVideoModel?.model.name ?? ''}`)
   const activeVideoModel = activeVideoNode
-    ? enabledVideoModels.find(({ connection, model }) => connection.id === activeVideoNode.data.videoModelConnectionId && model.id === activeVideoNode.data.videoModelId) ?? enabledVideoModels[0]
+    ? enabledVideoModels.find(({ connection, model }) => activeVideoNode.data.videoModelId
+        ? connection.id === activeVideoNode.data.videoModelConnectionId && model.id === activeVideoNode.data.videoModelId
+        : Boolean(activeVideoNode.data.videoModelName) && model.name === activeVideoNode.data.videoModelName)
+      ?? (!activeVideoNode.data.videoModelId && !activeVideoNode.data.videoModelName ? enabledVideoModels[0] : undefined)
     : undefined
   const activeVideoCapabilities = useMemo(
-    () => getVideoModelCapabilities(activeVideoModel?.model.id || activeVideoModel?.model.name || activeVideoNode?.data.videoModelName || ''),
+    () => getVideoModelCapabilities(`${activeVideoModel?.model.id ?? activeVideoNode?.data.videoModelId ?? ''} ${activeVideoModel?.model.name ?? activeVideoNode?.data.videoModelName ?? ''}`),
     [activeVideoModel?.model.id, activeVideoModel?.model.name, activeVideoNode?.data.videoModelName],
   )
+  const activeVideoMinDuration = activeVideoCapabilities.minDuration ?? hfsyVideoLimits(activeVideoNode?.data.videoModelId || '')?.minSeconds ?? 1
+  const activeVideoMaxDuration = activeVideoCapabilities.maxDuration ?? hfsyVideoLimits(activeVideoNode?.data.videoModelId || '')?.maxSeconds ?? 15
   useEffect(() => {
     if (!activeVideoNode) return
     const currentResolution = activeVideoNode.data.videoResolution ?? '720p'
     const currentRatio = activeVideoNode.data.videoAspectRatio ?? '16:9'
+    const currentDuration = activeVideoNode.data.videoDuration ?? 4
     const patch: Partial<CanvasNode['data']> = {}
-    if (!activeVideoCapabilities.resolutions.includes(currentResolution)) patch.videoResolution = activeVideoCapabilities.resolutions[0]
-    if (!activeVideoCapabilities.ratios.includes(currentRatio)) patch.videoAspectRatio = activeVideoCapabilities.ratios[0]
+    const legacyModelBinding = !activeVideoNode.data.videoModelId && Boolean(activeVideoModel)
+    if (legacyModelBinding) {
+      patch.videoModelConnectionId = activeVideoModel!.connection.id
+      patch.videoModelId = activeVideoModel!.model.id
+      patch.videoModelName = activeVideoModel!.model.name
+      patch.videoResolution = activeVideoCapabilities.defaultResolution ?? activeVideoCapabilities.resolutions[0]
+      patch.videoAspectRatio = (activeVideoNode.data.videoGenerationMethod ?? 'text') !== 'text' && activeVideoCapabilities.defaultImageRatio
+        ? activeVideoCapabilities.defaultImageRatio
+        : activeVideoCapabilities.defaultRatio ?? activeVideoCapabilities.ratios[0]
+      patch.videoDuration = activeVideoCapabilities.defaultDuration ?? activeVideoMinDuration
+      if (typeof activeVideoCapabilities.defaultGenerateAudio === 'boolean') patch.videoGenerateAudio = activeVideoCapabilities.defaultGenerateAudio
+    } else {
+      if (!activeVideoCapabilities.resolutions.includes(currentResolution)) patch.videoResolution = activeVideoCapabilities.defaultResolution ?? activeVideoCapabilities.resolutions[0]
+      if (!activeVideoCapabilities.ratios.includes(currentRatio)) patch.videoAspectRatio = activeVideoCapabilities.defaultRatio ?? activeVideoCapabilities.ratios[0]
+      if (currentDuration < activeVideoMinDuration || currentDuration > activeVideoMaxDuration) patch.videoDuration = activeVideoCapabilities.defaultDuration ?? activeVideoMinDuration
+    }
     if (Object.keys(patch).length) updateNodeData(activeVideoNode.id, patch)
-  }, [activeVideoCapabilities, activeVideoNode, updateNodeData])
+  }, [activeVideoCapabilities, activeVideoMaxDuration, activeVideoMinDuration, activeVideoNode, updateNodeData])
   const activeVideoPrice = activeVideoModel
     ? providerPricesByConnection[activeVideoModel.connection.id]?.[activeVideoModel.model.id]
     : undefined
@@ -11959,7 +12156,7 @@ function App() {
     : null
 
   return (
-    <div ref={shellRef} className={`disy-shell ${agentOpen ? 'has-agent-open' : ''} ${performanceModeActive ? 'is-performance-mode' : ''} ${isNodeDragging ? 'is-node-dragging' : ''}`}>
+    <div ref={shellRef} className={`disy-shell ${mobileCanvasMode ? 'is-mobile-canvas' : ''} ${touchCanvasMode ? 'is-touch-canvas' : ''} ${isCanvasInteracting ? 'is-canvas-interacting' : ''} ${agentOpen ? 'has-agent-open' : ''} ${performanceModeActive ? 'is-performance-mode' : ''} ${isNodeDragging ? 'is-node-dragging' : ''}`}>
       <AnimatePresence>
         {projectHomeOpen && (
           <motion.section className="project-home" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
@@ -12108,7 +12305,7 @@ function App() {
           edges={renderedEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          minZoom={0.25}
+          minZoom={mobileCanvasMode ? .45 : .25}
           maxZoom={2}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
@@ -12251,7 +12448,7 @@ function App() {
             setNodes((current) => [...current, stationaryDuplicate])
           }}
           onNodeDrag={(_, node) => {
-            if (!performanceModeActive && !reduceMotion && nodes.length < 8) scheduleLiveOverlapTilt(node)
+            if (!touchCanvasMode && !performanceModeActive && !reduceMotion && nodes.length < 8) scheduleLiveOverlapTilt(node)
           }}
           onNodeDragStop={(_, node) => {
             stopLiveOverlapTilt()
@@ -12365,8 +12562,22 @@ function App() {
             setActiveVideoNodeId(null)
             setExpandedEditorNodeId(null)
           }}
+          onMoveStart={() => {
+            if (touchCanvasMode) setIsCanvasInteracting(true)
+          }}
+          onMoveEnd={(_, viewport) => {
+            canvasViewportRef.current = viewport
+            if (touchCanvasMode) {
+              setCanvasZoom((current) => Math.abs(current - viewport.zoom) > 0.002 ? viewport.zoom : current)
+              setCanvasViewport((current) => Math.abs(current.x - viewport.x) > 0.25 || Math.abs(current.y - viewport.y) > 0.25
+                ? { x: viewport.x, y: viewport.y }
+                : current)
+              setIsCanvasInteracting(false)
+            }
+          }}
           onMove={(_, viewport) => {
             canvasViewportRef.current = viewport
+            if (touchCanvasMode) return
             const viewportCommitInterval = performanceModeActive ? 64 : 32
             if (canvasViewportFrameRef.current === null) {
               canvasViewportFrameRef.current = window.requestAnimationFrame(() => {
@@ -12391,11 +12602,12 @@ function App() {
           }}
           zoomOnDoubleClick={false}
           zoomOnScroll={false}
+          zoomOnPinch
           zoomActivationKeyCode="Control"
-          panOnScroll
+          panOnScroll={!touchCanvasMode}
           panOnScrollMode={PanOnScrollMode.Vertical}
-          selectionOnDrag
-          panOnDrag={[1]}
+          selectionOnDrag={!touchCanvasMode}
+          panOnDrag={touchCanvasMode ? [0, 1] : [1]}
           deleteKeyCode={null}
           fitView
           fitViewOptions={{ padding: 0.2 }}
@@ -12404,7 +12616,7 @@ function App() {
           defaultEdgeOptions={{
             type: 'luminous',
           }}
-          onlyRenderVisibleElements={performanceModeActive}
+          onlyRenderVisibleElements={performanceModeActive || touchCanvasMode}
         >
           {showGrid && !performanceModeActive && (
             <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="var(--canvas-dot)" />
@@ -12539,16 +12751,34 @@ function App() {
               const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
               window.addEventListener('pointermove', move); window.addEventListener('pointerup', up, { once:true })
             }
+            const startCropMove = (event: React.PointerEvent<HTMLDivElement>) => {
+              if (event.button !== 0 || (event.target as HTMLElement).closest('.crop-selection > i')) return
+              event.preventDefault(); event.stopPropagation()
+              const plane = event.currentTarget.closest('.image-tool-image-plane') as HTMLElement | null
+              if (!plane) return
+              const bounds = plane.getBoundingClientRect(), start = cropRect, startX = event.clientX, startY = event.clientY
+              const move = (moveEvent: PointerEvent) => {
+                const dx = (moveEvent.clientX - startX) / bounds.width * 100
+                const dy = (moveEvent.clientY - startY) / bounds.height * 100
+                setCropRect({
+                  ...start,
+                  x: Math.max(0, Math.min(100 - start.width, start.x + dx)),
+                  y: Math.max(0, Math.min(100 - start.height, start.y + dy)),
+                })
+              }
+              const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
+              window.addEventListener('pointermove', move); window.addEventListener('pointerup', up, { once:true })
+            }
             return <motion.div className="image-tool-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={() => { if (!cutoutBusy) setImageTool(null) }}>
               <motion.section className={`image-tool-dialog mode-${imageTool.mode}`} initial={{ opacity: 0, y: 18, scale: .98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12, scale: .98 }} onMouseDown={(event) => event.stopPropagation()}>
                 <header><div><span>{imageTool.mode === 'grid' ? <Grid3X3 size={17} /> : imageTool.mode === 'crop' ? <Crop size={17} /> : imageTool.mode === 'expand' ? <Expand size={17} /> : imageTool.mode === 'studio' ? <Lightbulb size={17} /> : imageTool.mode === 'color' ? <Palette size={17} /> : imageTool.mode === 'local-edit' ? <MessageCircle size={17} /> : <Scissors size={17} />}</span><div><strong>{imageTool.mode === 'grid' ? '宫格切分' : imageTool.mode === 'crop' ? '本地裁剪' : imageTool.mode === 'expand' ? '自由区域扩图' : imageTool.mode === 'studio' ? '打光' : imageTool.mode === 'color' ? '调色' : imageTool.mode === 'local-edit' ? '局部修改' : '免费本地抠图'}</strong><small>{imageTool.mode === 'grid' ? '拖动辅助线定义每一张输出图片' : imageTool.mode === 'crop' ? '调整裁剪区域并保留原图，处理不消耗积分' : imageTool.mode === 'expand' ? '拖动画布边界，编辑画面延展提示词' : imageTool.mode === 'studio' ? '在左侧光场拖动光源，调整亮度、色温与轮廓光' : imageTool.mode === 'color' ? '实时预览基础影调与白平衡，确认后生成新版本' : imageTool.mode === 'local-edit' ? '点击图片标记需要调整的位置，最多 10 处' : '主体识别将在本机执行，不上传原图'}</small></div></div><button type="button" disabled={cutoutBusy} onClick={() => setImageTool(null)} aria-label="关闭"><X size={17} /></button></header>
                 <div className="image-tool-content">
-                  <div className={`image-tool-stage mode-${imageTool.mode}${imageToolZoomable ? ' is-zoomable' : ''}`} ref={imageToolStageRef} onPointerDown={imageToolZoomable ? startImageToolPan : undefined}>
+                  <div className={`image-tool-stage mode-${imageTool.mode}${imageToolZoomable ? ' is-zoomable' : ''}${imageTool.mode === 'expand' ? ' is-pannable' : ''}`} ref={imageToolStageRef} onPointerDown={imageTool.mode === 'expand' ? startImageToolPan : undefined}>
                     <div className="image-tool-image-plane" ref={imageToolPlaneRef} onPointerDown={addLocalEditMark} style={{ aspectRatio: imageTool.mode === 'expand' ? `${expandSize.width} / ${expandSize.height}` : `${imageToolSourceSize.width} / ${imageToolSourceSize.height}`, ...(imageTool.mode !== 'expand' ? { width: `min(100%, ${Math.max(1, Math.round(Math.max(160, Math.min(500, window.innerHeight - 250)) * imageToolSourceSize.width / Math.max(1, imageToolSourceSize.height)))}px)` } : {}), ...(imageToolZoomable ? { transform: `translate(${imageToolView.x}px, ${imageToolView.y}px) scale(${imageToolView.scale})` } : {}) }}>
                       <img src={sourceUrl} alt="编辑预览" draggable={false} style={imageTool.mode === 'color' ? { filter: colorFilter } : undefined} />
                       {imageTool.mode === 'color' && <i className="color-temperature-overlay" style={{ backgroundColor: colorAdjustments.temperature >= 0 ? '#ff8a45' : '#69aaff', opacity: Math.abs(colorAdjustments.temperature) / 260, boxShadow: `inset 0 0 0 999px ${colorAdjustments.tint >= 0 ? 'rgba(224,72,190,' : 'rgba(62,194,120,'}${Math.abs(colorAdjustments.tint) / 420})` }} />}
                       {imageTool.mode === 'grid' && <>{gridGuides.vertical.map((guide, index) => <i key={`v-${index}`} className="image-guide is-vertical" style={{ left: `${guide}%` }} onPointerDown={(event) => { const stage = event.currentTarget.parentElement!; const move = (moveEvent: PointerEvent) => { const next = Math.min(95, Math.max(5, (moveEvent.clientX - stage.getBoundingClientRect().left) / stage.getBoundingClientRect().width * 100)); setGuide('vertical', index, next) }; window.addEventListener('pointermove', move); window.addEventListener('pointerup', () => window.removeEventListener('pointermove', move), { once: true }) }} />)}{gridGuides.horizontal.map((guide, index) => <i key={`h-${index}`} className="image-guide is-horizontal" style={{ top: `${guide}%` }} onPointerDown={(event) => { const stage = event.currentTarget.parentElement!; const move = (moveEvent: PointerEvent) => { const next = Math.min(95, Math.max(5, (moveEvent.clientY - stage.getBoundingClientRect().top) / stage.getBoundingClientRect().height * 100)); setGuide('horizontal', index, next) }; window.addEventListener('pointermove', move); window.addEventListener('pointerup', () => window.removeEventListener('pointermove', move), { once: true }) }} />)}</>}
-                      {imageTool.mode === 'crop' && <div className="crop-selection" style={{ left:`${cropRect.x}%`,top:`${cropRect.y}%`,width:`${cropRect.width}%`,height:`${cropRect.height}%` }}>{(['nw','n','ne','e','se','s','sw','w'] as const).map((edge)=><i key={edge} className={edge} onPointerDown={(event)=>startCropResize(edge,event)}/>)}</div>}
+                      {imageTool.mode === 'crop' && <div className="crop-selection" style={{ left:`${cropRect.x}%`,top:`${cropRect.y}%`,width:`${cropRect.width}%`,height:`${cropRect.height}%` }} onPointerDown={startCropMove}>{(['nw','n','ne','e','se','s','sw','w'] as const).map((edge)=><i key={edge} className={edge} onPointerDown={(event)=>startCropResize(edge,event)}/>)}</div>}
                       {imageTool.mode === 'expand' && <div className="expand-boundary" style={{ inset: `${expandInsets.top}% ${expandInsets.right}% ${expandInsets.bottom}% ${expandInsets.left}%` }}><button className="expand-handle top" onPointerDown={(event) => startExpandDrag('top', event)} /><button className="expand-handle right" onPointerDown={(event) => startExpandDrag('right', event)} /><button className="expand-handle bottom" onPointerDown={(event) => startExpandDrag('bottom', event)} /><button className="expand-handle left" onPointerDown={(event) => startExpandDrag('left', event)} /></div>}
                       {imageTool.mode === 'studio' && <div className="lighting-three-shell"><div className="lighting-three-tabs"><button className={lightingView === 'perspective' ? 'is-active' : ''} onClick={() => setLightingView('perspective')}>透视</button><button className={lightingView === 'front' ? 'is-active' : ''} onClick={() => setLightingView('front')}>正面</button></div><Suspense fallback={<div className="lighting-three-loading"><LoaderCircle className="is-spinning" size={20} />正在载入三维光场…</div>}><LightingSpherePreview imageUrl={sourceUrl} lights={studioLighting.lights} activeLightId={activeStudioLight.id} exposure={studioLighting.exposure} view={lightingView} onSelectLight={setActiveStudioLightId} onChange={(id, yaw, pitch) => updateStudioLight(id, { yaw, pitch })} /></Suspense><span className="lighting-three-label"><i style={{ background: activeStudioLight.temperatureK < 5000 ? '#ff9a55' : activeStudioLight.temperatureK > 6200 ? '#8fc9ff' : '#fff7e9' }} />{activeStudioLight.name}</span><button type="button" className="lighting-three-reset" onClick={resetStudioLights}>↻ 重置</button><em>水平 {activeStudioLight.yaw}° · 垂直 {activeStudioLight.pitch}°</em></div>}
                       {imageTool.mode === 'local-edit' && <div className="local-edit-overlay">{localEditMarks.map((mark, index) => <span key={mark.id} className="local-edit-pin" style={{ left: `${mark.x}%`, top: `${mark.y}%` }} onPointerDown={(event) => event.stopPropagation()}>{index + 1}</span>)}</div>}
@@ -12750,7 +12980,7 @@ function App() {
                   </AnimatePresence>
                 </div>
                 <footer className="image-editor-footer">
-                  {enabledVideoModels.length ? <div className="video-model-picker"><button type="button" className="editor-model-empty video-model-select" onClick={() => setVideoModelMenuOpen((open) => !open)}><ModelBrandBadge name={formatVideoModelName(activeVideoNode.data.videoModelName || enabledVideoModels[0]?.model.name || '')} video /><span>{formatVideoModelName(activeVideoNode.data.videoModelName || enabledVideoModels[0]?.model.name || '选择视频模型')}</span></button>{videoModelMenuOpen && <div className="video-model-menu"><header><span>视频模型</span><button type="button" className="video-model-settings" title="打开 API 设置" aria-label="打开 API 设置" onClick={(event) => { event.stopPropagation(); setVideoModelMenuOpen(false); openApiSettings() }}><Settings2 size={13} /></button></header>{videoModelProviderGroups.map((group) => <div className="video-model-provider-group" key={group.key}>{groupVideoModelsByProvider && <div className="video-model-provider"><span>{group.label}</span><small>{group.items.length} 个模型</small></div>}{group.items.map(({ connection, model }) => { const selected = (activeVideoNode.data.videoModelId || enabledVideoModels[0]?.model.id) === model.id && (activeVideoNode.data.videoModelConnectionId || enabledVideoModels[0]?.connection.id) === connection.id; return <div className="video-model-option-wrap" key={`${connection.id}-${model.id}`}><button type="button" className={selected ? 'is-selected' : ''} onClick={() => { updateNodeData(activeVideoNode.id, { videoModelConnectionId: connection.id, videoModelId: model.id, videoModelName: model.name }); setVideoModelMenuOpen(false) }}><ModelBrandBadge name={formatVideoModelName(model.name)} video /><span><strong>{formatVideoModelName(model.name)}</strong></span>{selected && <Check size={13} />}</button></div> })}</div>)}</div>}</div> : <button type="button" className="editor-model-empty video-model-select video-model-configure" onClick={openApiSettings}><ModelBrandBadge name="seedance" video /><span>配置并启用视频模型</span></button>}
+                  {enabledVideoModels.length ? <div className="video-model-picker"><button type="button" className="editor-model-empty video-model-select" onClick={() => setVideoModelMenuOpen((open) => !open)}><ModelBrandBadge name={formatVideoModelName(activeVideoNode.data.videoModelName || enabledVideoModels[0]?.model.name || '')} video /><span>{formatVideoModelName(activeVideoNode.data.videoModelName || enabledVideoModels[0]?.model.name || '选择视频模型')}</span></button>{videoModelMenuOpen && <div className="video-model-menu"><header><span>视频模型</span><button type="button" className="video-model-settings" title="打开 API 设置" aria-label="打开 API 设置" onClick={(event) => { event.stopPropagation(); setVideoModelMenuOpen(false); openApiSettings() }}><Settings2 size={13} /></button></header>{videoModelProviderGroups.map((group) => <div className="video-model-provider-group" key={group.key}>{groupVideoModelsByProvider && <div className="video-model-provider"><span>{group.label}</span><small>{group.items.length} 个模型</small></div>}{group.items.map(({ connection, model }) => { const selected = (activeVideoNode.data.videoModelId || enabledVideoModels[0]?.model.id) === model.id && (activeVideoNode.data.videoModelConnectionId || enabledVideoModels[0]?.connection.id) === connection.id; return <div className="video-model-option-wrap" key={`${connection.id}-${model.id}`}><button type="button" className={selected ? 'is-selected' : ''} onClick={() => { const defaults = getVideoModelCapabilities(`${model.id} ${model.name}`); const imageBased = (activeVideoNode.data.videoGenerationMethod ?? 'text') !== 'text'; updateNodeData(activeVideoNode.id, { videoModelConnectionId: connection.id, videoModelId: model.id, videoModelName: model.name, ...(defaults.defaultDuration ? { videoDuration: defaults.defaultDuration } : {}), ...(imageBased && defaults.defaultImageRatio ? { videoAspectRatio: defaults.defaultImageRatio } : defaults.defaultRatio ? { videoAspectRatio: defaults.defaultRatio } : {}), ...(defaults.defaultResolution ? { videoResolution: defaults.defaultResolution } : {}), ...(typeof defaults.defaultGenerateAudio === 'boolean' ? { videoGenerateAudio: defaults.defaultGenerateAudio } : {}), ...(/minimax[-_ ]?h3/i.test(`${model.id} ${model.name}`) ? { videoGenerationMethod: 'text' as const } : {}) }); setVideoTextPickerNodeId(null); setVideoModelMenuOpen(false) }}><ModelBrandBadge name={formatVideoModelName(model.name)} video /><span><strong>{formatVideoModelName(model.name)}</strong></span>{selected && <Check size={13} />}</button></div> })}</div>)}</div>}</div> : <button type="button" className="editor-model-empty video-model-select video-model-configure" onClick={openApiSettings}><ModelBrandBadge name="seedance" video /><span>配置并启用视频模型</span></button>}
                   <div className="image-editor-options video-editor-options">
                     {renderPromptOptimizeControl(activeVideoNode.id)}
                     <div className="video-parameter-control">
@@ -12759,7 +12989,7 @@ function App() {
                           <header><strong>视频参数</strong><button type="button" aria-label="关闭视频参数" onClick={() => setVideoParameterMenuOpen(false)}><X size={13} /></button></header>
                           <section><label>生成模式</label><div className="video-generation-method-options">{([['text', '文生视频', Type, '仅使用文字描述生成视频，不接收图片或视频参考'], ['omni', '全能参考', Sparkles, '最多支持 9 张图片和 3 个视频，可作为角色、动作和风格参考'], ['image', '图生视频', FileImage, '使用一张图片作为视频首帧'], ['frames', '首尾帧', Frame, '使用前两张图片分别作为首帧和尾帧'], ['reference', '图片参考', ImagePlus, '使用最多四张图片作为主体与风格参考']] as const).map(([value, label, ModeIcon, tip]) => <button type="button" key={value} data-tooltip={tip} aria-label={`${label}：${tip}`} className={(activeVideoNode.data.videoGenerationMethod || 'text') === value ? 'is-selected' : ''} onClick={() => { updateNodeData(activeVideoNode.id, { videoGenerationMethod: value, promptText: undefined }); setVideoTextPickerNodeId(null) }}><ModeIcon size={13} /><span>{label}</span></button>)}</div></section>
                           <section><label>清晰度</label><div className="video-quality-options">{(['480p', '720p', '1080p', '4K'] as const).map((quality) => { const value = quality.toLowerCase() as VideoResolution; const available = activeVideoCapabilities.resolutions.includes(value); return <button type="button" key={quality} disabled={!available} className={`${(activeVideoNode.data.videoResolution || '720p').toUpperCase() === quality.toUpperCase() ? 'is-selected' : ''} ${!available ? 'is-disabled' : ''}`} onClick={() => available && updateNodeData(activeVideoNode.id, { videoResolution: value })}>{quality}</button> })}</div></section>
-                          <section><label>视频时长</label><div className="video-duration-control"><input type="range" min="1" max={activeVideoMaxDuration} step="1" value={activeVideoNode.data.videoDuration || 4} onChange={(event) => updateNodeData(activeVideoNode.id, { videoDuration: Number(event.target.value) })} /><input className="video-duration-number" type="number" min="1" max={activeVideoMaxDuration} step="1" value={activeVideoNode.data.videoDuration || 4} aria-label="视频时长（秒）" onChange={(event) => updateNodeData(activeVideoNode.id, { videoDuration: Math.max(1, Math.min(activeVideoMaxDuration, Number(event.target.value) || 1)) })} /><small>秒</small></div></section>
+                          <section><label>视频时长</label><div className="video-duration-control"><input type="range" min={activeVideoMinDuration} max={activeVideoMaxDuration} step="1" value={activeVideoNode.data.videoDuration || activeVideoMinDuration} onChange={(event) => updateNodeData(activeVideoNode.id, { videoDuration: Number(event.target.value) })} /><input className="video-duration-number" type="number" min={activeVideoMinDuration} max={activeVideoMaxDuration} step="1" value={activeVideoNode.data.videoDuration || activeVideoMinDuration} aria-label="视频时长（秒）" onChange={(event) => updateNodeData(activeVideoNode.id, { videoDuration: Math.max(activeVideoMinDuration, Math.min(activeVideoMaxDuration, Number(event.target.value) || activeVideoMinDuration)) })} /><small>秒</small></div></section>
                           <section><label>比例</label><div className="video-ratio-options">{VIDEO_ASPECT_OPTIONS.map((option) => { const available = activeVideoCapabilities.ratios.includes(option.value); return <button type="button" key={option.value} disabled={!available} className={`${(activeVideoNode.data.videoAspectRatio || '16:9') === option.value ? 'is-selected' : ''} ${!available ? 'is-disabled' : ''}`} title={!available ? `${option.label} 暂不支持当前视频模型` : undefined} onClick={() => available ? updateNodeData(activeVideoNode.id, { videoAspectRatio: option.value }) : setToastMessage(`${option.label} 暂不支持当前视频模型`)}><span className="ratio-shape" style={{ aspectRatio: `${option.width} / ${option.height}` }} /><small>{option.label === 'Auto' ? '自适应' : option.label}</small></button> })}</div></section>
                           <section><label>生成音频</label><div className="video-audio-options"><button type="button" className={activeVideoNode.data.videoGenerateAudio !== false ? 'is-selected' : ''} onClick={() => updateNodeData(activeVideoNode.id, { videoGenerateAudio: true })}>开启</button><button type="button" className={activeVideoNode.data.videoGenerateAudio === false ? 'is-selected' : ''} onClick={() => updateNodeData(activeVideoNode.id, { videoGenerateAudio: false })}>关闭</button></div></section>
                         </motion.div>}
@@ -12973,7 +13203,26 @@ function App() {
                 videoModelKey={agentVideoModelKey}
                 onTextModelChange={setAgentTextModelKey}
                 onImageModelChange={(key) => { setAgentImageModelKey(key); const [connectionId = '', modelId = ''] = key.split('::'); setAgentPlans((current) => current.map((plan) => plan.status === 'running' || plan.status === 'completed' ? plan : { ...plan, imageConnectionId: connectionId, imageModelId: modelId })) }}
-                onVideoModelChange={(key) => { setAgentVideoModelKey(key); const [connectionId = '', modelId = ''] = key.split('::'); setAgentVideoPlans((current) => current.map((plan) => plan.status === 'running' || plan.status === 'completed' ? plan : { ...plan, videoConnectionId: connectionId, videoModelId: modelId })) }}
+                onVideoModelChange={(key) => {
+                  setAgentVideoModelKey(key)
+                  const [connectionId = '', modelId = ''] = key.split('::')
+                  const selected = enabledVideoModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
+                  const capabilities = getVideoModelCapabilities(`${selected?.model.id ?? ''} ${selected?.model.name ?? ''}`)
+                  const normalizedRatio = (value: VideoAspectRatio, imageBased = false) => imageBased && capabilities.defaultImageRatio
+                    ? capabilities.defaultImageRatio
+                    : capabilities.defaultRatio ?? (capabilities.ratios.includes(value) ? value : capabilities.ratios[0] ?? '16:9')
+                  const normalizedResolution = (value: VideoResolution) => capabilities.defaultResolution ?? (capabilities.resolutions.includes(value) ? value : capabilities.resolutions[0] ?? '720p')
+                  const normalizedDuration = (value: number) => capabilities.defaultDuration ?? Math.max(capabilities.minDuration ?? 1, Math.min(capabilities.maxDuration ?? 15, value))
+                  setAgentVideoDefaults((current) => ({ ...current, aspectRatio: normalizedRatio(current.aspectRatio), resolution: normalizedResolution(current.resolution), duration: normalizedDuration(current.duration) }))
+                  setAgentVideoPlans((current) => current.map((plan) => plan.status === 'running' || plan.status === 'completed' ? plan : {
+                    ...plan,
+                    videoConnectionId: connectionId,
+                    videoModelId: modelId,
+                    aspectRatio: normalizedRatio(plan.aspectRatio as VideoAspectRatio, Boolean(plan.generationMode && plan.generationMode !== 'text')),
+                    resolution: normalizedResolution(plan.resolution as VideoResolution),
+                    duration: normalizedDuration(plan.duration),
+                  }))
+                }}
                 onSend={(message) => void sendAgentMessage(message, message)}
                 busy={agentBusy}
               /></motion.div>}
@@ -13174,7 +13423,7 @@ function App() {
               <div className="project-brand-menu-section"><small>项目</small>
                 <button onClick={() => { setProjectMenuOpen(false); setCanvasSwitcherOpen(true); setProjectRename({ id: activeProjectId, draft: projectName, source: 'switcher' }) }}><Pencil size={14} /><span>重命名</span></button>
                 <button onClick={() => { setProjectMenuOpen(false); void createNewProject() }}><Plus size={15} /><span>新建项目</span></button>
-                <button onClick={() => { setProjectMenuOpen(false); setSelectedProjectIds([]); setProjectOpen(false); setProjectHomeOpen(true) }}><Folder size={14} /><span>管理项目</span></button>
+                <button onClick={() => { setProjectMenuOpen(false); setSelectedProjectIds([]); setProjectHomeOpen(false); setProjectOpen(true) }}><Folder size={14} /><span>管理项目</span></button>
               </div>
               <button className="project-brand-menu-danger" onClick={() => { setProjectMenuOpen(false); void removeProject(activeProjectId) }}><Trash2 size={14} /><span>删除当前项目</span></button>
             </motion.section>
@@ -13536,7 +13785,7 @@ function App() {
           <button
             aria-label="画布/项目"
             data-tooltip="画布/项目"
-            onClick={() => { setProjectOpen(false); setProjectHomeOpen(true) }}
+            onClick={() => { setProjectHomeOpen(false); setProjectOpen(true) }}
           >
             <PanelsTopLeft size={18} />
           </button>
@@ -13585,6 +13834,12 @@ function App() {
           <span className="rail-divider" />
           <button aria-label="设置" data-tooltip="设置" onClick={openApiSettings}>
             <Settings2 size={18} />
+          </button>
+          <button className="mobile-rail-only" aria-label="文件工具箱" data-tooltip="文件工具箱" onClick={() => setToolboxOpen(true)}>
+            <BriefcaseBusiness size={18} />
+          </button>
+          <button className="mobile-rail-only" aria-label="帮助" data-tooltip="帮助" onClick={() => setHelpOpen(true)}>
+            <CircleHelp size={18} />
           </button>
           <button className={`rail-avatar ${agentOpen ? 'is-active' : ''}`} aria-label="Disy 与您对话" data-tooltip="Disy 与您对话" aria-expanded={agentOpen} aria-controls="disy-agent-panel" onClick={() => { setAgentOpen((open) => !open); setAgentCanvasPicking(false) }}>
             <img src="/disy-logo.png" alt="" />
@@ -13734,15 +13989,19 @@ function App() {
                   const capabilities = getVideoModelCapabilities(`${selected?.model.id ?? ''} ${selected?.model.name ?? ''}`)
                   setAgentVideoDefaults((current) => ({
                     ...current,
-                    aspectRatio: capabilities.ratios.includes(current.aspectRatio) ? current.aspectRatio : capabilities.ratios[0] ?? '16:9',
-                    resolution: capabilities.resolutions.includes(current.resolution) ? current.resolution : capabilities.resolutions[0] ?? '720p',
+                    aspectRatio: capabilities.defaultRatio ?? (capabilities.ratios.includes(current.aspectRatio) ? current.aspectRatio : capabilities.ratios[0] ?? '16:9'),
+                    resolution: capabilities.defaultResolution ?? (capabilities.resolutions.includes(current.resolution) ? current.resolution : capabilities.resolutions[0] ?? '720p'),
+                    duration: capabilities.defaultDuration ?? Math.max(capabilities.minDuration ?? 1, Math.min(capabilities.maxDuration ?? 15, current.duration)),
                   }))
                   setAgentVideoPlans((current) => current.map((plan) => plan.status !== 'ready' ? plan : {
                     ...plan,
                     videoConnectionId: connectionId,
                     videoModelId: modelId,
-                    aspectRatio: capabilities.ratios.includes(plan.aspectRatio as VideoAspectRatio) ? plan.aspectRatio : capabilities.ratios[0] ?? '16:9',
-                    resolution: capabilities.resolutions.includes(plan.resolution as VideoResolution) ? plan.resolution : capabilities.resolutions[0] ?? '720p',
+                    aspectRatio: plan.generationMode && plan.generationMode !== 'text' && capabilities.defaultImageRatio
+                      ? capabilities.defaultImageRatio
+                      : capabilities.defaultRatio ?? (capabilities.ratios.includes(plan.aspectRatio as VideoAspectRatio) ? plan.aspectRatio : capabilities.ratios[0] ?? '16:9'),
+                    resolution: capabilities.defaultResolution ?? (capabilities.resolutions.includes(plan.resolution as VideoResolution) ? plan.resolution : capabilities.resolutions[0] ?? '720p'),
+                    duration: capabilities.defaultDuration ?? Math.max(capabilities.minDuration ?? 1, Math.min(capabilities.maxDuration ?? 15, plan.duration)),
                   }))
                 }}
                 onImageDefaultsChange={(patch) => {
@@ -16311,6 +16570,16 @@ function App() {
                         </button>
                       </span>
                     </label>
+                    <label className="api-field-wide">
+                      鉴权方式
+                      <select value={apiDraft.authMode} onChange={(event) => setApiDraft((draft) => ({ ...draft, authMode: event.target.value as ApiAuthMode }))}>
+                        <option value="auto">自动识别（推荐）</option>
+                        <option value="bearer">Authorization: Bearer</option>
+                        <option value="x-api-key">x-api-key</option>
+                        <option value="api-key">api-key（Azure 等）</option>
+                        <option value="x-goog-api-key">x-goog-api-key</option>
+                      </select>
+                    </label>
                     <button type="button" className="api-fetch-models" disabled={modelsLoading} onClick={() => void refreshRemoteModels()}>
                       {modelsLoading ? <LoaderCircle size={15} className="is-spinning" /> : <History size={15} />}
                       {modelsLoading ? '正在获取模型' : '获取当前连接模型'}
@@ -16319,7 +16588,7 @@ function App() {
 
                   <section className="provider-credits-card" aria-live="polite">
                     <div className="provider-credits-heading">
-                      <span><WalletCards size={16} /><strong>账户积分</strong><small>仅显示厂商提供余额接口的连接</small></span>
+                      <span><WalletCards size={16} /><strong>{currentProviderCredits?.scope === 'api-key' ? 'Key 可用积分' : '账户积分'}</strong><small>{currentProviderCredits?.scope === 'api-key' ? '显示当前 API Key 的剩余额度' : '仅显示厂商提供余额接口的连接'}</small></span>
                       <button type="button" onClick={() => void refreshProviderCredits()} disabled={creditsLoading}>
                         {creditsLoading ? <LoaderCircle size={14} className="is-spinning" /> : <RefreshCw size={14} />}
                         {creditsLoading ? '查询中' : '刷新余额'}
@@ -16337,6 +16606,24 @@ function App() {
                           <span>{draftModels.filter((model) => model.capability === capability).length}</span>
                         </button>
                       ))}
+                    </div>
+                    <div className="api-manual-model-add">
+                      <input value={manualModelId} placeholder="模型 ID（厂商无 /models 时手动添加）" onChange={(event) => setManualModelId(event.target.value)} onKeyDown={(event) => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        const id = manualModelId.trim()
+                        if (!id) return
+                        setDraftModels((current) => current.some((model) => model.id === id) ? current : [...current, { id, name: id, capability: apiModelTab, enabled: true }])
+                        setManualModelIds((current) => current.includes(id) ? current : [...current, id])
+                        setManualModelId('')
+                      }} />
+                      <button type="button" onClick={() => {
+                        const id = manualModelId.trim()
+                        if (!id) return
+                        setDraftModels((current) => current.some((model) => model.id === id) ? current : [...current, { id, name: id, capability: apiModelTab, enabled: true }])
+                        setManualModelIds((current) => current.includes(id) ? current : [...current, id])
+                        setManualModelId('')
+                      }}><Plus size={13} />添加{MODEL_CAPABILITY_LABELS[apiModelTab]}模型</button>
                     </div>
                     <div className="api-model-list">
                       {draftModels.filter((model) => model.capability === apiModelTab).map((model) => (

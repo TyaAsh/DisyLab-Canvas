@@ -16,6 +16,7 @@ const LEGACY_API_SECRET_KEY = 'disy-api-secret'
 
 export type ActivePanel = 'canvas' | 'assets' | 'settings'
 export type ModelCapability = 'text' | 'image' | 'video' | 'audio' | 'unknown'
+export type ApiAuthMode = 'auto' | 'bearer' | 'x-api-key' | 'api-key' | 'x-goog-api-key'
 
 export type ApiModelConfig = {
   id: string
@@ -29,6 +30,7 @@ export type ApiConnection = {
   name: string
   baseUrl: string
   apiKey: string
+  authMode?: ApiAuthMode
   balanceToken?: string
   models: ApiModelConfig[]
   modelsFetchedAt?: string
@@ -112,6 +114,7 @@ function readApiSettings(): ApiSettings {
           name: typeof connection.name === 'string' ? connection.name : 'API 连接',
           baseUrl: typeof connection.baseUrl === 'string' ? connection.baseUrl : '',
           apiKey: secrets[id] ?? '',
+          authMode: ['auto', 'bearer', 'x-api-key', 'api-key', 'x-goog-api-key'].includes(String(connection.authMode)) ? connection.authMode as ApiAuthMode : 'auto',
           balanceToken: typeof balanceTokens[id] === 'string' ? balanceTokens[id] : '',
           models: Array.isArray(connection.models)
             ? connection.models.flatMap((candidate) => {

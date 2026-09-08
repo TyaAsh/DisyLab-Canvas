@@ -45,7 +45,7 @@ function browserGlobal(t, name, value) {
 test('HFSY requires public media URLs before submitting a task', async (t) => {
   let calls = 0
   t.mock.method(globalThis, 'fetch', async () => { calls++; throw new Error('unexpected request') })
-  for (const firstFrame of ['data:image/png;base64,AAAA', 'blob:http://localhost/image']) {
+  for (const firstFrame of ['data:image/png;base64,AAAA', 'blob:http://localhost/image', 'http://169.254.169.254/frame.png', 'http://localhost./frame.png']) {
     await assert.rejects(() => api.generateRemoteVideo({ baseUrl: 'https://api.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-mini-720' }, {
       prompt: 'test', seconds: 6, size: '720x1280', mode: 'image2video', firstFrame,
     }), /HFSY 仅支持公网素材链接/)
@@ -66,7 +66,175 @@ test('HFSY rejects unsupported duration and video references before network call
   }
   assert.equal(api.hfsyVideoLimits('sd-2.5-720').images, 30)
   assert.equal(api.hfsyVideoLimits('sd-2.5-720').videos, 10)
+  assert.equal(api.hfsyVideoLimits('minimax-h3').images, 9)
   assert.equal(api.hfsyVideoLimits('unknown'), undefined)
+})
+
+test('HFSY submits text, image, frame, image-reference and mixed-material routes with public URLs', async (t) => {
+  const bodies = []
+  let frameAdminLog
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url).includes('/video/create')) {
+      bodies.push(JSON.parse(init.body))
+      return Response.json({ id: `task-${bodies.length}`, status: 'SUCCESS', result_url: `https://media.aixinai.net/${bodies.length}.mp4` })
+    }
+    return new Response(new Blob(['video'], { type: 'video/mp4' }), { headers: { 'content-type': 'video/mp4' } })
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-mini-720' }
+  const base = { prompt: 'test', seconds: 5, size: '720x1280' }
+  await api.generateRemoteVideo(settings, { ...base, mode: 'text2video' })
+  await api.generateRemoteVideo(settings, { ...base, mode: 'image2video', firstFrame: 'https://cdn.example.com/first.png' })
+  await api.generateRemoteVideo(settings, { ...base, mode: 'first_last_frame', firstFrame: 'https://cdn.example.com/first.png', lastFrame: 'https://cdn.example.com/last.png' })
+  await api.generateRemoteVideo(settings, { ...base, mode: 'first_last_frame', firstFrame: 'https://cdn.example.com/same.png', lastFrame: 'https://cdn.example.com/same.png', captureAdminLog: (log) => { frameAdminLog = log } })
+  await api.generateRemoteVideo(settings, { ...base, mode: 'image_reference', referenceImages: ['https://cdn.example.com/a.png', 'https://cdn.example.com/b.png'] })
+  await api.generateRemoteVideo(settings, { ...base, mode: 'all_reference', referenceImages: ['https://cdn.example.com/a.png'], referenceVideos: ['https://cdn.example.com/motion.mp4'] })
+  await api.generateRemoteVideo(settings, { ...base, size: '3:4', mode: 'text2video' })
+  assert.equal('images' in bodies[0], false)
+  assert.deepEqual(bodies[1].images, ['https://cdn.example.com/first.png'])
+  assert.deepEqual(bodies[2].images, ['https://cdn.example.com/first.png', 'https://cdn.example.com/last.png'])
+  assert.deepEqual(bodies[3].images, ['https://cdn.example.com/same.png', 'https://cdn.example.com/same.png'])
+  assert.deepEqual(bodies[4].images, ['https://cdn.example.com/a.png', 'https://cdn.example.com/b.png'])
+  assert.deepEqual(bodies[5].videos, ['https://cdn.example.com/motion.mp4'])
+  assert.equal(bodies[6].orientation, 'portrait')
+  assert.equal(JSON.parse(frameAdminLog.requestJson).referenceImageCount, 2)
+})
+
+test('HFSY stops immediately on documented asynchronous failure states', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1
+    if (calls === 1) return Response.json({ id: 'failed-task', status: 'queued' })
+    return Response.json({ id: 'failed-task', status: 'FAILURE', fail_reason: 'vendor rejected material' })
+  })
+  await assert.rejects(() => api.generateRemoteVideo({ baseUrl: 'https://api.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-mini-720' }, {
+    prompt: 'test', seconds: 5, size: '9:16', mode: 'text2video',
+  }), (error) => {
+    assert.match(error.message, /HFSY 视频生成失败/)
+    assert.match(error.detail, /vendor rejected material/)
+    return true
+  })
+  assert.equal(calls, 2)
+})
+
+test('Seedance families expose and submit their own defaults and limits', async (t) => {
+  assert.deepEqual(api.seedanceVideoDefaults('doubao-seedance-1-0-lite-i2v-250428'), {
+    resolutions: ['480p', '720p'], ratios: ['auto', '16:9', '4:3', '1:1', '3:4', '9:16', '21:9'], minDuration: 2, maxDuration: 12, defaultDuration: 5, defaultRatio: '16:9', defaultResolution: '720p', defaultGenerateAudio: false,
+  })
+  assert.equal(api.seedanceVideoDefaults('doubao-seedance-1-5-pro-251215').defaultRatio, 'auto')
+  assert.equal(api.seedanceVideoDefaults('Seedance 1.0 Pro').defaultImageRatio, 'auto')
+  assert.deepEqual(api.seedanceVideoDefaults('seedance2.0fast').resolutions, ['480p', '720p'])
+  assert.deepEqual(api.seedanceVideoDefaults('seedance-v2.0').resolutions, ['480p', '720p', '1080p', '4k'])
+  assert.equal(api.seedanceVideoDefaults('dreamina-seedance-2-0-fast-260128').maxDuration, 15)
+  assert.equal(api.seedanceVideoDefaults('dreamina-seedance-2-5-260628').maxDuration, 30)
+  const bodies = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url).includes('/contents/generations/tasks')) {
+      bodies.push(JSON.parse(init.body))
+      return Response.json({ id: `seedance-${bodies.length}`, status: 'succeeded', content: { video_url: `https://cdn.example.com/seedance-${bodies.length}.mp4` } })
+    }
+    return new Response(new Blob(['video'], { type: 'video/mp4' }))
+  })
+  await api.generateRemoteVideo({ baseUrl: 'https://api.apiyi.com/v1', apiKey: 'key', model: 'doubao-seedance-1-0-lite-i2v-250428' }, { prompt: 'x', seconds: 1, size: '16:9', resolution: '720p' })
+  await api.generateRemoteVideo({ baseUrl: 'https://api.apiyi.com/v1', apiKey: 'key', model: 'dreamina-seedance-2-0-fast-260128' }, { prompt: 'x', seconds: 99, size: 'adaptive', resolution: '1080p' })
+  await api.generateRemoteVideo({ baseUrl: 'https://api.apiyi.com/v1', apiKey: 'key', model: 'dreamina-seedance-2-5-260628' }, { prompt: 'x', seconds: 99, size: 'adaptive', resolution: '720p' })
+  assert.equal(bodies[0].duration, 2)
+  assert.equal('generate_audio' in bodies[0], false)
+  assert.equal(bodies[1].resolution, '720p')
+  assert.equal(bodies[1].duration, 15)
+  assert.equal(bodies[1].ratio, 'adaptive')
+  assert.equal(bodies[1].generate_audio, true)
+  assert.equal(bodies[2].duration, 30)
+})
+
+test('custom OpenAI-compatible bases preserve explicit paths and parse nested model catalogues', async (t) => {
+  let calledUrl = ''
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    calledUrl = String(url)
+    return Response.json({ result: { list: [{ model_name: 'gpt-5.4', display_name: 'GPT 5.4' }] } })
+  })
+  const models = await api.fetchRemoteModels({ baseUrl: 'https://gateway.example.com/v1', apiKey: 'key' })
+  assert.equal(calledUrl, 'https://gateway.example.com/v1/models')
+  assert.deepEqual(models.map((model) => model.id), ['gpt-5.4'])
+})
+
+test('custom text API accepts array content and SSE chunks', async (t) => {
+  const responses = [
+    Response.json({ choices: [{ message: { content: [{ type: 'text', text: 'array result' }] } }] }),
+    new Response('data: {"choices":[{"delta":{"content":"stream "}}]}\n\ndata: {"choices":[{"delta":{"content":"result"}}]}\n\ndata: [DONE]\n', { headers: { 'content-type': 'text/event-stream' } }),
+  ]
+  t.mock.method(globalThis, 'fetch', async () => responses.shift())
+  const settings = { baseUrl: 'https://gateway.example.com/v1', apiKey: 'key', model: 'gpt-5.4' }
+  assert.equal(await api.generateRemoteText(settings, 'hello'), 'array result')
+  assert.equal(await api.generateRemoteText(settings, 'hello'), 'stream result')
+})
+
+test('custom text API supports copied Responses and native Anthropic Messages endpoints', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) })
+    if (String(url).endsWith('/responses')) return Response.json({ output: [{ content: [{ type: 'output_text', text: 'responses ok' }] }] })
+    return Response.json({ content: [{ type: 'text', text: 'messages ok' }] })
+  })
+  assert.equal(await api.generateRemoteText({ baseUrl: 'https://gateway.example.com/v1/responses', apiKey: 'key', model: 'gpt-next' }, 'hello'), 'responses ok')
+  assert.equal(await api.generateRemoteText({ baseUrl: 'https://api.anthropic.com/v1/messages', apiKey: 'anthropic-key', model: 'claude-next' }, 'hello'), 'messages ok')
+  assert.equal(requests[0].url, 'https://gateway.example.com/v1/responses')
+  assert.equal(requests[0].body.input, 'hello')
+  assert.equal(requests[1].url, 'https://api.anthropic.com/v1/messages')
+  assert.equal(requests[1].headers.get('x-api-key'), 'anthropic-key')
+  assert.equal(requests[1].headers.has('authorization'), false)
+  assert.equal(requests[1].body.max_tokens, 4096)
+})
+
+test('custom text API preserves endpoint queries, configurable auth and native Anthropic images', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) })
+    return Response.json({ content: [{ type: 'text', text: 'ok' }] })
+  })
+  await api.generateRemoteText({
+    baseUrl: 'https://azure.example.com/openai/deployments/demo/chat/completions?api-version=2026-01-01',
+    apiKey: 'azure-key', authMode: 'api-key', model: 'deployment-model',
+  }, 'hello')
+  await api.generateRemoteText({ baseUrl: 'https://api.anthropic.com', apiKey: 'anthropic-key', model: 'claude-next' }, 'describe', {
+    referenceImages: ['https://cdn.example.com/reference.png'],
+  })
+  assert.equal(requests[0].url, 'https://azure.example.com/openai/deployments/demo/chat/completions?api-version=2026-01-01')
+  assert.equal(requests[0].headers.get('api-key'), 'azure-key')
+  assert.equal(requests[0].headers.has('authorization'), false)
+  assert.equal(requests[1].url, 'https://api.anthropic.com/v1/messages')
+  assert.deepEqual(requests[1].body.messages[0].content[1], { type: 'image', source: { type: 'url', url: 'https://cdn.example.com/reference.png' } })
+})
+
+test('Responses SSE prefers the completed text instead of duplicating deltas', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'data: {"type":"response.output_text.delta","delta":"hel"}',
+    'data: {"type":"response.output_text.delta","delta":"lo"}',
+    'data: {"type":"response.output_text.done","text":"hello"}',
+    'data: [DONE]',
+    '',
+  ].join('\n\n'), { headers: { 'content-type': 'text/event-stream' } }))
+  assert.equal(await api.generateRemoteText({ baseUrl: 'https://gateway.example.com/v1/responses', apiKey: 'key', model: 'gpt-next' }, 'hello'), 'hello')
+})
+
+test('custom auth modes are used consistently for image and video requests', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    requests.push({ url: String(url), headers: new Headers(init.headers) })
+    if (String(url).endsWith('/images/generations')) return Response.json({ data: [{ url: 'https://cdn.example.com/image.png' }] })
+    if (String(url).endsWith('/videos')) return Response.json({ id: 'video-auth-task', status: 'succeeded', url: 'https://cdn.example.com/video.mp4' })
+    return new Response(new Blob(['video'], { type: 'video/mp4' }))
+  })
+  await api.generateRemoteImages({ baseUrl: 'https://gateway.example.com/v1', apiKey: 'google-key', authMode: 'x-goog-api-key', model: 'image-model' }, {
+    prompt: 'image', count: 1,
+  })
+  await api.generateRemoteVideo({ baseUrl: 'https://gateway.example.com/v1', apiKey: 'azure-key', authMode: 'api-key', model: 'video-model' }, {
+    prompt: 'video', seconds: 5, size: '16:9', mode: 'text2video',
+  })
+  assert.equal(requests[0].headers.get('x-goog-api-key'), 'google-key')
+  assert.equal(requests[0].headers.has('authorization'), false)
+  assert.equal(requests[1].headers.get('api-key'), 'azure-key')
+  assert.equal(requests[1].headers.has('authorization'), false)
 })
 
 test('HFSY unwraps the image relay URL and surfaces provider parameter rejection', async (t) => {
@@ -171,4 +339,19 @@ test('GRS AI model catalogue fails clearly when getModelList is unavailable', as
     () => api.fetchRemoteModels({ baseUrl: 'https://grsaiapi.com/v1', apiKey: 'test-key' }),
     /GRS AI 当前模型目录不可用/,
   )
+})
+
+test('GRS AI balance reports the current API key limit instead of the account pool', async (t) => {
+  let calledUrl = ''
+  let requestBody
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calledUrl = String(url)
+    requestBody = JSON.parse(init.body)
+    return Response.json({ code: 0, data: { credits: 30000 } })
+  })
+  const credits = await api.fetchProviderCredits({ baseUrl: 'https://grsai.dakka.com.cn/v1', apiKey: 'limited-key' })
+  assert.equal(calledUrl, 'https://grsai.dakka.com.cn/client/openapi/getAPIKeyCredits')
+  assert.deepEqual(requestBody, { apiKey: 'limited-key' })
+  assert.equal(credits.amount, 30000)
+  assert.equal(credits.scope, 'api-key')
 })
