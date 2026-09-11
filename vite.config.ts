@@ -192,10 +192,17 @@ const apiYiMediaRelayPlugin: Plugin = {
         headers.set('Accept-Encoding', 'identity')
         const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await readBody(request)
         const target = new URL(upstreamPath, rootCatalogRequest || rootUploadRequest ? `${base.origin}/` : `${base.origin}${base.pathname.replace(/\/$/, '')}/`)
-        const upstream = await fetch(target, { method: request.method, headers, body })
-        const output = Buffer.from(await upstream.arrayBuffer())
+        const proxyAvailable = await localProxyIsAvailable()
+        const upstream = proxyAvailable
+          ? await requestThroughLocalProxy(target, request.method!, headers, body)
+          : await fetch(target, { method: request.method, headers, body }).then(async (result) => ({
+              status: result.status,
+              headers: Object.fromEntries(result.headers.entries()),
+              body: Buffer.from(await result.arrayBuffer()),
+            }))
+        const output = upstream.body
         response.statusCode = upstream.status
-        response.setHeader('content-type', upstream.headers.get('content-type') || 'application/json')
+        response.setHeader('content-type', upstream.headers['content-type'] || 'application/json')
         response.setHeader('content-length', output.length)
         response.end(output)
       } catch (error) {
@@ -297,7 +304,7 @@ const apiYiMediaRelayPlugin: Plugin = {
             'Accept-Encoding': 'identity',
             Accept: 'video/*,image/*,application/octet-stream;q=0.9,*/*;q=0.5',
           })
-          if (/(?:^|\.)aixinai\.net$/i.test(targetUrl.hostname)) {
+          if (/(?:^|\.)aixinai\.net$|^www\.qixinai\.net$/i.test(targetUrl.hostname)) {
             relayHeaders.set('Referer', 'https://www.hfsyapi.cn/')
             relayHeaders.set('Origin', 'https://www.hfsyapi.cn')
             relayHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36')

@@ -714,16 +714,13 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
       const replicated = await waitForReplicatedVideoUrl(`${taskEndpoint}/${encodeURIComponent(taskId)}`, requestHeaders, job, options.signal)
       const videoUrl = replicated.url
       if (!videoUrl) throw new GenerationRequestError('platform', 'Seedance 成功但没有返回视频地址', sanitizeAdminLogJson(replicated.payload), { requestId: taskId })
-      let videoResponse: Response
+      let blob: Blob
       try {
-        videoResponse = await fetch(apiYiGeneratedMediaUrl(videoUrl), { signal: options.signal })
+        blob = await downloadGeneratedVideoBlob(videoUrl, { signal: options.signal })
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') throw error
-        throw new GenerationRequestError('network', 'Seedance 视频下载请求失败', `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
+        throw new GenerationRequestError('network', 'Seedance 视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}。任务 ${taskId}`, { requestId: taskId, resultUrls: [videoUrl] })
       }
-      if (!videoResponse.ok) throw new GenerationRequestError('network', 'Seedance 视频下载失败', `视频下载失败（${videoResponse.status}）。任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
-      const blob = await videoResponse.blob()
-      if (!blob.size) throw new GenerationRequestError('platform', 'Seedance 返回了空视频文件', `任务 ${taskId}。视频地址：${videoUrl}`, { requestId: taskId, resultUrls: [videoUrl] })
       options.onProgress?.(100, 'completed')
       return { blob, taskId, progress: 100, sourceUrl: videoUrl }
     }
@@ -743,6 +740,56 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
     job = await poll.json() as Record<string, unknown>
     status = videoTaskStatus(job, status)
   }
+}
+
+function validGeneratedVideoType(contentType: string) {
+  return !/^(?:text\/|image\/|audio\/)|application\/(?:json|problem\+json)|image\/svg\+xml/i.test(contentType)
+}
+
+/** Download a completed provider video into a durable local Blob. Provider
+ * result URLs frequently omit CORS headers or need anti-hotlink credentials,
+ * and their CDN can lag behind the completed task response. Try the controlled
+ * same-origin relay (with and without scoped auth) and a direct request across
+ * a short replication window before declaring the archive recoverable. */
+export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { signal?: AbortSignal; authorization?: string } = {}) {
+  const relayUrl = apiYiGeneratedMediaUrl(sourceUrl)
+  const candidates = typeof window === 'undefined'
+    ? [{ url: sourceUrl, headers: undefined as HeadersInit | undefined }]
+    : [
+        ...(options.authorization ? [{ url: relayUrl, headers: { 'X-DisyLab-Media-Authorization': options.authorization } }] : []),
+        { url: relayUrl, headers: undefined },
+        ...(relayUrl !== sourceUrl ? [{ url: sourceUrl, headers: undefined }] : []),
+      ]
+  const failures: string[] = []
+  for (let round = 0; round < 3; round += 1) {
+    for (const candidate of candidates) {
+      try {
+        const response = await fetch(candidate.url, { signal: options.signal, headers: candidate.headers, cache: round ? 'reload' : 'default' })
+        if (!response.ok) {
+          failures.push(`${response.status}`)
+          continue
+        }
+        const blob = await response.blob()
+        const contentType = blob.type || response.headers.get('content-type') || ''
+        if (!blob.size || !validGeneratedVideoType(contentType)) {
+          failures.push(!blob.size ? 'empty' : contentType || 'invalid-type')
+          continue
+        }
+        const prefix = await blob.slice(0, 96).text().catch(() => '')
+        if (/^\s*(?:<!doctype\s+html|<html|\{\s*"?(?:error|message)"?\s*:)/i.test(prefix)) {
+          failures.push('invalid-body')
+          continue
+        }
+        return blob.type ? blob : blob.slice(0, blob.size, 'video/mp4')
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        failures.push(error instanceof Error ? error.name : 'network')
+      }
+    }
+    if (round < 2) await waitForDelay(round ? 1_800 : 700, options.signal)
+  }
+  const host = (() => { try { return new URL(sourceUrl).hostname } catch { return 'unknown-host' } })()
+  throw new GenerationRequestError('network', '视频已生成但本地归档失败', `媒体主机 ${host} 在多路径下载后仍不可读（${Array.from(new Set(failures)).join('、') || '无响应'}）。任务结果地址已保留，可稍后恢复。`, { resultUrls: [sourceUrl] })
 }
 
 function videoResolutionFromSize(size: string) {
@@ -871,11 +918,12 @@ async function generateApiYiWanVideo(settings: ApiRequestSettings, options: Vide
       const replicated = await waitForReplicatedVideoUrl(taskUrl, taskHeaders, job, options.signal)
       const resultUrl = replicated.url
       if (!resultUrl) throw new GenerationRequestError('platform', 'Wan 成功但没有返回视频地址', sanitizeAdminLogJson(replicated.payload), { requestId: taskId })
-      const video = await fetch(apiYiGeneratedMediaUrl(resultUrl), { signal: options.signal })
-      if (!video.ok) throw new GenerationRequestError('network', 'Wan 视频下载失败', `视频下载失败（${video.status}）`, { requestId: taskId, resultUrls: [resultUrl] })
-      const blob = await video.blob()
-      if (!blob.size) throw new GenerationRequestError('platform', 'Wan 返回了空视频文件', `任务 ${taskId}`, { requestId: taskId, resultUrls: [resultUrl] })
-      return { blob, taskId, progress: 100, sourceUrl: resultUrl }
+      try {
+        return { blob: await downloadGeneratedVideoBlob(resultUrl, { signal: options.signal }), taskId, progress: 100, sourceUrl: resultUrl }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        throw new GenerationRequestError('network', 'Wan 视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId, resultUrls: [resultUrl] })
+      }
     }
   }
   throw new GenerationRequestError('platform', 'Wan 任务未完成', `任务 ${taskId}`, { requestId: taskId })
@@ -1182,10 +1230,13 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   }
   const completedUrl = videoResultUrl(lastJob)
   if (completedUrl) {
-    const mediaResponse = await fetch(/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) ? apiYiGeneratedMediaUrl(completedUrl) : completedUrl, { signal: options.signal })
-    if (!mediaResponse.ok) throw new GenerationRequestError('network', '视频已生成但下载失败', `任务 ${taskId} 的媒体下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [completedUrl] })
-    const mediaBlob = await mediaResponse.blob()
-    if (mediaBlob.size) return { blob: mediaBlob, taskId, progress: 100, sourceUrl: completedUrl }
+    try {
+      const mediaBlob = await downloadGeneratedVideoBlob(completedUrl, { signal: options.signal })
+      return { blob: mediaBlob, taskId, progress: 100, sourceUrl: completedUrl }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new GenerationRequestError('network', '视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId, resultUrls: [completedUrl] })
+    }
   }
   const contentResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: compatibleApiHeaders(settings), signal: options.signal })
   if (!contentResponse.ok) throw await createApiError(contentResponse)
@@ -1310,29 +1361,16 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     const status = videoTaskStatus(task)
     const sourceUrl = videoResultUrl(task)
     if (sourceUrl) {
-      // HFSY returns its completed videos from aixinai.net. The task is already
-      // successful at this point, but that CDN does not expose browser CORS
-      // headers, so download through the same-origin media relay.
-      let media: Response
+      let blob: Blob
       try {
-        media = await fetch(apiYiGeneratedMediaUrl(sourceUrl), {
+        blob = await downloadGeneratedVideoBlob(sourceUrl, {
           signal: options.signal,
-          headers: typeof window !== 'undefined' ? { 'X-DisyLab-Media-Authorization': `Bearer ${settings.apiKey}` } : undefined,
+          authorization: `Bearer ${settings.apiKey}`,
         })
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') throw error
-        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，但媒体下载请求失败：${error instanceof Error ? error.message : String(error)}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
-      }
-      if (!media.ok) throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，媒体下载失败（${media.status}）。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
-      let blob: Blob
-      try {
-        blob = await media.blob()
-      } catch (error) {
-        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载失败', `任务已成功，但媒体数据读取中断：${error instanceof Error ? error.message : String(error)}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
-      }
-      const contentType = blob.type || media.headers.get('content-type') || ''
-      if (!blob.size || /^(?:text\/|image\/|audio\/)|application\/(?:json|problem\+json)|image\/svg\+xml/i.test(contentType)) {
-        throw new GenerationRequestError('network', 'HFSY 视频已生成但下载内容无效', `任务已成功，但媒体地址返回了${!blob.size ? '空文件' : contentType || '非视频内容'}。可在 HFSY 控制台使用原始地址获取。`, { requestId: taskId, resultUrls: [sourceUrl] })
+        const detail = error instanceof GenerationRequestError ? error.detail : error instanceof Error ? error.message : String(error)
+        throw new GenerationRequestError('network', 'HFSY 视频已生成但本地归档失败', detail, { requestId: taskId, resultUrls: [sourceUrl] })
       }
       options.onProgress?.(100, 'completed')
       return { blob, taskId, progress: 100, sourceUrl }
@@ -1412,9 +1450,12 @@ async function generateEvolinkVideo(settings: ApiRequestSettings, options: Video
   const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
   const sourceUrl = extractProviderImages(completed)[0]?.url
   if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 视频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
-  const mediaResponse = await fetch(sourceUrl, { signal: options.signal })
-  if (!mediaResponse.ok) throw new GenerationRequestError('network', 'Evolink 视频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
-  return { blob: await mediaResponse.blob(), taskId, progress: 100, sourceUrl }
+  try {
+    return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal: options.signal }), taskId, progress: 100, sourceUrl }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new GenerationRequestError('network', 'Evolink 视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId, resultUrls: [sourceUrl] })
+  }
 }
 
 /** Evolink unified asynchronous audio endpoint. Model-specific optional fields
@@ -1487,7 +1528,7 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     const normalized = normalizeGenerationError(error)
-    const generatedButDownloadPending = Boolean(normalized.resultUrls?.length && /^HFSY 视频已生成但下载/.test(normalized.message))
+    const generatedButDownloadPending = Boolean(normalized.resultUrls?.length && /视频已生成但(?:下载|本地归档)/.test(normalized.message))
     options.captureAdminLog?.({
       provider,
       taskId: normalized.requestId,
@@ -1648,30 +1689,76 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
   }
   if (!isGrsaiBaseUrl(settings.baseUrl) || !settings.apiKey.trim()) return null
   const apiKey = settings.apiKey.trim()
-  const requestCredits = async () => {
+  const parseGrsCredits = (payload: { code?: unknown; msg?: unknown; data?: unknown }, label: string) => {
+    if (payload.code !== 0) throw new Error(typeof payload.msg === 'string' ? payload.msg : `未能读取 GRS AI ${label}`)
+    const data = payload.data
+    const numericCredit = (value: unknown, depth = 0): number | undefined => {
+      if (typeof value === 'number' && Number.isFinite(value)) return value
+      if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value)
+      if (!value || typeof value !== 'object' || depth > 2) return undefined
+      const record = value as Record<string, unknown>
+      const preferredFields = [
+        'remainingCredits', 'remaining_credits', 'remainCredits', 'remain_credits',
+        'availableCredits', 'available_credits', 'apiKeyCredits', 'keyCredits',
+        'accountCredits', 'account_credits', 'userCredits', 'user_credits',
+        'totalCredits', 'total_credits', 'credit', 'credits', 'quota', 'balance',
+      ]
+      for (const field of preferredFields) {
+        if (!(field in record)) continue
+        const parsed = numericCredit(record[field], depth + 1)
+        if (parsed !== undefined) return parsed
+      }
+      for (const [field, nested] of Object.entries(record)) {
+        if (!/(?:credit|balance|quota|remain|available)/i.test(field)) continue
+        const parsed = numericCredit(nested, depth + 1)
+        if (parsed !== undefined) return parsed
+      }
+      for (const field of ['account', 'user', 'wallet', 'result', 'data']) {
+        if (!(field in record)) continue
+        const parsed = numericCredit(record[field], depth + 1)
+        if (parsed !== undefined) return parsed
+      }
+      return undefined
+    }
+    const credits = numericCredit(data)
+    const amount = credits ?? Number.NaN
+    if (!Number.isFinite(amount) || amount < 0) {
+      const fields = data && typeof data === 'object' ? Object.keys(data as Record<string, unknown>).slice(0, 8).join('、') : typeof data
+      throw new Error(`GRS AI 返回了无法识别的${label}${fields ? `（字段：${fields}）` : ''}`)
+    }
+    return amount
+  }
+  const requestCredits = async (path: 'getAPIKeyCredits' | 'getCredits', label: string) => {
     // Query the generation key itself. The common getCredits endpoint reports
     // the owning account's pool and ignores a per-key credit limit.
-    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/openapi/getAPIKeyCredits'), {
+    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, `client/openapi/${path}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiKey }),
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
     const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown }
-    if (payload.code !== 0) throw new Error(typeof payload.msg === 'string' ? payload.msg : '未能读取 GRS AI 积分')
-    const data = payload.data
-    const record = data && typeof data === 'object' ? data as Record<string, unknown> : null
-    const credits = record
-      ? ['remainingCredits', 'remaining_credits', 'apiKeyCredits', 'keyCredits', 'credits', 'quota', 'balance']
-          .map((field) => record[field])
-          .find((value) => typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
-      : data
-    const amount = typeof credits === 'number' ? credits : typeof credits === 'string' ? Number(credits) : Number.NaN
-    if (!Number.isFinite(amount) || amount < 0) throw new Error('GRS AI 返回了无效的 API Key 积分余额')
-    return amount
+    return parseGrsCredits(payload, label)
   }
-  const amount = await requestCredits()
-  return { provider: 'GRS AI', amount, unit: '积分', updatedAt: new Date().toISOString(), scope: 'api-key' }
+  const requestSharedAccountCredits = async () => {
+    // Current GRS documentation exposes the account pool associated with a key
+    // through this read-only endpoint. Keep the legacy POST path as a fallback
+    // for older domestic nodes that have not rolled out the common endpoint.
+    const url = new URL(grsaiControlEndpoint(settings.baseUrl, 'client/common/getCredits'))
+    url.searchParams.set('apikey', apiKey)
+    const response = await fetch(url.toString(), { headers: { Accept: 'application/json' } })
+    if (response.ok) {
+      const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown; credits?: unknown }
+      return parseGrsCredits({ ...payload, data: payload.data ?? payload.credits }, '账户积分余额')
+    }
+    return requestCredits('getCredits', '账户积分余额')
+  }
+  const keyAmount = await requestCredits('getAPIKeyCredits', 'API Key 积分余额')
+  if (keyAmount > 0) return { provider: 'GRS AI', amount: keyAmount, unit: '积分', updatedAt: new Date().toISOString(), scope: 'api-key' }
+  // GRS returns zero when a key has no independent quota. Such keys spend from
+  // the account pool, so zero is a sentinel rather than an exhausted balance.
+  const accountAmount = await requestSharedAccountCredits()
+  return { provider: 'GRS AI', amount: accountAmount, unit: '积分', updatedAt: new Date().toISOString(), scope: 'account' }
 }
 
 /** Validate credentials without performing a billable generation request. */

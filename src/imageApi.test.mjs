@@ -341,6 +341,21 @@ test('GRS AI model catalogue fails clearly when getModelList is unavailable', as
   )
 })
 
+test('completed videos retry relay without provider auth and reject error documents', async (t) => {
+  browserGlobal(t, 'window', { setTimeout, clearTimeout, location: { href: 'http://localhost/' } })
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    requests.push({ url: String(url), authorization: new Headers(init.headers).get('x-disylab-media-authorization') })
+    if (requests.length === 1) return new Response('forbidden', { status: 403, headers: { 'content-type': 'text/plain' } })
+    return new Response(new Blob(['video-bytes'], { type: 'video/mp4' }), { headers: { 'content-type': 'video/mp4' } })
+  })
+  const blob = await api.downloadGeneratedVideoBlob('https://cdn.aixinai.net/result.mp4', { authorization: 'Bearer key' })
+  assert.equal(await blob.text(), 'video-bytes')
+  assert.equal(requests[0].authorization, 'Bearer key')
+  assert.equal(requests[1].authorization, null)
+  assert.match(requests[0].url, /^\/apiyi\/media\?url=/)
+})
+
 test('GRS AI balance reports the current API key limit instead of the account pool', async (t) => {
   let calledUrl = ''
   let requestBody
@@ -354,4 +369,21 @@ test('GRS AI balance reports the current API key limit instead of the account po
   assert.deepEqual(requestBody, { apiKey: 'limited-key' })
   assert.equal(credits.amount, 30000)
   assert.equal(credits.scope, 'api-key')
+})
+
+test('GRS AI balance falls back to the shared account pool for an unlimited key', async (t) => {
+  const calledUrls = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    calledUrls.push(String(url))
+    return calledUrls.length === 1
+      ? Response.json({ code: 0, data: { credits: 0 } })
+      : Response.json({ code: 0, data: { credits: '608575' } })
+  })
+  const credits = await api.fetchProviderCredits({ baseUrl: 'https://grsai.dakka.com.cn/v1', apiKey: 'shared-key' })
+  assert.deepEqual(calledUrls, [
+    'https://grsai.dakka.com.cn/client/openapi/getAPIKeyCredits',
+    'https://grsai.dakka.com.cn/client/common/getCredits?apikey=shared-key',
+  ])
+  assert.equal(credits.amount, 608575)
+  assert.equal(credits.scope, 'account')
 })

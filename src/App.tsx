@@ -9,7 +9,7 @@
  */
 import { createContext, forwardRef, lazy, memo, Suspense, useCallback, useContext, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { GenerationRequestError, apiYiGeneratedMediaUrl, readImageSourceBlob, publicImageSourceUrl, hfsyVideoLimits, seedanceVideoDefaults } from './imageApi'
+import { GenerationRequestError, downloadGeneratedVideoBlob, readImageSourceBlob, publicImageSourceUrl, hfsyVideoLimits, seedanceVideoDefaults } from './imageApi'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import gsap from 'gsap'
 import { useGSAP } from '@gsap/react'
@@ -149,7 +149,7 @@ import { AgentPanel } from './AgentPanel'
 import { useProjectDialog } from './ProjectDialog'
 import type { PromptLibraryCase } from './PromptLibraryPanel'
 import type { WorkflowTemplate } from './WorkflowTemplatePanel'
-import { compactReferenceName, getRequestedAgentPlanCount, messageExpectsImagePlans, messageExpectsVideoPlans, messageRequestsDirectImagePlan, normalizeAgentMessageContent, parseAgentReply, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
+import { buildAgentConversationContext, compactReferenceName, getRequestedAgentPlanCount, inferAgentInteractionMode, messageExpectsImagePlans, messageExpectsVideoPlans, messageRequestsDirectImagePlan, normalizeAgentMessageContent, parseAgentReply, type AgentCanvasContextSnapshot, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentRun, type AgentTextPlan, type AgentVideoPlan } from './agent'
 
 const PromptLibraryPanel = lazy(() => import('./PromptLibraryPanel').then((module) => ({ default: module.PromptLibraryPanel })))
 
@@ -516,6 +516,86 @@ type VideoModelCapabilities = {
 
 function apiCredentialKey(baseUrl: string, apiKey: string, authMode: ApiAuthMode = 'auto') {
   return `${baseUrl.trim().replace(/\/$/, '')}\n${apiKey.trim()}\n${authMode}`
+}
+
+const API_AUTH_MODE_OPTIONS: Array<{ value: ApiAuthMode; label: string; detail: string }> = [
+  { value: 'auto', label: '自动识别', detail: '推荐 · 根据接口自动选择' },
+  { value: 'bearer', label: 'Bearer Token', detail: 'Authorization 请求头' },
+  { value: 'x-api-key', label: 'x-api-key', detail: 'Anthropic 等接口' },
+  { value: 'api-key', label: 'api-key', detail: 'Azure 等接口' },
+  { value: 'x-goog-api-key', label: 'x-goog-api-key', detail: 'Google 接口' },
+]
+
+function ApiAuthModeSelect({ value, onChange }: { value: ApiAuthMode; onChange: (value: ApiAuthMode) => void }) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const selected = API_AUTH_MODE_OPTIONS.find((option) => option.value === value) ?? API_AUTH_MODE_OPTIONS[0]
+
+  useEffect(() => {
+    if (!open) return
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!(event.target instanceof globalThis.Node) || !rootRef.current?.contains(event.target)) setOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('pointerdown', closeOnOutside)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('pointerdown', closeOnOutside)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [open])
+
+  const openAndFocus = (index: number) => {
+    setOpen(true)
+    requestAnimationFrame(() => optionRefs.current[index]?.focus())
+  }
+
+  return <div className="relative" ref={rootRef}>
+    <button
+      type="button"
+      className={`group flex h-10 w-full appearance-none items-center gap-3 rounded-[10px] !border bg-[linear-gradient(145deg,rgba(255,255,255,.07),rgba(255,255,255,.025))] !bg-[rgba(20,23,24,.94)] px-3 text-left shadow-[inset_0_1px_0_rgba(255,255,255,.06)] backdrop-blur-xl transition-[border-color,background-color,box-shadow] duration-200 ${open ? '!border-[var(--accent-border)] !bg-[var(--accent-soft)] shadow-[0_0_0_3px_var(--accent-soft),inset_0_1px_0_rgba(255,255,255,.08)]' : '!border-[var(--line)] hover:!border-white/20 hover:!bg-white/[.075]'}`}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      onClick={() => setOpen((current) => !current)}
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowDown') { event.preventDefault(); openAndFocus(Math.max(0, API_AUTH_MODE_OPTIONS.findIndex((option) => option.value === value))) }
+        if (event.key === 'ArrowUp') { event.preventDefault(); openAndFocus(API_AUTH_MODE_OPTIONS.length - 1) }
+      }}
+    >
+      <span className={`grid size-5 flex-none place-items-center rounded-md border text-[9px] font-extrabold ${open ? 'border-[var(--accent-border)] bg-[var(--accent-soft)] text-accent' : 'border-white/10 bg-black/20 text-muted group-hover:text-ink'}`}>A</span>
+      <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-bold text-ink">{selected.label}</span>
+      <small className="hidden text-[8px] font-medium text-muted min-[720px]:block">{selected.detail}</small>
+      <ChevronDown className={`flex-none text-muted transition-transform duration-200 ${open ? 'rotate-180 text-accent' : ''}`} size={14} />
+    </button>
+    {open && <div className="absolute top-[calc(100%+6px)] right-0 left-0 z-50 overflow-hidden rounded-xl border border-white/15 bg-[linear-gradient(145deg,rgba(38,43,45,.98),rgba(19,23,24,.99))] p-1.5 shadow-[0_20px_55px_rgba(0,0,0,.58),inset_0_1px_0_rgba(255,255,255,.08)] backdrop-blur-[28px]" role="listbox" aria-label="鉴权方式">
+      {API_AUTH_MODE_OPTIONS.map((option, index) => {
+        const active = option.value === value
+        return <button
+          ref={(node) => { optionRefs.current[index] = node }}
+          type="button"
+          role="option"
+          aria-selected={active}
+          className={`grid min-h-[42px] w-full grid-cols-[24px_minmax(0,1fr)_18px] items-center gap-2 rounded-lg px-2 text-left transition-colors ${active ? 'bg-[var(--accent-soft)] text-ink' : 'bg-transparent text-muted hover:bg-white/7 hover:text-ink'}`}
+          key={option.value}
+          onClick={() => { onChange(option.value); setOpen(false) }}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault()
+              const direction = event.key === 'ArrowDown' ? 1 : -1
+              optionRefs.current[(index + direction + API_AUTH_MODE_OPTIONS.length) % API_AUTH_MODE_OPTIONS.length]?.focus()
+            }
+          }}
+        >
+          <span className={`grid size-6 place-items-center rounded-[7px] border text-[8px] font-extrabold ${active ? 'border-[var(--accent-border)] bg-[var(--accent-soft)] text-accent' : 'border-white/8 bg-black/15 text-muted'}`}>{index + 1}</span>
+          <span className="grid min-w-0 gap-0.5"><strong className="text-[10px]">{option.label}</strong><small className="text-[8px] font-medium text-muted">{option.detail}</small></span>
+          {active && <Check className="text-accent" size={14} />}
+        </button>
+      })}
+    </div>}
+  </div>
 }
 
 const ALL_VIDEO_RESOLUTIONS: readonly VideoResolution[] = ['480p', '720p', '1080p', '4k']
@@ -3157,7 +3237,11 @@ function App() {
   const [agentOpen, setAgentOpen] = useState(false)
   const agentOpenRef = useRef(false)
   const agentRequestRef = useRef<AbortController | null>(null)
-  const agentRequestVersionRef = useRef(0)
+  const agentRunControllersRef = useRef(new Map<string, AbortController>())
+  const agentRunsRef = useRef(new Map<string, AgentRun>())
+  const agentVideoRunOriginsRef = useRef(new Map<string, { projectId: string; canvasId: string; sessionId: string; planId: string }>())
+  const agentImageRunOriginsRef = useRef(new Map<string, { projectId: string; canvasId: string; sessionId: string; planId: string }>())
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([])
   useEffect(() => {
     agentOpenRef.current = agentOpen
   }, [agentOpen])
@@ -3278,6 +3362,14 @@ function App() {
   activeProjectIdRef.current = activeProjectId
   activeCanvasIdRef.current = activeCanvasId
   agentConversationIdRef.current = agentConversationId
+  useEffect(() => {
+    const currentRun = agentRuns.find((run) => run.status === 'running'
+      && run.projectId === activeProjectId
+      && run.canvasId === activeCanvasId
+      && run.conversationId === agentConversationId)
+    agentRequestRef.current = currentRun ? agentRunControllersRef.current.get(currentRun.id) ?? null : null
+    setAgentBusy(Boolean(currentRun))
+  }, [activeCanvasId, activeProjectId, agentConversationId, agentRuns])
   draftCreditKeyRef.current = editingConnectionId === 'new' ? apiDraft.baseUrl.trim() : ''
   const assetUploadInputRef = useRef<HTMLInputElement>(null)
   const workspaceImportInputRef = useRef<HTMLInputElement>(null)
@@ -5554,6 +5646,32 @@ function App() {
     void commitSavedAssets(nextAssets, '已加入资产库')
   }
 
+  const ensureVideoEditingMedia = async (node: CanvasNode, signal?: AbortSignal) => {
+    if (node.data.kind !== 'video') return null
+    if (node.data.videoMediaId) {
+      const stored = await loadHistoryMedia(node.data.videoMediaId)
+      if (stored) return stored
+    }
+    if (!node.data.videoUrl) return null
+    const connection = apiSettings.connections.find((item) => item.id === node.data.videoModelConnectionId)
+    const blob = await downloadGeneratedVideoBlob(node.data.videoUrl, {
+      signal,
+      authorization: connection?.apiKey ? `Bearer ${connection.apiKey}` : undefined,
+    })
+    const mediaId = `video-media-${crypto.randomUUID()}`
+    const createdAt = new Date().toISOString()
+    const fileName = node.data.fileName || `disy-video-recovered-${Date.now()}.mp4`
+    const sourceUrl = node.data.videoUrl
+    await saveHistoryMedia({ id: mediaId, blob, fileName, createdAt })
+    const variant: VideoVariant = { id: `video-variant-${crypto.randomUUID()}`, mediaId, fileName, createdAt, taskId: node.data.videoTaskId, sourceUrl }
+    updateNodeData(node.id, {
+      status: '已完成', videoProgress: 100, videoMediaId: mediaId, videoGeneratedAt: createdAt,
+      videoUrl: undefined, fileName, videoVariants: [...(node.data.videoVariants ?? []), variant],
+      activeVideoVariantId: variant.id, generationError: undefined,
+    })
+    return { id: mediaId, blob, fileName, createdAt }
+  }
+
   const downloadVideoNode = async (nodeId: string) => {
     const node = nodes.find((item) => item.id === nodeId && item.data.kind === 'video')
     if (!node || (!node.data.videoUrl && !node.data.videoMediaId)) {
@@ -5561,16 +5679,8 @@ function App() {
       return
     }
     try {
-      const media = node.data.videoMediaId ? await loadHistoryMedia(node.data.videoMediaId) : null
-      const selectedConnection = apiSettings.connections.find((connection) => connection.id === node.data.videoModelConnectionId)
-      const sourceUrl = node.data.videoUrl || ''
-      const requiresHfsyRelay = /(?:^|\.)aixinai\.net$/i.test(new URL(sourceUrl || 'https://invalid.local').hostname)
-      const blob = media?.blob ?? (sourceUrl ? await fetch(requiresHfsyRelay ? apiYiGeneratedMediaUrl(sourceUrl) : sourceUrl, {
-        headers: requiresHfsyRelay && selectedConnection?.apiKey ? { 'X-DisyLab-Media-Authorization': `Bearer ${selectedConnection.apiKey}` } : undefined,
-      }).then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        return response.blob()
-      }) : null)
+      const media = await ensureVideoEditingMedia(node)
+      const blob = media?.blob
       if (!blob) throw new Error('视频媒体读取失败')
       const baseName = (node.data.fileName || getNodeDisplayTitle(node.data)).replace(/\.[a-z0-9]+$/i, '') || 'disy-video'
       const extension = blob.type.split('/')[1]?.split(';')[0] || 'mp4'
@@ -5588,8 +5698,8 @@ function App() {
     try {
       const renderedVideo = shellRef.current?.querySelector<HTMLVideoElement>(`.react-flow__node[data-id="${CSS.escape(nodeId)}"] video`)
       const directUrl = renderedVideo?.currentSrc || renderedVideo?.src || node.data.videoUrl || ''
-      const media = !directUrl && node.data.videoMediaId ? await loadHistoryMedia(node.data.videoMediaId) : null
-      const sourceUrl = directUrl || (media ? URL.createObjectURL(media.blob) : '')
+      const media = await ensureVideoEditingMedia(node)
+      const sourceUrl = media ? URL.createObjectURL(media.blob) : directUrl
       if (!sourceUrl) throw new Error('视频媒体读取失败')
       const video = document.createElement('video')
       video.preload = 'metadata'; video.muted = true; video.playsInline = true
@@ -5679,8 +5789,8 @@ function App() {
     try {
       const renderedVideo = shellRef.current?.querySelector<HTMLVideoElement>(`.react-flow__node[data-id="${CSS.escape(nodeId)}"] video`)
       const directUrl = node.data.videoUrl || renderedVideo?.currentSrc || renderedVideo?.src || ''
-      const media = !directUrl && node.data.videoMediaId ? await loadHistoryMedia(node.data.videoMediaId) : null
-      const sourceUrl = directUrl || (media ? URL.createObjectURL(media.blob) : '')
+      const media = await ensureVideoEditingMedia(node)
+      const sourceUrl = media ? URL.createObjectURL(media.blob) : directUrl
       if (!sourceUrl) throw new Error('视频媒体读取失败')
       const fallbackDuration = Math.max(0.1, Number(node.data.videoDuration) || 4)
       setClipSession({ nodeId, start: 0, end: fallbackDuration, duration: fallbackDuration, sourceUrl, frames: [], removeAudio: false })
@@ -5848,6 +5958,50 @@ function App() {
     setDraftModelsCredentialKey(currentCredentialKey)
     setManualModelIds([])
     setToastMessage(validationWarning ? `连接已保存；模型目录不可验证：${validationWarning}` : 'API 连接已保存')
+  }
+
+  const recoverVideoNodeArchive = async (nodeId: string) => {
+    const node = nodes.find((item) => item.id === nodeId && item.data.kind === 'video')
+    const sourceUrl = node?.data.videoUrl
+    if (!node || !sourceUrl) {
+      setToastMessage('没有可恢复的视频源地址')
+      return
+    }
+    const taskKey = `video-recover:${nodeId}`
+    const controller = beginGenerationTask(taskKey)
+    if (!controller) return
+    updateNodeData(nodeId, { status: '正在恢复本地视频', generationError: undefined })
+    try {
+      const connection = apiSettings.connections.find((item) => item.id === node.data.videoModelConnectionId)
+      const blob = await downloadGeneratedVideoBlob(sourceUrl, {
+        signal: controller.signal,
+        authorization: connection?.apiKey ? `Bearer ${connection.apiKey}` : undefined,
+      })
+      const mediaId = `video-media-${crypto.randomUUID()}`
+      const createdAt = new Date().toISOString()
+      const fileName = node.data.fileName || `disy-video-recovered-${Date.now()}.mp4`
+      await saveHistoryMedia({ id: mediaId, blob, fileName, createdAt })
+      const variant: VideoVariant = { id: `video-variant-${crypto.randomUUID()}`, mediaId, fileName, createdAt, taskId: node.data.videoTaskId, sourceUrl }
+      updateNodeData(nodeId, {
+        status: '已完成',
+        videoProgress: 100,
+        videoMediaId: mediaId,
+        videoGeneratedAt: createdAt,
+        videoUrl: undefined,
+        fileName,
+        videoVariants: [...(node.data.videoVariants ?? []), variant],
+        activeVideoVariantId: variant.id,
+        generationError: undefined,
+      })
+      setToastMessage('视频已恢复到本地，现在可以抽帧、剪辑和裁剪')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      const normalized = normalizeGenerationError(error)
+      updateNodeData(nodeId, { status: '生成成功·下载待恢复', generationError: normalized.message })
+      setToastMessage(`恢复失败：${normalized.message}`)
+    } finally {
+      finishGenerationTask(taskKey)
+    }
   }
 
   const beginNewApiConnection = () => {
@@ -6107,6 +6261,91 @@ function App() {
     })
   }
 
+  const patchAgentVideoPlansAtOrigin = async (
+    origin: { projectId: string; canvasId: string; sessionId: string },
+    patch: (current: AgentVideoPlan[]) => AgentVideoPlan[],
+  ) => {
+    if (
+      activeProjectIdRef.current === origin.projectId
+      && activeCanvasIdRef.current === origin.canvasId
+      && agentConversationIdRef.current === origin.sessionId
+    ) {
+      setAgentVideoPlans(patch)
+      return
+    }
+    const sessions = await listAgentSessions(origin.canvasId)
+    const session = sessions.find((item) => item.id === origin.sessionId)
+    if (!session || session.projectId !== origin.projectId) return
+    const storedPlans = (session.plans as StoredAgentPlan[] | undefined) ?? []
+    await saveAgentSession({
+      ...session,
+      plans: [
+        ...storedPlans.filter(isAgentImagePlan),
+        ...patch(storedPlans.filter(isAgentVideoPlan)),
+        ...storedPlans.filter(isAgentTextPlan),
+      ],
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  const updateAgentRun = (runId: string, patch: Partial<AgentRun>) => {
+    const current = agentRunsRef.current.get(runId)
+    if (!current) return
+    const next = { ...current, ...patch, updatedAt: new Date().toISOString() }
+    agentRunsRef.current.set(runId, next)
+    setAgentRuns(Array.from(agentRunsRef.current.values()))
+    if (next.status !== 'running') agentRunControllersRef.current.delete(runId)
+  }
+
+  const commitAgentTurnAtOrigin = async (
+    origin: { projectId: string; canvasId: string; sessionId: string },
+    userMessage: AgentMessage,
+    assistantMessage: AgentMessage,
+    createdPlans: StoredAgentPlan[],
+  ) => {
+    const switchingAway = canvasSwitchBarrierRef.current?.origin.projectId === origin.projectId
+      && canvasSwitchBarrierRef.current?.origin.canvasId === origin.canvasId
+    if (
+      !switchingAway
+      &&
+      activeProjectIdRef.current === origin.projectId
+      && activeCanvasIdRef.current === origin.canvasId
+      && agentConversationIdRef.current === origin.sessionId
+    ) {
+      setAgentMessages((current) => current.some((message) => message.id === assistantMessage.id) ? current : [...current, assistantMessage])
+      const imagePlans = createdPlans.filter(isAgentImagePlan)
+      const videoPlans = createdPlans.filter(isAgentVideoPlan)
+      const textPlans = createdPlans.filter(isAgentTextPlan)
+      if (imagePlans.length) setAgentPlans((current) => [...current, ...imagePlans])
+      if (videoPlans.length) setAgentVideoPlans((current) => [...current, ...videoPlans])
+      if (textPlans.length) setAgentTextPlans((current) => [...current, ...textPlans])
+      return
+    }
+    const sessions = await listAgentSessions(origin.canvasId)
+    const session = sessions.find((item) => item.id === origin.sessionId)
+    const now = new Date().toISOString()
+    const storedMessages = normalizeHistoricalAgentMessages((session?.messages as AgentMessage[] | undefined) ?? [])
+    const messages = [...storedMessages]
+    if (!messages.some((message) => message.id === userMessage.id)) messages.push(userMessage)
+    if (!messages.some((message) => message.id === assistantMessage.id)) messages.push(assistantMessage)
+    const storedPlans = (session?.plans as StoredAgentPlan[] | undefined) ?? []
+    const existingPlanIds = new Set(storedPlans.map((plan) => plan.id))
+    await saveAgentSession({
+      ...session,
+      id: origin.sessionId,
+      projectId: origin.projectId,
+      canvasId: origin.canvasId,
+      title: session?.title || messages[0]?.content.slice(0, 36) || '新的对话',
+      messages,
+      plans: [...storedPlans, ...createdPlans.filter((plan) => !existingPlanIds.has(plan.id))],
+      selectedChatModelId: session?.selectedChatModelId,
+      selectedImageModelId: session?.selectedImageModelId,
+      selectedVideoModelId: session?.selectedVideoModelId,
+      createdAt: session?.createdAt ?? userMessage.createdAt,
+      updatedAt: now,
+    })
+  }
+
   useEffect(() => {
     const autoSaveTimer = window.setInterval(() => {
       if (!canvasSavedRef.current) autoSaveActionRef.current()
@@ -6120,12 +6359,15 @@ function App() {
     void saveCanvasState(canvasNameDraft)
   }
 
-  const workspaceMutationBlocked = () => agentBusy || agentVideoPlans.some((plan) => plan.status === 'running')
+  const workspaceMutationBlocked = () => false
   const destructiveWorkspaceMutationBlocked = () => generationLoading
     || agentBusy
     || agentPlanLocksRef.current.size > 0
     || agentPlans.some((plan) => plan.status === 'running')
     || agentVideoPlans.some((plan) => plan.status === 'running')
+  const hasRunningAgentAt = (projectId: string, canvasId?: string) => Array.from(agentRunsRef.current.values()).some((run) => run.status === 'running'
+    && run.projectId === projectId
+    && (!canvasId || run.canvasId === canvasId))
 
   const openWorkspaceCanvas = async (canvasId: string, projectId = activeProjectId, skipCurrentSave = false) => {
     if (!skipCurrentSave && workspaceMutationBlocked()) {
@@ -6206,10 +6448,10 @@ function App() {
     const interruptedPlans = storedPlans.filter(isAgentImagePlan)
     const interruptedVideoPlans = storedPlans.filter(isAgentVideoPlan)
     setAgentTextPlans(storedPlans.filter(isAgentTextPlan))
-    const interruptedNodeIds = new Set(interruptedPlans.filter((plan) => plan.status === 'running' && plan.nodeId).map((plan) => plan.nodeId))
+    const interruptedNodeIds = new Set(interruptedPlans.filter((plan) => plan.status === 'running' && plan.nodeId && !agentPlanLocksRef.current.has(plan.id)).map((plan) => plan.nodeId))
     if (interruptedNodeIds.size) setNodes((current) => current.map((node) => interruptedNodeIds.has(node.id) ? { ...node, data: { ...node.data, status: '生成失败' } } : node))
-    setAgentPlans(interruptedPlans.map((plan) => plan.status === 'running' ? { ...plan, status: 'failed', error: '上次生成已中断，请在对应图像节点中手动重试。' } : plan))
-    setAgentVideoPlans(interruptedVideoPlans.map((plan) => plan.status === 'running' ? { ...plan, status: 'failed', error: '上次视频生成已中断，请在对应视频节点中手动重试。' } : plan))
+    setAgentPlans(interruptedPlans.map((plan) => plan.status === 'running' && !agentPlanLocksRef.current.has(plan.id) ? { ...plan, status: 'failed', error: '上次生成已中断，请在对应图像节点中手动重试。' } : plan))
+    setAgentVideoPlans(interruptedVideoPlans.map((plan) => plan.status === 'running' && !agentPlanLocksRef.current.has(plan.id) ? { ...plan, status: 'failed', error: '上次视频生成已中断，请在对应视频节点中手动重试。' } : plan))
     setAgentTextModelKey(session?.selectedChatModelId ?? agentTextModelKey)
     setAgentImageModelKey(session?.selectedImageModelId ?? agentImageModelKey)
     setAgentVideoModelKey(typeof session?.selectedVideoModelId === 'string' ? session.selectedVideoModelId : agentVideoModelKey)
@@ -6282,7 +6524,7 @@ function App() {
       ? { ...plan, status: 'failed', error: '上次生成已中断，请在对应图像节点中手动重试。' }
       : plan))
     setAgentTextPlans(storedPlans.filter(isAgentTextPlan))
-    setAgentVideoPlans(videoPlans.map((plan) => plan.status === 'running' ? { ...plan, status: 'failed', error: '上次视频生成已中断，请在对应视频节点中手动重试。' } : plan))
+    setAgentVideoPlans(videoPlans.map((plan) => plan.status === 'running' && !agentPlanLocksRef.current.has(plan.id) ? { ...plan, status: 'failed', error: '上次视频生成已中断，请在对应视频节点中手动重试。' } : plan))
     setAgentReferences([])
     setAgentPendingReferences([])
     setAgentCanvasPicking(false)
@@ -6329,7 +6571,7 @@ function App() {
   }
 
   const removeCanvas = async (canvasId: string) => {
-    if (destructiveWorkspaceMutationBlocked()) {
+    if (destructiveWorkspaceMutationBlocked() || hasRunningAgentAt(activeProjectId, canvasId)) {
       setToastMessage('正在生成内容，完成后才能删除画布')
       return
     }
@@ -6486,7 +6728,7 @@ function App() {
   }
 
   const removeProject = async (projectId: string) => {
-    if (destructiveWorkspaceMutationBlocked()) {
+    if (destructiveWorkspaceMutationBlocked() || hasRunningAgentAt(projectId)) {
       setToastMessage('正在生成内容，完成后才能删除项目')
       return
     }
@@ -6511,6 +6753,10 @@ function App() {
   const removeProjects = async (projectIds: string[]) => {
     const ids = Array.from(new Set(projectIds)).filter((id) => workspaceProjects.some((project) => project.id === id))
     if (!ids.length || destructiveWorkspaceMutationBlocked()) return
+    if (ids.some((id) => hasRunningAgentAt(id))) {
+      setToastMessage('所选项目中仍有 Agent 正在运行，完成后才能删除')
+      return
+    }
     const deletingAll = ids.length === workspaceProjects.length
     const message = deletingAll
       ? `确认删除全部 ${ids.length} 个项目及其所有画布吗？此操作不可撤销。`
@@ -8039,9 +8285,9 @@ function App() {
     try {
       const renderedVideo = shellRef.current?.querySelector<HTMLVideoElement>(`.react-flow__node[data-id="${CSS.escape(nodeId)}"] video`)
       const directUrl = renderedVideo?.currentSrc || renderedVideo?.src || source.data.videoUrl || ''
-      const media = !directUrl && source.data.videoMediaId ? await loadHistoryMedia(source.data.videoMediaId) : null
+      const media = await ensureVideoEditingMedia(source)
       ownedObjectUrl = media ? URL.createObjectURL(media.blob) : ''
-      const sourceUrl = directUrl || ownedObjectUrl
+      const sourceUrl = ownedObjectUrl || directUrl
       if (!sourceUrl) throw new Error('视频媒体读取失败')
 
       const video = document.createElement('video')
@@ -8885,7 +9131,8 @@ function App() {
     if (mode === 'omni' && !selectedImageEntries.length && !videoReferenceCount) { setToastMessage('全能参考模式请先连接或上传参考图片/视频'); return }
     const controller = beginGenerationTask(nodeId)
     if (!controller) return
-    const origin = { projectId: activeProjectId, canvasId: activeCanvasId }
+    const agentOrigin = agentVideoRunOriginsRef.current.get(nodeId)
+    const origin = { projectId: agentOrigin?.projectId ?? activeProjectId, canvasId: agentOrigin?.canvasId ?? activeCanvasId }
     const referenceImage = imageReferences[0]
     const referenceVideoObjectUrls: string[] = []
     setNodes((current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '排队中', videoProgress: 0, generationError: undefined, videoModelConnectionId: selected.connection.id, videoModelId: selected.model.id, videoModelName: selected.model.name } } : item))
@@ -8996,7 +9243,7 @@ function App() {
           },
           onProgress: (progress, status) => {
             const label = status === 'queued' ? '排队中' : status === 'completed' ? '下载完成' : generateCount > 1 ? `生成中 ${index + 1}/${generateCount}` : '生成中'
-            setNodes((current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: label, videoProgress: Math.max(0, Math.min(100, progress)) } } : item))
+            void patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: label, videoProgress: Math.max(0, Math.min(100, progress)) } } : item))
           },
         })
         lastTaskId = result.taskId
@@ -9020,26 +9267,33 @@ function App() {
       }
       const activeVariant = generatedVideoVariants.at(-1)
       await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '已完成', videoProgress: 100, videoMediaId: lastMediaId, videoGeneratedAt: activeVariant?.createdAt || new Date().toISOString(), videoUrl: undefined, videoTaskId: lastTaskId, fileName: lastFileName, videoVariants: generatedVideoVariants, activeVideoVariantId: activeVariant?.id, generationError: undefined } } : item))
+      if (agentOrigin) await patchAgentVideoPlansAtOrigin(agentOrigin, (current) => current.map((plan) => plan.id === agentOrigin.planId ? { ...plan, status: 'completed', error: undefined } : plan))
       setToastMessage(generateCount > 1 ? `视频生成完成，共 ${generateCount} 份已保存到本地项目` : '视频生成完成，已保存到本地项目')
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, status: '已停止' } } : item))
+        if (agentOrigin) await patchAgentVideoPlansAtOrigin(agentOrigin, (current) => current.map((plan) => plan.id === agentOrigin.planId ? { ...plan, status: 'cancelled' } : plan))
       } else {
         const normalized = normalizeGenerationError(error)
-        const generatedButDownloadFailed = normalized.resultUrls?.length && /^HFSY 视频已生成但下载/.test(normalized.message)
+        const generatedButDownloadFailed = normalized.resultUrls?.length && /视频已生成但(?:下载|本地归档)/.test(normalized.message)
         await patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: {
           ...item.data,
           status: generatedButDownloadFailed ? '生成成功·下载待恢复' : '生成失败',
           generationError: normalized.message,
           ...(generatedButDownloadFailed ? { videoTaskId: normalized.requestId, videoUrl: normalized.resultUrls?.[0], videoMediaId: undefined, activeVideoVariantId: undefined } : {}),
         } } : item))
+        if (agentOrigin) await patchAgentVideoPlansAtOrigin(agentOrigin, (current) => current.map((plan) => plan.id === agentOrigin.planId ? { ...plan, status: generatedButDownloadFailed ? 'completed' : 'failed', error: normalized.message } : plan))
         setToastMessage(normalized.message)
       }
     } finally {
       referenceVideoObjectUrls.forEach((url) => URL.revokeObjectURL(url))
       finishGenerationTask(nodeId)
+      if (agentOrigin) {
+        agentPlanLocksRef.current.delete(agentOrigin.planId)
+        agentVideoRunOriginsRef.current.delete(nodeId)
+      }
     }
-  }, [activeCanvasId, activeProjectId, edges, enabledVideoModels, nodes, patchCanvasNodesAtOrigin, setNodes, stylePresets])
+  }, [activeCanvasId, activeProjectId, edges, enabledVideoModels, nodes, patchAgentVideoPlansAtOrigin, patchCanvasNodesAtOrigin, setNodes, stylePresets])
   generateVideoNodeRef.current = (nodeId) => { void generateVideoNode(nodeId) }
 
   useEffect(() => {
@@ -10091,9 +10345,42 @@ function App() {
       .map((preset) => `${preset.name}：“${preset.keyword.trim()}”`)
     const userMessage: AgentMessage = { id: `agent-message-${crypto.randomUUID()}`, role: 'user', content, createdAt: new Date().toISOString(), references: sentReferences }
     const nextMessages = [...agentMessages, userMessage]
+    const origin = { projectId: activeProjectId, canvasId: activeCanvasId, sessionId: agentConversationId }
+    const localDecision = inferAgentInteractionMode(invocationText)
+    const canvasRevision = `${origin.canvasId}:${nodes.length}:${edges.length}:${Date.now()}`
+    const canvasContext: AgentCanvasContextSnapshot = {
+      projectId: origin.projectId,
+      canvasId: origin.canvasId,
+      canvasName,
+      revision: canvasRevision,
+      selectedNodeIds: [...selectedNodeIds],
+      nodes: nodes.slice(0, 120).map((node) => ({
+        id: node.id,
+        kind: node.data.kind,
+        title: getNodeDisplayTitle(node.data),
+        status: node.data.status,
+        excerpt: (node.data.body || node.data.promptText || '').trim().slice(0, 160) || undefined,
+      })),
+      edges: edges.slice(0, 240).map((edge) => ({ source: edge.source, target: edge.target })),
+    }
     agentRequestRef.current?.abort()
     const controller = new AbortController()
-    const requestVersion = ++agentRequestVersionRef.current
+    const runId = `agent-run-${crypto.randomUUID()}`
+    const startedAt = new Date().toISOString()
+    const run: AgentRun = {
+      id: runId,
+      projectId: origin.projectId,
+      canvasId: origin.canvasId,
+      conversationId: origin.sessionId,
+      canvasRevision,
+      mode: localDecision.mode,
+      status: 'running',
+      startedAt,
+      updatedAt: startedAt,
+    }
+    agentRunsRef.current.set(runId, run)
+    agentRunControllersRef.current.set(runId, controller)
+    setAgentRuns(Array.from(agentRunsRef.current.values()))
     agentRequestRef.current = controller
     setAgentMessages(nextMessages)
     setAgentBusy(true)
@@ -10106,7 +10393,9 @@ function App() {
       }))
       const videoFrames = (await Promise.all(videoReferences.map((reference) => captureVideoReferenceFrames({ id: reference.nodeId, source: 'connection', sourceNodeId: reference.nodeId, selected: true, name: reference.name, mention: `@[node:${reference.nodeId}]`, kind: 'video', available: true, url: reference.url, mediaId: reference.mediaId }, controller.signal)))).flat()
       images.push(...videoFrames)
-      const transcript = nextMessages.slice(-12).map((message) => `${message.role === 'user' ? '用户' : 'Disy'}：${message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}`).join('\n')
+      const transcript = buildAgentConversationContext(nextMessages)
+      const canvasContextGuide = `这是本轮开始时冻结的画布上下文快照。节点顺序不代表语义关系，必须结合 edges 判断上下游；切换到其他画布不会改变本次任务归属：${JSON.stringify(canvasContext)}`
+      const decisionGuide = `先输出 decision，对本轮选择唯一模式：answer（直接回答）、clarify（信息不足需追问）、plan（只给可审阅方案）、execute（用户已明确要求执行）、inspect（检查分析但不改动画布）。本地初判为 ${localDecision.mode}，依据是“${localDecision.reason}”；你必须结合完整对话和画布上下文复核，不应盲从。decision 格式为 {"mode":"answer|clarify|plan|execute|inspect","confidence":0到1,"needsApproval":true或false,"reason":"简短依据"}。涉及媒体生成、删除或覆盖时 needsApproval 必须为 true。`
       const resolvedContextGuide = resolvedContextReferences.length
         ? `系统已为本轮解析出这些上下文对象：${resolvedContextReferences.map((reference) => `${reference.kind === 'image' ? '图片' : '文本'}“${reference.name}”${reference.excerpt ? `（内容摘要：${reference.excerpt}）` : ''}${reference.autoResolved ? `，自动关联依据：${reference.resolutionReason}` : ''}`).join('；')}。必须按这些对象理解用户指代；如语义仍不唯一，在 reply 中追问，不要自行替换成其他对象。`
         : '本轮没有解析出明确的上下文对象；遇到“那个/它/上面”等无法唯一落到对象的指代时，必须先追问。'
@@ -10126,9 +10415,9 @@ function App() {
       const directPlanGuide = directImagePlanRequested
         ? '用户本次明确不要再选择多个方案。若上下文中的媒体目标已经足够清楚，直接把用户要求整合成唯一一项对应的 imagePlans 或 videoPlans，供界面创建待确认卡；不要再追问创作方向，也不要返回多个备选。仍然不得直接声称已经生成。'
         : '用户未明确跳过方案选择时，按正常流程提出可选方向。'
-      const instruction = `你是 Disy 创意画布助手。请和用户中文对话、脑暴。${orchestrationGuide} ${textNodeGuide} ${directPlanGuide} 禁止直接生成媒体，也禁止声称图片或视频已经生成；必须先提出对应确认方案。严格只返回 JSON，不要 Markdown：{"reply":"自然对话回复；文本/脚本请用清晰标题、列表与可复制内容组织","textNode":{"title":"仅最终交付物标题","content":"仅最终整合正文"},"imagePlans":[{"label":"图像方案一","prompt":"可直接用于生图的完整中文提示词","aspectRatio":"1:1","resolution":"1K","detail":"medium","count":1}],"videoPlans":[{"label":"视频方案一","prompt":"包含主体动作、镜头运动、场景和节奏的完整中文视频提示词","aspectRatio":"16:9","resolution":"720p","duration":4,"count":1}]}。只返回任务需要的字段；不满足最终文本交付条件时省略 textNode；不需要图像时省略 imagePlans，不需要视频时省略 videoPlans。需要图像或视频时，对应 plans 必须恰好返回 ${requestedPlanCount} 项。每个方向必须是独立项目，禁止把多个方向合并进同一个 prompt。count 只表示同一方案生成几份结果，不表示方案数量。用户提到图1、图片1或参考图1时，都表示下方编号中的同一张图片；每份方案必须保留用户指定的图片编号及其用途，不得交换顺序。${resolvedContextGuide}${referenceUsageGuide ? `\n\n${referenceUsageGuide}` : ''}\n\n${agentReferenceGuide || '本次对话没有参考图。'}\n\n${styleInvocationWords.length ? `用户本次已调用风格预设：${invokedStylePresets.map((preset) => `${preset.name}（${preset.keyword}）`).join('、')}，确认卡会自动附带对应风格图。` : availableStyleKeywords.length ? `可用风格预设为：${availableStyleKeywords.join('；')}。仅当用户本次消息包含对应调用词时才附带风格图。` : '项目未设置可用的风格调用词。'}\n\n${transcript}`
+      const instruction = `你是 Disy 创意画布助手。请和用户中文对话、脑暴。${orchestrationGuide} ${textNodeGuide} ${directPlanGuide} ${decisionGuide} 禁止直接生成媒体，也禁止声称图片或视频已经生成；必须先提出对应确认方案。严格只返回 JSON，不要 Markdown：{"decision":{"mode":"plan","confidence":0.9,"needsApproval":false,"reason":"需要先确定方向"},"reply":"自然对话回复；文本/脚本请用清晰标题、列表与可复制内容组织","textNode":{"title":"仅最终交付物标题","content":"仅最终整合正文"},"imagePlans":[{"label":"图像方案一","prompt":"可直接用于生图的完整中文提示词","aspectRatio":"1:1","resolution":"1K","detail":"medium","count":1}],"videoPlans":[{"label":"视频方案一","prompt":"包含主体动作、镜头运动、场景和节奏的完整中文视频提示词","aspectRatio":"16:9","resolution":"720p","duration":4,"count":1}]}。decision 和 reply 必须返回；其他只返回任务需要的字段。不满足最终文本交付条件时省略 textNode；不需要图像时省略 imagePlans，不需要视频时省略 videoPlans。需要图像或视频时，对应 plans 必须恰好返回 ${requestedPlanCount} 项。每个方向必须是独立项目，禁止把多个方向合并进同一个 prompt。count 只表示同一方案生成几份结果，不表示方案数量。用户提到图1、图片1或参考图1时，都表示下方编号中的同一张图片；每份方案必须保留用户指定的图片编号及其用途，不得交换顺序。${canvasContextGuide}\n\n${resolvedContextGuide}${referenceUsageGuide ? `\n\n${referenceUsageGuide}` : ''}\n\n${agentReferenceGuide || '本次对话没有参考图。'}\n\n${styleInvocationWords.length ? `用户本次已调用风格预设：${invokedStylePresets.map((preset) => `${preset.name}（${preset.keyword}）`).join('、')}，确认卡会自动附带对应风格图。` : availableStyleKeywords.length ? `可用风格预设为：${availableStyleKeywords.join('；')}。仅当用户本次消息包含对应调用词时才附带风格图。` : '项目未设置可用的风格调用词。'}\n\n${transcript}`
       let raw = await generateRemoteText({ baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id }, instruction, { referenceImages: images, signal: controller.signal })
-      if (controller.signal.aborted || requestVersion !== agentRequestVersionRef.current) return
+      if (controller.signal.aborted) return
       let parsed = parseAgentReply(raw)
       let parsedPlans = parsed.imagePlans ?? (parsed.imagePlan ? [parsed.imagePlan] : [])
       let parsedVideoPlans = parsed.videoPlans ?? (parsed.videoPlan ? [parsed.videoPlan] : [])
@@ -10140,7 +10429,7 @@ function App() {
           `${instruction}\n\n你上一次返回的方案数量不符合要求。请为本次实际需要的每种媒体重新返回恰好 ${requestedPlanCount} 个彼此独立的 plans。`,
           { referenceImages: images, signal: controller.signal },
         )
-        if (controller.signal.aborted || requestVersion !== agentRequestVersionRef.current) return
+        if (controller.signal.aborted) return
         const corrected = parseAgentReply(raw)
         const correctedPlans = corrected.imagePlans ?? (corrected.imagePlan ? [corrected.imagePlan] : [])
         parsed = corrected
@@ -10155,8 +10444,9 @@ function App() {
         role: 'assistant',
         content: parsed.reply || '我已经整理好了。',
         createdAt: new Date().toISOString(),
+        decision: parsed.decision ?? localDecision,
       }
-      setAgentMessages((current) => [...current, assistantMessage])
+      const createdPlans: StoredAgentPlan[] = []
       parsedPlans = parsedPlans.slice(0, requestedPlanCount).map((draft) => ({
         ...draft,
         prompt: ensureAgentPlanReferenceContext(draft.prompt, numberedUserRequest, sentReferences),
@@ -10165,7 +10455,7 @@ function App() {
         const [imageConnectionId, imageModelId] = agentImageModelKey.split('::')
         const createdAt = new Date().toISOString()
         const needsChoice = parsedPlans.length > 1
-        setAgentPlans((current) => [...current, ...parsedPlans.map((draft, index): AgentImagePlan => ({
+        createdPlans.push(...parsedPlans.map((draft, index): AgentImagePlan => ({
           id: `agent-plan-${crypto.randomUUID()}`,
           status: needsChoice ? 'proposed' : 'ready',
           label: draft.label || `方案${index + 1}`,
@@ -10184,7 +10474,7 @@ function App() {
           imageModelId,
           assistantMessageId: assistantMessage.id,
           createdAt,
-        }))])
+        })))
       }
       parsedVideoPlans = parsedVideoPlans.slice(0, requestedPlanCount).map((draft) => ({
         ...draft,
@@ -10195,7 +10485,7 @@ function App() {
         const selectedVideoModel = enabledVideoModels.find(({ connection, model }) => connection.id === videoConnectionId && model.id === videoModelId)
         const videoCapabilities = getVideoModelCapabilities(`${selectedVideoModel?.model.id ?? ''} ${selectedVideoModel?.model.name ?? ''}`)
         const createdAt = new Date().toISOString()
-        setAgentVideoPlans((current) => [...current, ...parsedVideoPlans.map((draft, index): AgentVideoPlan => {
+        createdPlans.push(...parsedVideoPlans.map((draft, index): AgentVideoPlan => {
           const generationMode = videoGenerationMode ?? (sentReferences.some((reference) => reference.kind === 'video') ? 'omni' : sentReferences.length ? 'reference' : 'text')
           return {
             id: `agent-video-plan-${crypto.randomUUID()}`,
@@ -10219,10 +10509,10 @@ function App() {
             assistantMessageId: assistantMessage.id,
             createdAt,
           }
-        })])
+        }))
       }
       if (parsed.textNode) {
-        setAgentTextPlans((current) => [...current, {
+        createdPlans.push({
           id: `agent-text-plan-${crypto.randomUUID()}`,
           status: 'ready',
           title: parsed.textNode!.title,
@@ -10230,17 +10520,28 @@ function App() {
           contextReferences: resolvedContextReferences,
           assistantMessageId: assistantMessage.id,
           createdAt: new Date().toISOString(),
-        }])
+        })
       }
-      setAgentReferences([])
+      await commitAgentTurnAtOrigin(origin, userMessage, assistantMessage, createdPlans)
+      updateAgentRun(runId, { status: 'completed', mode: parsed.decision?.mode ?? localDecision.mode })
+      if (activeProjectIdRef.current === origin.projectId && activeCanvasIdRef.current === origin.canvasId && agentConversationIdRef.current === origin.sessionId) {
+        setAgentReferences([])
+      } else {
+        setToastMessage(`“${canvasName}”中的 Disy Agent 已完成`)
+      }
     } catch (error) {
-      if (controller.signal.aborted || requestVersion !== agentRequestVersionRef.current) return
-      setAgentMessages((current) => [...current, { id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', content: `这次没有成功：${error instanceof Error ? error.message : '对话请求失败'}`, createdAt: new Date().toISOString() }])
-    } finally {
-      if (requestVersion === agentRequestVersionRef.current) {
-        agentRequestRef.current = null
-        setAgentBusy(false)
+      if (controller.signal.aborted) {
+        updateAgentRun(runId, { status: 'cancelled' })
+        return
       }
+      const failureMessage: AgentMessage = { id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', content: `这次没有成功：${error instanceof Error ? error.message : '对话请求失败'}`, createdAt: new Date().toISOString() }
+      await commitAgentTurnAtOrigin(origin, userMessage, failureMessage, [])
+      updateAgentRun(runId, { status: 'failed' })
+    } finally {
+      if (agentRequestRef.current === controller) {
+        agentRequestRef.current = null
+      }
+      if (agentRunsRef.current.get(runId)?.status === 'running') updateAgentRun(runId, { status: controller.signal.aborted ? 'cancelled' : 'completed' })
     }
   }
 
@@ -10351,11 +10652,27 @@ function App() {
     const createdEdges: Edge[] = references
       .filter((reference) => canvasReferenceIds.has(reference.nodeId))
       .map((reference) => ({ id: `agent-video-reference-${reference.nodeId}-${nodeId}`, source: reference.nodeId, target: nodeId, type: 'luminous', data: { referenceSelected: true } }))
+    const origin = { projectId: activeProjectId, canvasId: activeCanvasId, sessionId: agentConversationId, planId }
+    const nextVideoPlans = agentVideoPlans.map((item) => item.id === planId ? { ...item, status: 'running' as const, nodeId, aspectRatio, resolution } : item)
     agentPlanLocksRef.current.add(planId)
+    agentVideoRunOriginsRef.current.set(nodeId, origin)
     setAgentVideoPlans((current) => current.map((item) => item.id === planId ? { ...item, status: 'running', nodeId, aspectRatio, resolution } : item))
     setNodes((current) => current.some((node) => node.id === nodeId) ? current : [...current, generatedNode])
     setEdges((current) => [...current, ...createdEdges.filter((edge) => !current.some((item) => item.id === edge.id))])
     setActiveVideoNodeId(nodeId)
+    await saveAgentSession({
+      id: origin.sessionId,
+      projectId: origin.projectId,
+      canvasId: origin.canvasId,
+      title: agentMessages[0]?.content.slice(0, 36) || '新的对话',
+      messages: agentMessages,
+      plans: [...agentPlans, ...nextVideoPlans, ...agentTextPlans],
+      selectedChatModelId: agentTextModelKey,
+      selectedImageModelId: agentImageModelKey,
+      selectedVideoModelId: agentVideoModelKey,
+      createdAt: agentMessages[0]?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    })
     window.requestAnimationFrame(() => {
       updateNodeInternals(nodeId)
       window.setTimeout(() => generateVideoNodeRef.current(nodeId), 0)
@@ -10408,6 +10725,7 @@ function App() {
     if (!controller) return
     agentPlanLocksRef.current.add(planId)
     const origin = { projectId: activeProjectId, canvasId: activeCanvasId, sessionId: agentConversationId }
+    agentImageRunOriginsRef.current.set(nodeId, { ...origin, planId })
     const flowPosition = screenToFlowPosition({ x: Math.max(360, window.innerWidth - (agentOpen ? 720 : 420)), y: 230 })
     // Freeze the confirmed card values once. The node geometry, persisted metadata,
     // request payload and history must all describe this exact generation attempt.
@@ -10600,6 +10918,7 @@ function App() {
       setToastMessage(failureReason)
     } finally {
       agentPlanLocksRef.current.delete(planId)
+      agentImageRunOriginsRef.current.delete(nodeId)
       finishGenerationTask(taskKey)
     }
   }
@@ -13972,6 +14291,9 @@ function App() {
                 imageDefaults={agentImageDefaults}
                 videoDefaults={agentVideoDefaults}
                 busy={agentBusy}
+                backgroundRunCount={agentRuns.filter((run) => run.status === 'running' && (run.projectId !== activeProjectId || run.canvasId !== activeCanvasId || run.conversationId !== agentConversationId)).length
+                  + Array.from(agentImageRunOriginsRef.current.values()).filter((run) => run.projectId !== activeProjectId || run.canvasId !== activeCanvasId || run.sessionId !== agentConversationId).length
+                  + Array.from(agentVideoRunOriginsRef.current.values()).filter((run) => run.projectId !== activeProjectId || run.canvasId !== activeCanvasId || run.sessionId !== agentConversationId).length}
                 agentOnly={false}
                 onStop={stopAgentThinking}
                 onClose={() => { setAgentOpen(false); setAgentCanvasPicking(false) }}
@@ -14249,6 +14571,7 @@ function App() {
                 </motion.div>}</AnimatePresence>
               </div>
               <span className="quick-toolbar-divider" />
+              {videoToolbarNode.data.status === '生成成功·下载待恢复' && <button type="button" onClick={() => void recoverVideoNodeArchive(videoToolbarNode.id)} title="重新获取供应商成品并保存到本地"><RefreshCw size={14} /><span>恢复视频</span></button>}
               <button type="button" onClick={() => void downloadVideoNode(videoToolbarNode.id)} title="下载到浏览器默认目录"><Download size={14} /><span>下载</span></button>
               <button type="button" onClick={() => saveNodeToAssets(videoToolbarNode)}><Library size={14} /><span>加入资产库</span></button>
             </motion.div>
@@ -16570,16 +16893,10 @@ function App() {
                         </button>
                       </span>
                     </label>
-                    <label className="api-field-wide">
-                      鉴权方式
-                      <select value={apiDraft.authMode} onChange={(event) => setApiDraft((draft) => ({ ...draft, authMode: event.target.value as ApiAuthMode }))}>
-                        <option value="auto">自动识别（推荐）</option>
-                        <option value="bearer">Authorization: Bearer</option>
-                        <option value="x-api-key">x-api-key</option>
-                        <option value="api-key">api-key（Azure 等）</option>
-                        <option value="x-goog-api-key">x-goog-api-key</option>
-                      </select>
-                    </label>
+                    <div className="api-field-wide grid gap-2 text-[10px] font-bold text-muted">
+                      <span>鉴权方式</span>
+                      <ApiAuthModeSelect value={apiDraft.authMode} onChange={(authMode) => setApiDraft((draft) => ({ ...draft, authMode }))} />
+                    </div>
                     <button type="button" className="api-fetch-models" disabled={modelsLoading} onClick={() => void refreshRemoteModels()}>
                       {modelsLoading ? <LoaderCircle size={15} className="is-spinning" /> : <History size={15} />}
                       {modelsLoading ? '正在获取模型' : '获取当前连接模型'}

@@ -1,5 +1,9 @@
 node_modules/
 dist/
+dist.old.*/
+output/
+tmp/
+.tmp-*/
 .netlify/
 .netlify-appdata/
 .netlify-config/

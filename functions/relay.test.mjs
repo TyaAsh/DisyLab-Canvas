@@ -46,6 +46,23 @@ test('Cloudflare media relay sends HFSY anti-hotlink and scoped authorization he
   } finally { globalThis.fetch = originalFetch }
 })
 
+test('Cloudflare media relay sends HFSY anti-hotlink headers to qixinai results', async () => {
+  const originalFetch = globalThis.fetch
+  let upstreamHeaders
+  globalThis.fetch = async (_url, init) => {
+    upstreamHeaders = new Headers(init.headers)
+    return new Response('video', { headers: { 'content-type': 'video/mp4' } })
+  }
+  try {
+    const response = await mediaRelay({ request: new Request('https://app.test/apiyi/media?url=https%3A%2F%2Fwww.qixinai.net%2Fresult.mp4') })
+    assert.equal(response.status, 200)
+    assert.equal(upstreamHeaders.get('referer'), 'https://www.hfsyapi.cn/')
+    assert.equal(upstreamHeaders.get('origin'), 'https://www.hfsyapi.cn')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('Cloudflare HFSY relay keeps the configured version path exactly once', async () => {
   const originalFetch = globalThis.fetch
   let capturedUrl = ''

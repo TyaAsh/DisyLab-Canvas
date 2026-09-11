@@ -18,6 +18,7 @@ export type AgentMessage = {
     content: string
     nodeId?: string
   }
+  decision?: AgentDecision
 }
 
 export type AgentImageReference = {
@@ -85,6 +86,37 @@ export type AgentImagePlan = {
   error?: string
 }
 
+export type AgentInteractionMode = 'answer' | 'clarify' | 'plan' | 'execute' | 'inspect'
+
+export type AgentDecision = {
+  mode: AgentInteractionMode
+  confidence: number
+  needsApproval: boolean
+  reason: string
+}
+
+export type AgentRun = {
+  id: string
+  projectId: string
+  canvasId: string
+  conversationId: string
+  canvasRevision: string
+  mode: AgentInteractionMode
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  startedAt: string
+  updatedAt: string
+}
+
+export type AgentCanvasContextSnapshot = {
+  projectId: string
+  canvasId: string
+  canvasName: string
+  revision: string
+  selectedNodeIds: string[]
+  nodes: Array<{ id: string; kind: string; title: string; status?: string; excerpt?: string }>
+  edges: Array<{ source: string; target: string }>
+}
+
 export type AgentVideoPlan = {
   id: string
   mediaKind: 'video'
@@ -135,6 +167,7 @@ export interface CanvasAgentService {
 
 export type AgentReply = {
   reply: string
+  decision?: AgentDecision
   imagePlan?: AgentImagePlanDraft
   imagePlans?: AgentImagePlanDraft[]
   videoPlan?: AgentVideoPlanDraft
@@ -186,6 +219,19 @@ export function messageExpectsImagePlans(content: string) {
   return explicitImageIntent
 }
 
+export function inferAgentInteractionMode(content: string): AgentDecision {
+  const normalized = content.trim()
+  const inspect = /(?:检查|分析|审计|评估|看看|为什么|怎么回事|找问题|排查)/i.test(normalized)
+  const explicitPlan = /(?:先|只|暂时).{0,8}(?:计划|方案|分析|思路|建议)|(?:不要|先别|暂不).{0,8}(?:执行|生成|修改|动手)|计划模式/i.test(normalized)
+  const explicitExecute = /(?:开始|直接|立即|现在|马上|就按|照着|执行|落实|修改好|修复好|生成|制作|创建|删除)/i.test(normalized)
+  const ambiguous = normalized.length < 5 || /^(?:这个|那个|它|继续|然后呢|怎么办)[？?。！!]*$/i.test(normalized)
+  if (explicitPlan) return { mode: 'plan', confidence: .96, needsApproval: false, reason: '用户明确要求先规划或暂不执行' }
+  if (explicitExecute) return { mode: 'execute', confidence: .88, needsApproval: /(?:生成|制作|创建|删除|覆盖)/i.test(normalized), reason: '用户明确要求开始产生变更' }
+  if (ambiguous) return { mode: 'clarify', confidence: .72, needsApproval: false, reason: '目标或指代不足以安全执行' }
+  if (inspect) return { mode: 'inspect', confidence: .82, needsApproval: false, reason: '用户请求分析现状或定位问题' }
+  return { mode: 'answer', confidence: .62, needsApproval: false, reason: '未发现明确执行或规划指令' }
+}
+
 export function messageExpectsVideoPlans(content: string) {
   return /(?:生成|制作|创作|做|出|续写|延展).{0,12}(?:视频|短片|动画|动态画面)/i.test(content)
     || /(?:文生视频|图生视频|视频生成|生成视频)/i.test(content)
@@ -222,7 +268,7 @@ function extractFirstJsonContainer(value: string) {
 function normalizeAgentReplyRecord(value: unknown): Record<string, unknown> | null {
   if (Array.isArray(value)) {
     const records = value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    const protocolRecords = records.filter((record) => ['reply', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode'].some((field) => field in record))
+    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode'].some((field) => field in record))
     return protocolRecords.length ? Object.assign({}, ...protocolRecords) : null
   }
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -255,7 +301,7 @@ function extractMalformedReply(value: string) {
 
 function looksLikeAgentProtocolPayload(value: string) {
   const cleaned = value.trim()
-  const hasProtocolField = /(?:["']|\\["'])?(?:reply|imagePlans?|videoPlans?|textNode)(?:["']|\\["'])?\s*:/i.test(cleaned)
+  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode)(?:["']|\\["'])?\s*:/i.test(cleaned)
   if (!hasProtocolField) return false
   return /^```(?:json|js)?/i.test(cleaned)
     || /^[\[{"']/.test(cleaned)
@@ -268,12 +314,34 @@ export function normalizeAgentMessageContent(content: string) {
   return looksLikeAgentProtocolPayload(content) ? parseAgentReply(content).reply : content
 }
 
+export function buildAgentConversationContext(messages: AgentMessage[], recentCount = 12) {
+  const recent = messages.slice(-recentCount)
+  const older = messages.slice(0, -recentCount)
+  const summary = older.slice(-24).map((message) => {
+    const content = normalizeAgentMessageContent(message.content).replace(/\s+/g, ' ').trim()
+    return `${message.role === 'user' ? '用户' : 'Disy'}：${content.slice(0, 180)}`
+  }).join('\n')
+  const transcript = recent.map((message) => `${message.role === 'user' ? '用户' : 'Disy'}：${message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}`).join('\n')
+  return summary ? `较早对话摘要（按原顺序压缩）：\n${summary}\n\n最近对话：\n${transcript}` : transcript
+}
+
 export function parseAgentReply(raw: string): AgentReply {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
   try {
     const value = parseAgentReplyRecord(cleaned)
     if (!value) throw new Error('Invalid Agent response payload')
     const reply = typeof value.reply === 'string' ? value.reply.trim() : ''
+    const decisionValue = value.decision && typeof value.decision === 'object' && !Array.isArray(value.decision)
+      ? value.decision as Record<string, unknown>
+      : null
+    const decisionModes: AgentInteractionMode[] = ['answer', 'clarify', 'plan', 'execute', 'inspect']
+    const decisionMode = decisionModes.find((mode) => mode === decisionValue?.mode)
+    const decision = decisionMode ? {
+      mode: decisionMode,
+      confidence: Math.min(1, Math.max(0, Number(decisionValue?.confidence) || 0)),
+      needsApproval: Boolean(decisionValue?.needsApproval),
+      reason: typeof decisionValue?.reason === 'string' ? decisionValue.reason.trim() : '',
+    } satisfies AgentDecision : undefined
     const candidates = Array.isArray(value.imagePlans)
       ? value.imagePlans.filter((candidate): candidate is Record<string, unknown> => Boolean(candidate) && typeof candidate === 'object')
       : value.imagePlan && typeof value.imagePlan === 'object'
@@ -327,6 +395,7 @@ export function parseAgentReply(raw: string): AgentReply {
         || (imagePlans.length ? `我已整理好${imagePlans.length > 1 ? `${imagePlans.length}份` : '一份'}图像方案，请选择并确认后生成。` : '')
         || (videoPlans.length ? `我已整理好${videoPlans.length > 1 ? `${videoPlans.length}份` : '一份'}视频方案，请确认后生成。` : '')
         || (textNode ? '我已整理好最终文本，并放入画布文本节点。' : '这次回复格式异常，请重新发送一次。'),
+      decision,
       imagePlan: imagePlans[0],
       imagePlans: imagePlans.length ? imagePlans : undefined,
       videoPlan: videoPlans[0],

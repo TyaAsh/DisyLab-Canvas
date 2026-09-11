@@ -25,7 +25,7 @@ export async function onRequest({ request }) {
         'Accept-Encoding': 'identity',
         Accept: 'video/*,image/*,application/octet-stream;q=0.9,*/*;q=0.5',
       })
-      if (/(?:^|\.)aixinai\.net$/i.test(current.hostname)) {
+      if (/(?:^|\.)aixinai\.net$|^www\.qixinai\.net$/i.test(current.hostname)) {
         headers.set('Referer', 'https://www.hfsyapi.cn/')
         headers.set('Origin', 'https://www.hfsyapi.cn')
         headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36')

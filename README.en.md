@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-<h1 align="center">DisyLab</h1>
+<h1 align="center">DisyLab Canvas</h1>
 
 <p align="center">
   <a href="README.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · English
@@ -37,18 +37,22 @@
 > [!IMPORTANT]
 > **DisyLab is proprietary source-available software, not open-source software.** Commercial use, sale, rental, white-labeling, redistribution, relicensing, and paid services based on this project or modified versions require prior written permission from the copyright holder. See [LICENSE](LICENSE) and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
-## What's new in v1.0.5
+## Current highlights
 
 - **Skill system:** open image and text Skills with `/`, run instant or configured tasks, and safely import and manage custom Skills.
 - **Comic storyboard workflow:** move from content breakdown and layout selection to composition approval and asset generation in one editable node flow.
 - **File toolbox:** lightweight image, video, and PDF utilities.
 - **Personal workspace and projects:** a unified project home with search, grid/list views, batch selection, and import/export.
 - **Interaction and stability fixes:** corrected overlay stacking, hidden dialogs, minimap dragging, and Skill panel readability.
+- **Context-aware Disy Agent:** uses the originating project, canvas, selected nodes, references, and conversation history to decide between planning and execution.
+- **Background canvas runs:** Agent and media tasks remain attached to their source canvas while users browse other projects.
+- **Per-plan model selection:** each image and video confirmation card can select an available connection and model.
+- **Recoverable video media:** generated videos are archived locally when possible, with controlled relay recovery for frame capture, trimming, and cropping.
 
 ## Core capabilities
 
 - Infinite canvas, node connections, and multi-canvas projects.
-- Text, upload, image, video, and Agent nodes.
+- Text, upload, image, video, and Agent workflows.
 - Image generation, video generation, trimming, cropping, and frame capture.
 - Workflow templates, inspiration library, asset library, and generation history.
 - Local-first storage with `.disy` project import and export.
@@ -68,15 +72,13 @@ Production checks:
 
 ```bash
 npm run typecheck
+npm test
 npm run build
 ```
 
-## Roadmap
+## Current scope
 
-- **Next minor release:** multilingual UI plus light and dark theme switching.
-- **D-Motion:** a lightweight motion-design workspace.
-- **D-Board:** a thinking whiteboard for drawing, brainstorming, flowcharts, tables, and multi-format export including PDF.
-- Frontend/backend separation is paused. The desktop app will follow the major release, and audio generation will be introduced gradually later.
+DisyLab currently focuses on the browser-based personal creative workflow. Accounts, cloud project sync, real-time collaboration, server-side key custody, public generation credits, and the desktop app are not included yet.
 
 ## License
 

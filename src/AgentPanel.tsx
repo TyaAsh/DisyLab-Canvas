@@ -229,6 +229,7 @@ type Props = {
   imageDefaults: { aspectRatio: string; resolution: string; detail: string; count: number }
   videoDefaults: { aspectRatio: string; resolution: string; duration: number; count: number }
   busy: boolean
+  backgroundRunCount: number
   agentOnly: boolean
   onStop: () => void
   onClose: () => void
@@ -248,13 +249,13 @@ type Props = {
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
   onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
-  onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count'>>) => void
+  onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId'>>) => void
   onSelectPlanOptions: (groupPlanIds: string[], selectedPlanIds: string[]) => void
   onConfirmPlan: (id: string) => void
   getImagePlanCostLabel?: (plan: AgentImagePlan) => string | null
   onCancelPlan: (id: string) => void
   onRemovePlanContextReference: (planId: string, nodeId: string) => void
-  onVideoPlanChange: (id: string, patch: Partial<Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count'>>) => void
+  onVideoPlanChange: (id: string, patch: Partial<Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'videoConnectionId' | 'videoModelId'>>) => void
   onConfirmVideoPlan: (id: string) => void
   onCancelVideoPlan: (id: string) => void
   onRemoveVideoPlanContextReference: (planId: string, nodeId: string) => void
@@ -754,6 +755,8 @@ export function AgentPanel(props: Props) {
     const statusLabel = plan.status === 'ready' ? '待确认' : plan.status === 'running' ? '生成中' : plan.status === 'completed' ? '已完成' : plan.status === 'cancelled' ? '已取消' : '失败'
     const isCompact = plan.status === 'completed' || plan.status === 'cancelled' || Boolean(plan.results?.length)
     const disabled = plan.status !== 'ready'
+    const imageModelKey = `${plan.imageConnectionId ?? ''}::${plan.imageModelId ?? ''}`
+    const imageModelAvailable = props.imageModels.some((model) => model.key === imageModelKey)
     const displayedContextReferences: AgentContextReference[] = plan.contextReferences?.length
       ? plan.contextReferences
       : (plan.references ?? []).map((reference) => ({ ...reference, kind: reference.kind ?? 'image' as const }))
@@ -804,6 +807,8 @@ export function AgentPanel(props: Props) {
         }}
       >
         <header><span><ImagePlus size={15} />图像生成确认</span><em>{statusLabel}</em></header>
+        <div className="mb-2 grid gap-1"><span className="text-[10px] text-[color:var(--muted)]">图像模型</span><AgentSelect className="w-full" ariaLabel="选择本次图像模型" value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: `${model.name} · ${model.connectionName}`, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={13} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); props.onPlanChange(plan.id, { imageConnectionId, imageModelId }) }} /></div>
+        {!imageModelAvailable && <p className="mb-2 text-[11px] text-amber-300">原图像模型已不可用，请重新选择。</p>}
         <textarea value={plan.prompt} disabled={disabled} onChange={(event) => props.onPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑图像方案提示词" />
         {!!displayedContextReferences.length && renderContextReferences(displayedContextReferences, (nodeId) => props.onRemovePlanContextReference(plan.id, nodeId))}
         {!!(plan.invokedStylePresets?.length || plan.invokedStyleReferences?.length) && <div className="agent-plan-invoked-styles">
@@ -818,7 +823,7 @@ export function AgentPanel(props: Props) {
           </div>)}
         </div>}
         {plan.error && <p className="agent-plan-error">{plan.error}</p>}
-        {plan.status === 'ready' && <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />确认生图{props.getImagePlanCostLabel?.(plan) ? ` · ${props.getImagePlanCostLabel(plan)}` : ''}</button></footer>}
+        {plan.status === 'ready' && <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable} title={imageModelAvailable ? '使用所选模型生成图片' : '请先选择可用的图像模型'} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />确认生图{props.getImagePlanCostLabel?.(plan) ? ` · ${props.getImagePlanCostLabel(plan)}` : ''}</button></footer>}
       </section>
     )
   }
@@ -846,8 +851,12 @@ export function AgentPanel(props: Props) {
     const displayedContextReferences = plan.contextReferences?.length
       ? plan.contextReferences
       : (plan.references ?? []).map((reference) => ({ ...reference, kind: reference.kind ?? 'image' as const }))
+    const videoModelKey = `${plan.videoConnectionId ?? ''}::${plan.videoModelId ?? ''}`
+    const videoModelAvailable = props.videoModels.some((model) => model.key === videoModelKey)
     return <section className="agent-plan-card agent-video-plan-card is-ready" key={plan.id}>
       <header><span><Film size={15} />视频生成确认</span><em>{statusLabel}</em></header>
+      <div className="mb-2 grid gap-1"><span className="text-[10px] text-[color:var(--muted)]">视频模型</span><AgentSelect className="w-full" ariaLabel="选择本次视频模型" value={videoModelAvailable ? videoModelKey : ''} placeholder="选择视频模型" options={props.videoModels.map((model) => ({ value: model.key, label: `${model.name} · ${model.connectionName}`, brand: getModelBrand(model.name) }))} icon={<Film size={13} />} onChange={(key) => { const [videoConnectionId = '', videoModelId = ''] = key.split('::'); props.onVideoPlanChange(plan.id, { videoConnectionId, videoModelId }) }} /></div>
+      {!videoModelAvailable && <p className="mb-2 text-[11px] text-amber-300">原视频模型已不可用，请重新选择。</p>}
       <textarea value={plan.prompt} onChange={(event) => props.onVideoPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑视频方案提示词" />
       <div className="agent-video-plan-settings">
         <AgentSelect ariaLabel="视频比例" value={plan.aspectRatio} placeholder="比例" options={props.videoAspectOptions} icon={<SlidersHorizontal size={13} />} onChange={(aspectRatio) => props.onVideoPlanChange(plan.id, { aspectRatio })} />
@@ -860,7 +869,7 @@ export function AgentPanel(props: Props) {
         {(plan.invokedStylePresets?.length ? plan.invokedStylePresets : [{ id: 'legacy-video-style', name: '风格设定', keyword: plan.styleInvocationWord || '', references: plan.invokedStyleReferences ?? [] }]).map((preset) => <div className="agent-plan-invoked-style" key={preset.id}><span><Sparkles size={12} />{preset.name}{preset.keyword ? ` · ${preset.keyword}` : ''}</span><div>{preset.references.map((reference) => <img src={reference.url} alt={reference.name} title={reference.name} key={reference.id} />)}</div></div>)}
       </div>}
       {plan.error && <p className="agent-plan-error">{plan.error}</p>}
-      <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelVideoPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" onClick={() => props.onConfirmVideoPlan(plan.id)}><Check size={15} />确认生成视频</button></footer>
+      <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelVideoPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!videoModelAvailable} title={videoModelAvailable ? '使用所选模型生成视频' : '请先选择可用的视频模型'} onClick={() => props.onConfirmVideoPlan(plan.id)}><Check size={15} />确认生成视频</button></footer>
     </section>
   }
   const renderTextPlan = (plan: AgentTextPlan) => {
@@ -936,7 +945,7 @@ export function AgentPanel(props: Props) {
     <aside id="disy-agent-panel" className={`agent-panel ${props.agentOnly ? 'is-agent-only' : ''} ${panelResizing ? 'is-resizing' : ''}`} style={{ '--agent-panel-width': `${panelWidth}px` } as CSSProperties} aria-label="Disy 对话 Agent">
       <div className="agent-panel-resize-handle" role="separator" aria-label="调整 Agent 面板宽度" aria-orientation="vertical" onPointerDown={startPanelResize} onPointerMove={resizePanel} onPointerUp={finishPanelResize} onPointerCancel={finishPanelResize}><span /></div>
       <header className="agent-panel-header">
-        <div className="agent-panel-title"><img className="agent-panel-logo" src="/disy-logo.png" alt="" /><span><strong>Disy Agent</strong><small>和你一起构思，并在确认后生成</small></span></div>
+        <div className="agent-panel-title"><img className="agent-panel-logo" src="/disy-logo.png" alt="" /><span><strong>Disy Agent</strong><small>和你一起构思，并在确认后生成</small></span>{props.backgroundRunCount > 0 && <span className="ml-2 inline-flex items-center gap-1 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-1 text-[10px] text-cyan-200" title="其他画布中的 Agent 正在后台运行"><LoaderCircle size={11} className="is-spinning" />后台 {props.backgroundRunCount}</span>}</div>
         <div className="agent-panel-header-actions">
           {props.agentOnly && <button className="agent-panel-api" onClick={props.onOpenApiSettings} title="配置 API"><KeyRound size={16} /><span>API 配置</span></button>}
           {!props.agentOnly && <button className="agent-panel-close" onClick={props.onClose} title="关闭"><X size={17} /></button>}
