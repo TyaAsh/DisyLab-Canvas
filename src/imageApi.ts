@@ -7,6 +7,7 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
+import { isDesktopApp, providerFetch } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
 import { inferModelCapability, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
@@ -49,7 +50,8 @@ export type VideoGenerationOptions = {
   prompt: string
   seconds: number
   size: string
-  resolution?: '480p' | '720p' | '1080p' | '4k'
+  resolution?: '480p' | '720p' | '768p' | '1080p' | '2k' | '4k'
+  aspectRatio?: string
   mode?: 'text2video' | 'image2video' | 'first_last_frame' | 'image_reference' | 'all_reference'
   referenceImage?: string
   referenceImages?: string[]
@@ -57,6 +59,7 @@ export type VideoGenerationOptions = {
   lastFrame?: string
   referenceVideo?: string
   referenceVideos?: string[]
+  referenceAudios?: string[]
   generateAudio?: boolean
   signal?: AbortSignal
   onProgress?: (progress: number, status: string) => void
@@ -83,23 +86,32 @@ export type GenerationAdminLog = {
 
 export type TextGenerationOptions = {
   referenceImages?: string[]
+  stream?: boolean
   signal?: AbortSignal
   captureAdminLog?: (log: GenerationAdminLog) => void
 }
+
+export type ImageOutput = 'png' | 'transparent-png' | 'gif' | 'svg'
+export type ImageQuality = 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+type ImageResolution = '1K' | '2K' | '4K'
 
 export type ImageGenerationOptions = {
   prompt: string
   count: number
   referenceImages?: string[]
   aspectRatio?: string
-  resolution?: '1K' | '2K' | '4K'
-  detail?: 'low' | 'medium' | 'high'
+  resolution?: ImageResolution
+  detail?: ImageQuality
+  output?: ImageOutput
   signal?: AbortSignal
+  onProgress?: ImageTaskProgressCallback
   /** Persists a paid async task before polling starts so it can be recovered safely. */
   onTaskId?: (taskId: string) => void
   /** Captures a sanitized request/result snapshot for admin recovery logs. */
   captureAdminLog?: (log: GenerationAdminLog) => void
 }
+
+type ImageTaskProgressCallback = (percent: number | undefined, status: string) => void
 
 const REFERENCE_IMAGE_REQUEST_MAX_DIMENSION = 1024
 const REFERENCE_IMAGE_READ_TIMEOUT_MS = 45_000
@@ -107,6 +119,8 @@ const REFERENCE_IMAGE_READ_ATTEMPTS = 2
 const GRSAI_IMAGE_POLL_INTERVAL_MS = 2_500
 const GRSAI_IMAGE_POLL_TIMEOUT_MS = 15 * 60_000
 const GRSAI_MAX_CONSECUTIVE_POLL_ERRORS = 24
+const GRSAI_MEDIA_HOST = /^file[1-9]\d?\.aitohumanize\.com$/i
+const HFSY_MEDIA_HOST = 'file.hfsyapi.cn'
 const VISIONARY_POLL_INTERVAL_MS = 3_000
 const VISIONARY_POLL_TIMEOUT_MS = 15 * 60_000
 const VISIONARY_MAX_CONSECUTIVE_POLL_ERRORS = 5
@@ -135,6 +149,18 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) 
   })
 }
 
+export async function normalizeOriginalImageBlob(blob: Blob): Promise<Blob> {
+  const bytes = new Uint8Array(await blob.slice(0, 8).arrayBuffer())
+  const signature = String.fromCharCode(...bytes.subarray(0, 6))
+  const isPng = [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte)
+  let mime = signature === 'GIF87a' || signature === 'GIF89a' ? 'image/gif' : isPng ? 'image/png' : blob.type
+  if (!mime || /^(?:application\/(?:octet-stream|xml)|text\/(?:plain|xml))$/.test(mime)) {
+    const header = await blob.slice(0, 1024).text()
+    if (/^\s*(?:<\?xml[^?]*\?>\s*)?<svg(?:\s|\/?>)/i.test(header)) mime = 'image/svg+xml'
+  }
+  return mime === blob.type ? blob : blob.slice(0, blob.size, mime)
+}
+
 export async function readImageSourceBlob(source: string, signal?: AbortSignal, referenceLabel = '图片'): Promise<Blob> {
   if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
   const trimmedSource = source.trim()
@@ -154,9 +180,10 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
       // Route those known result hosts through the same-origin media relay.
       if (typeof window !== 'undefined' && (
         host === 'aixinai.net' || host.endsWith('.aixinai.net')
-        || host === 'www.qixinai.net'
+        || host === 'www.qixinai.net' || host === HFSY_MEDIA_HOST
         || host === 'gptgod.online' || host.endsWith('.gptgod.online')
         || host === 'gptgod.com' || host.endsWith('.gptgod.com')
+        || GRSAI_MEDIA_HOST.test(host)
       )) return apiYiGeneratedMediaUrl(trimmedSource)
     } catch { /* retain the original source and surface a normal read error */ }
     return trimmedSource
@@ -173,7 +200,7 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
       try {
         const separator = readableSource.includes('?') ? '&' : '?'
         const attemptSource = attempt > 1 && /^https?:/i.test(readableSource) ? `${readableSource}${separator}disy_retry=${attempt}` : readableSource
-        const response = await fetch(attemptSource, { signal: referenceController.signal, cache: 'no-store' })
+        const response = await providerFetch(attemptSource, { signal: referenceController.signal, cache: 'no-store' })
         if (!response.ok) throw new Error(`图片读取失败（${response.status}）`)
         sourceBlob = await response.blob()
         break
@@ -206,6 +233,7 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
     )
   }
 
+  if (sourceBlob?.size) sourceBlob = await normalizeOriginalImageBlob(sourceBlob)
   if (!sourceBlob || !sourceBlob.size || !sourceBlob.type.startsWith('image/')) {
     throw new GenerationRequestError('platform', '参考图片格式无法识别', `收到的文件类型为 ${sourceBlob?.type || 'unknown'}`)
   }
@@ -227,20 +255,28 @@ export async function prepareReferenceImageForRequest(source: string | Blob, sig
   const isPreferredEditFormat = /^image\/(?:png|jpe?g)$/i.test(sourceBlob.type)
   // Remote and blob URLs are converted to stable request data. Unsupported
   // formats are always re-encoded while preserving their exact pixel dimensions.
-  let bitmap: ImageBitmap
+  const svgUrl = sourceBlob.type === 'image/svg+xml' ? URL.createObjectURL(sourceBlob) : undefined
+  let image: ImageBitmap | HTMLImageElement | undefined
   try {
-    bitmap = await createImageBitmap(sourceBlob)
-  } catch (error) {
-    throw new GenerationRequestError(
-      'platform',
-      '参考图片无法解码',
-      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-    )
-  }
-
-  try {
+    try {
+      if (svgUrl) {
+        // Browsers may display SVG as an image but reject it as an ImageBitmap.
+        const svg = new Image()
+        svg.src = svgUrl
+        await svg.decode()
+        image = svg
+      } else {
+        image = await createImageBitmap(sourceBlob)
+      }
+    } catch (error) {
+      throw new GenerationRequestError(
+        'platform',
+        '参考图片无法解码',
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      )
+    }
     if (signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
-    const maxSourceDimension = Math.max(bitmap.width, bitmap.height)
+    const maxSourceDimension = Math.max(image.width, image.height)
     if (isPreferredEditFormat && maxSourceDimension <= REFERENCE_IMAGE_REQUEST_MAX_DIMENSION) {
       return /^data:image\//i.test(trimmedSource) ? trimmedSource : blobToDataUrl(sourceBlob)
     }
@@ -248,11 +284,11 @@ export async function prepareReferenceImageForRequest(source: string | Blob, sig
     // Requests cap their longest edge at 1K. This is large enough for image
     // guidance while preventing an oversized local upload from bloating payloads.
     const scale = Math.min(1, REFERENCE_IMAGE_REQUEST_MAX_DIMENSION / maxSourceDimension)
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    canvas.width = Math.max(1, Math.round(image.width * scale))
+    canvas.height = Math.max(1, Math.round(image.height * scale))
     const context = canvas.getContext('2d')
     if (!context) throw new Error('浏览器无法创建图片压缩画布')
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
 
     // WebP and uncommon formats become PNG only for request compatibility.
     // PNG remains lossless; JPEG retains JPEG encoding at high quality.
@@ -260,7 +296,8 @@ export async function prepareReferenceImageForRequest(source: string | Blob, sig
     return blobToDataUrl(await canvasToBlob(canvas, outputType, .92))
 
   } finally {
-    bitmap.close()
+    if (image && 'close' in image) image.close()
+    if (svgUrl) URL.revokeObjectURL(svgUrl)
   }
 }
 
@@ -345,6 +382,9 @@ function normalizedApiBaseUrl(baseUrl: string) {
   // This prevents accidental paths such as /v1/chat/completions/models.
   const copiedEndpoint = /\/(?:models|chat\/completions|responses|messages|images\/(?:generations|edits)|videos(?:\/generations)?)\/?$/i.test(url.pathname)
   url.pathname = url.pathname.replace(/\/(?:models|chat\/completions|responses|messages|images\/(?:generations|edits)|videos(?:\/generations)?)\/?$/i, '') || '/'
+  if (/^(?:www\.|api\.|apigo\.)?hfsyapi\.cn$/i.test(host)) {
+    url.pathname = url.pathname.replace(/\/(?:image|video)\/create\/?$/i, '') || '/'
+  }
   if (copiedEndpoint) url.hash = ''
   // `visionary.beer` is the website/result-media host. Users commonly copy it
   // from task history, but generation endpoints live on api.visionary.beer/v1.
@@ -420,6 +460,152 @@ function grsaiControlEndpoint(baseUrl: string, path: string) {
 
 function isGrsaiBaseUrl(baseUrl: string) {
   return /^https?:\/\/(?:grsaiapi\.com|grsai\.dakka\.com\.cn)(?:\/|$)/i.test(normalizedApiBaseUrl(baseUrl))
+}
+
+function grsaiImageEndpoint(baseUrl: string) {
+  return /\/(images\/(?:generations|edits))\/?(?:[?#].*)?$/i.exec(baseUrl.trim())?.[1]?.toLowerCase() ?? 'api/generate'
+}
+
+function grsaiMediaEndpoint(baseUrl: string, path: 'generate' | 'result') {
+  return `${new URL(normalizedApiBaseUrl(baseUrl)).origin}/v1/api/${path}`
+}
+
+const GRS_VIDEO_RATIOS = ['16:9', '9:16', '21:9', '4:3', '1:1', '3:4'] as const
+const GRS_VIDEO_MODELS = {
+  'minimax-h3': { resolutions: ['480p', '768p', '1080p'], ratios: ['16:9', '9:16'], minDuration: 1, maxDuration: 15, defaultDuration: 5, defaultResolution: '768p', images: 9, supportsFrames: false },
+  'agnes-video-2.5': { resolutions: ['720p', '1080p', '2k'], ratios: GRS_VIDEO_RATIOS, minDuration: 4, maxDuration: 12, defaultDuration: 5, defaultResolution: '720p', images: 5, supportsFrames: true },
+  'wan-3.0': { resolutions: ['480p', '720p', '1080p'], ratios: GRS_VIDEO_RATIOS, minDuration: 2, maxDuration: 30, defaultDuration: 5, defaultResolution: '720p', images: 10, supportsFrames: true },
+} as const
+
+export function getGrsaiVideoCapabilities(baseUrl: string, modelId: string) {
+  try { if (!baseUrl || !isGrsaiBaseUrl(baseUrl)) return undefined } catch { return undefined }
+  const model = modelId.trim().toLowerCase().split(/\s+/)[0]
+  return Object.hasOwn(GRS_VIDEO_MODELS, model) ? GRS_VIDEO_MODELS[model as keyof typeof GRS_VIDEO_MODELS] : undefined
+}
+
+const GRS_IMAGE_SIZES: Record<string, readonly [string, string, string]> = {
+  '1:1': ['1024x1024', '2048x2048', '2880x2880'],
+  '16:9': ['1280x720', '2048x1152', '3840x2160'],
+  '9:16': ['720x1280', '1152x2048', '2160x3840'],
+  '4:3': ['1152x864', '2304x1728', '3264x2448'],
+  '3:4': ['864x1152', '1728x2304', '2448x3264'],
+  '3:2': ['1536x1024', '2048x1360', '3504x2336'],
+  '2:3': ['1024x1536', '1360x2048', '2336x3504'],
+  '5:4': ['1120x896', '2240x1792', '3200x2560'],
+  '4:5': ['896x1120', '1792x2240', '2560x3200'],
+  '21:9': ['1456x624', '2912x1248', '3840x1648'],
+  '9:21': ['624x1456', '1248x2912', '1648x3840'],
+  '2:1': ['1536x768', '3072x1536', '3840x1920'],
+  '1:2': ['768x1536', '1536x3072', '1920x3840'],
+}
+
+const GRS_GPT_MODELS = /^(?:gpt-image-2(?:-vip|\.[56](?:-(?:flare|sunburst))?)?)$/i
+const GRS_NANO_RATIOS = ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '5:4', '4:5', '21:9']
+
+export function getGrsaiImageCapabilities(baseUrl: string, modelId: string) {
+  try { if (!baseUrl || !isGrsaiBaseUrl(baseUrl)) return undefined } catch { return undefined }
+  const model = modelId.trim().toLowerCase()
+  if (/^nano-banana(?:-|$)/.test(model)) {
+    return {
+      gpt: false, customRatio: false,
+      ratios: /^nano-banana-2(?:[.-]|$)/.test(model) ? [...GRS_NANO_RATIOS, '1:4', '4:1', '1:8', '8:1'] : GRS_NANO_RATIOS,
+      resolutions: ['1K', '2K', '4K'] as readonly ImageResolution[],
+      qualities: [] as readonly ImageQuality[], outputs: [] as readonly ImageOutput[],
+    }
+  }
+  if (!GRS_GPT_MODELS.test(model)) return undefined
+  const premium = /-(?:vip|flare|sunburst)$/.test(model)
+  const qualities: ImageQuality[] = premium ? ['auto', 'low', 'medium', 'high'] : ['auto']
+  if (model === 'gpt-image-2.5-sunburst') qualities.push('xhigh', 'max')
+  const outputs: ImageOutput[] = grsaiImageEndpoint(baseUrl) === 'images/edits' ? ['png'] : ['png', 'transparent-png']
+  if (model.startsWith('gpt-image-2.6')) outputs.push('gif')
+  if (model === 'gpt-image-2.6') outputs.push('svg')
+  return {
+    gpt: true, customRatio: model === 'gpt-image-2-vip',
+    ratios: ['auto', ...Object.keys(GRS_IMAGE_SIZES)],
+    resolutions: (premium ? ['1K', '2K', '4K'] : ['1K']) as readonly ImageResolution[],
+    qualities, outputs,
+  }
+}
+
+// Pixel sizes in HFSY's native image/create tables, indexed by resolution.
+const HFSY_IMAGE_SIZES: Record<string, readonly [string, string, string]> = {
+  '1:1': ['1024x1024', '2048x2048', '2880x2880'],
+  '5:4': ['1040x832', '2080x1664', '3200x2560'],
+  '9:16': ['720x1280', '1152x2048', '2160x3840'],
+  '16:9': ['1280x720', '2048x1152', '3840x2160'],
+  '4:3': ['1024x768', '2048x1536', '3264x2448'],
+  '3:2': ['1008x672', '2016x1344', '3504x2336'],
+  '4:5': ['832x1040', '1664x2080', '2560x3200'],
+  '3:4': ['768x1024', '1536x2048', '2448x3264'],
+  '2:3': ['672x1008', '1344x2016', '2336x3504'],
+  '21:9': ['1344x576', '2016x864', '3696x1584'],
+  '3:1': ['1008x336', '2016x672', '3504x1168'],
+}
+const HFSY_SEEDREAM_SIZES: Record<string, string> = {
+  '1:1': '1024x1024', '16:9': '1280x720', '4:3': '1024x768', '4:5': '1024x832',
+  '9:16': '720x1280', '2:1': '1024x512', '1.85:1': '1024x554', '2.4:1': '1024x427', '21:9': '1344x576',
+}
+
+export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
+  if (!isHfsyBaseUrl(baseUrl)) return undefined
+  const model = modelId.trim().toLowerCase()
+  const transparent = /^gpt-image-2\.[56]-(?:flare|sunburst)$/.test(model)
+  const standard = /^gpt-image-2(?:\.[56])?$/.test(model)
+  const pro = model === 'gpt-image-2pro' || model === 'gpt-image-2pro-4k'
+  const gemini = /^(?:gemini-3-pro-image-preview|gemini-3\.1-flash-image-preview|nano-banana-(?:2(?:\.1)?|pro))$/.test(model)
+  const seedream = model === 'seedream-5.0-pro'
+  const midjourney = /^(?:mj_imagine|mj_blend)$/.test(model)
+  if (!transparent && !standard && !pro && !gemini && !seedream && !midjourney) return undefined
+  const resolutions: readonly ImageResolution[] = standard || seedream ? ['1K'] : midjourney ? []
+    : pro ? (model.endsWith('-4k') ? ['2K', '4K'] : ['2K']) : ['1K', '2K', '4K']
+  const ratios = seedream ? Object.keys(HFSY_SEEDREAM_SIZES) : transparent
+    ? ['1:1', '5:4', '9:16', '16:9', '4:3', '3:1', '3:2', '3:4']
+    : Object.keys(HFSY_IMAGE_SIZES).filter((ratio) => ratio !== '3:1')
+  const outputs: readonly ImageOutput[] = transparent ? ['png', 'transparent-png'] : ['png']
+  const images = transparent ? 16 : standard ? 6 : seedream ? 10
+    : /^(?:nano-banana-pro|gemini-3-pro-image-preview|mj_)/.test(model) ? 7 : 4
+  return { ratios, resolutions, outputs, images, qualities: [] as readonly ImageQuality[], customRatio: midjourney }
+}
+
+export function getImageModelCapabilities(baseUrl: string, model: string) {
+  return getGrsaiImageCapabilities(baseUrl, model) ?? getHfsyImageCapabilities(baseUrl, model)
+}
+
+function numericAspectRatio(value: string) {
+  const [width, height] = value.split(/[:x]/i).map(Number)
+  return width > 0 && height > 0 && Number.isFinite(width / height) ? width / height : 1
+}
+
+export function resolveImageModelOptions(baseUrl: string, model: string, options: Pick<ImageGenerationOptions, 'aspectRatio' | 'resolution' | 'detail' | 'output'>) {
+  const capabilities = getImageModelCapabilities(baseUrl, model)
+  if (!capabilities) return options
+  const ratio = options.aspectRatio || '1:1'
+  const closest = capabilities.ratios.filter((value) => value !== 'auto').reduce((best, value) => {
+    const distance = (candidate: string) => Math.abs(Math.log(numericAspectRatio(candidate) / numericAspectRatio(ratio)))
+    return distance(value) < distance(best) ? value : best
+  }, '1:1')
+  return {
+    aspectRatio: capabilities.customRatio || capabilities.ratios.includes(ratio) ? ratio : closest,
+    resolution: options.resolution && capabilities.resolutions.includes(options.resolution) ? options.resolution : capabilities.resolutions[0],
+    detail: options.detail && capabilities.qualities.includes(options.detail) ? options.detail : capabilities.qualities[0],
+    output: options.output && capabilities.outputs.includes(options.output) ? options.output : capabilities.outputs[0],
+  }
+}
+
+function resolveGrsaiGptSize(model: string, ratio: string, resolution: ImageResolution) {
+  if (ratio === 'auto') return 'auto'
+  if (!/-(?:vip|flare|sunburst)$/i.test(model)) return ratio
+  const preset = GRS_IMAGE_SIZES[ratio]
+  if (preset) return preset[resolution === '4K' ? 2 : resolution === '2K' ? 1 : 0]
+
+  // Custom VIP dimensions must meet the pixel budget, edge and ratio limits.
+  const numeric = Math.min(3, Math.max(1 / 3, numericAspectRatio(ratio)))
+  const shape = Math.max(numeric, 1 / numeric)
+  const targetPixels = resolution === '4K' ? 8_294_400 : resolution === '2K' ? 4_194_304 : 1_048_576
+  const short = Math.floor(Math.sqrt(targetPixels / shape) / 16) * 16
+  const long = Math.min(3840, Math.floor(short * shape / 16) * 16)
+  return numeric >= 1 ? `${long}x${short}` : `${short}x${long}`
 }
 
 function isHfsyBaseUrl(baseUrl: string) {
@@ -552,7 +738,7 @@ async function mediaSourceForApiYi(source: string, signal?: AbortSignal) {
     ? `/apiyi/media?url=${encodeURIComponent(source)}`
     : source
   if (isRemote && typeof window === 'undefined') return source
-  const response = await fetch(readableSource, { signal })
+  const response = await providerFetch(readableSource, { signal })
   if (!response.ok) throw new GenerationRequestError('platform', '参考媒体无法读取', `媒体读取失败（${response.status}）`)
   const blob = await response.blob()
   return await new Promise<string>((resolve, reject) => {
@@ -591,7 +777,7 @@ async function waitForReplicatedVideoUrl(taskUrl: string, headers: HeadersInit, 
     if (url) return { url, payload }
     await waitForDelay(2_000, signal)
     try {
-      const response = await fetch(taskUrl, { headers, signal })
+      const response = await providerFetch(taskUrl, { headers, signal })
       if (response.ok) payload = await response.json() as unknown
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
@@ -607,13 +793,14 @@ export function apiYiGeneratedMediaUrl(source: string) {
 }
 
 function browserReadableImageResult(source: string, settings: ApiRequestSettings) {
+  if (isDesktopApp()) return source
   // The provider can return this CDN regardless of the configured gateway.
   // Normalize new outputs before archiving; older saved URLs are also handled
   // by prepareReferenceImageForRequest above.
   if (typeof window !== 'undefined') {
     try {
       const url = new URL(source)
-      if (url.protocol === 'https:' && url.hostname === 'www.qixinai.net') return apiYiGeneratedMediaUrl(source)
+      if (url.protocol === 'https:' && (url.hostname === 'www.qixinai.net' || url.hostname === HFSY_MEDIA_HOST || GRSAI_MEDIA_HOST.test(url.hostname))) return apiYiGeneratedMediaUrl(source)
     } catch { /* data/blob and relative URLs retain their existing handling */ }
   }
   if (typeof window === 'undefined' || !isVisionaryBaseUrl(settings.baseUrl) || !/^https?:\/\//i.test(source)) return source
@@ -680,7 +867,7 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
   })
   if (typeof window !== 'undefined') requestHeaders.set('X-DisyLab-APIYI-Origin', origin)
   try {
-    response = await fetch(taskEndpoint, {
+    response = await providerFetch(taskEndpoint, {
       method: 'POST',
       signal: options.signal,
       headers: requestHeaders,
@@ -728,7 +915,7 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
     await waitForDelay(20_000, options.signal)
     let poll: Response
     try {
-      poll = await fetch(`${taskEndpoint}/${encodeURIComponent(taskId)}`, {
+      poll = await providerFetch(`${taskEndpoint}/${encodeURIComponent(taskId)}`, {
         signal: options.signal,
         headers: requestHeaders,
       })
@@ -764,7 +951,7 @@ export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { s
   for (let round = 0; round < 3; round += 1) {
     for (const candidate of candidates) {
       try {
-        const response = await fetch(candidate.url, { signal: options.signal, headers: candidate.headers, cache: round ? 'reload' : 'default' })
+        const response = await providerFetch(candidate.url, { signal: options.signal, headers: candidate.headers, cache: round ? 'reload' : 'default' })
         if (!response.ok) {
           failures.push(`${response.status}`)
           continue
@@ -804,7 +991,7 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
   const resolution = videoResolutionFromSize(options.size)
   const requestedSeconds = [4, 6, 8].reduce((best, current) => Math.abs(current - options.seconds) < Math.abs(best - options.seconds) ? current : best, 4)
   const seconds = resolution === '1080p' || resolution === '4k' ? 8 : requestedSeconds
-  const response = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', '/v1/videos'), {
+  const response = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', '/v1/videos'), {
     method: 'POST',
     signal: options.signal,
     headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
@@ -826,7 +1013,7 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
   while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
     if (Date.now() - startedAt > 10 * 60_000) throw new GenerationRequestError('network', 'Veo 视频生成等待超时', `任务 ${taskId} 超过 10 分钟仍未完成`, { requestId: taskId })
     await waitForDelay(8_000, options.signal)
-    const poll = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    const poll = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (!poll.ok) throw await createApiError(poll)
     const job = await poll.json() as Record<string, unknown>
     status = videoTaskStatus(job, status)
@@ -838,7 +1025,7 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
   await waitForDelay(4_000, options.signal)
   let lastError: GenerationRequestError | null = null
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const content = await fetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    const content = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (content.ok) {
       const blob = await content.blob()
       if (blob.size) return { blob, taskId, progress: 100 }
@@ -879,7 +1066,7 @@ async function generateApiYiWanVideo(settings: ApiRequestSettings, options: Vide
     if (videos.length) input.reference_video_urls = await Promise.all(videos.map((source) => mediaSourceForApiYi(source, options.signal)))
     if (!images.length && !videos.length) throw new GenerationRequestError('platform', 'Wan 参考生视频缺少参考素材', '请选择至少一张参考图或一个参考视频后再生成。')
   }
-  const response = await fetch(apiYiVideoEndpoint(settings, '/apiyi/wan', '/wan/api/v1/services/aigc/video-generation/video-synthesis'), {
+  const response = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/wan', '/wan/api/v1/services/aigc/video-generation/video-synthesis'), {
     method: 'POST',
     signal: options.signal,
     headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' }),
@@ -905,7 +1092,7 @@ async function generateApiYiWanVideo(settings: ApiRequestSettings, options: Vide
   while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
     if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Wan 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`, { requestId: taskId })
     await waitForDelay(8_000, options.signal)
-    const poll = await fetch(apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
+    const poll = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (!poll.ok) throw await createApiError(poll)
     const job = await poll.json() as Record<string, unknown>
     status = videoTaskStatus(job, status)
@@ -1058,12 +1245,13 @@ const VENDOR_MODEL_SUPPLEMENTS: VendorModelSupplement[] = [
 ]
 
 /** GRS exposes the live catalogue at a host-root control path, not OpenAI `/v1/models`. */
-async function fetchGrsaiLiveCatalog(settings: Pick<ApiRequestSettings, 'baseUrl'>): Promise<RemoteModel[] | null> {
+async function fetchGrsaiLiveCatalog(settings: Pick<ApiRequestSettings, 'baseUrl'>, signal: AbortSignal): Promise<RemoteModel[] | null> {
   try {
-    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/serverGrsai/getModelList'), {
+    const response = await providerFetch(grsaiControlEndpoint(settings.baseUrl, 'client/serverGrsai/getModelList'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: '{}',
+      signal,
     })
     if (!response.ok) return null
     const payload = await response.json() as { code?: unknown; data?: { list?: unknown[] } }
@@ -1087,38 +1275,45 @@ async function fetchGrsaiLiveCatalog(settings: Pick<ApiRequestSettings, 'baseUrl
   }
 }
 
-/**
- * HFSY's OpenAI-compatible `/v1/models` can contain old channel entries after
- * they have been withdrawn. Its public model plaza is the source of truth for
- * the currently enabled catalogue, including the media modality.  The special
- * relay path is deliberately limited server-side to this one public endpoint.
- */
-async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>): Promise<RemoteModel[]> {
-  // Always use the documented www model plaza rather than whichever compatible
-  // API host the user chose for generation (www/api/apigo can differ by route).
+async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>, signal: AbortSignal): Promise<RemoteModel[]> {
+  // The public plaza omits some documented models. Include those only when
+  // returned by the user's authenticated catalogue.
   const plazaSettings = { ...settings, baseUrl: 'https://www.hfsyapi.cn/v1' }
-  const response = await fetch('/hfsy/__root__/api/pricing', {
-    headers: providerRelayHeaders(plazaSettings, { Accept: 'application/json' }),
+  const [account, plaza] = await Promise.all([
+    providerFetch(endpoint(settings.baseUrl, 'models'), { headers: compatibleApiHeaders(settings, { Accept: 'application/json' }), signal }),
+    providerFetch(typeof window === 'undefined' ? 'https://www.hfsyapi.cn/api/pricing' : '/hfsy/__root__/api/pricing', {
+      headers: providerRelayHeaders(plazaSettings, { Accept: 'application/json' }), signal,
+    }).then(async (response) => response.ok ? parseHfsyMarketplaceCatalog(await response.json() as unknown) : []).catch(() => []),
+  ])
+  if (!account.ok) throw new Error(await readError(account) || apiErrorSummary(account.status))
+  const available = parseRemoteModelCatalog(await account.json() as unknown)
+  const plazaById = new Map(plaza.map((model) => [model.id, model]))
+  const models = available.flatMap((model): RemoteModel[] => {
+    const listed = plazaById.get(model.id)
+    if (listed) return [listed]
+    if (getHfsyImageCapabilities(settings.baseUrl, model.id)) return [{ ...model, capability: 'image' }]
+    if (hfsyVideoLimits(model.id) || isHfsyNativeSeedance(model.id)) return [{ ...model, capability: 'video' }]
+    return model.capability === 'text' ? [model] : []
   })
-  if (!response.ok) throw new Error(await readError(response))
-  const models = parseHfsyMarketplaceCatalog(await response.json() as unknown)
-  if (!models.length) throw new Error('HFSY 模型广场没有返回当前可用模型')
+  if (!models.length) throw new Error('HFSY 未返回当前 API Key 可用的已识别模型')
   return models
 }
 
 export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<RemoteModel[]> {
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
-  if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings)
+  const signal = AbortSignal.timeout(15_000)
+  if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings, signal)
   const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
   // GRS has no standard OpenAI-compatible model endpoint. Prefer the live
   // host-root catalogue; do not fall back to a static list when it fails.
   if (supplement?.catalogOnly) {
-    const models = await fetchGrsaiLiveCatalog(settings)
+    const models = await fetchGrsaiLiveCatalog(settings, signal)
     if (!models) throw new Error('GRS AI 当前模型目录不可用，请稍后重新刷新')
     return models
   }
-  const response = await fetch(endpoint(settings.baseUrl, 'models'), {
+  const response = await providerFetch(endpoint(settings.baseUrl, 'models'), {
     headers: compatibleApiHeaders(settings),
+    signal,
   })
   if (!response.ok) {
     // A response means the provider evaluated the request. In particular, do
@@ -1135,6 +1330,8 @@ export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'base
 /** OpenAI-compatible asynchronous video job. Large media stays as a Blob and is
  * never converted to base64, keeping React state and canvas snapshots small. */
 async function generateRemoteVideoRequest(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const grsai = getGrsaiVideoCapabilities(settings.baseUrl, settings.model)
+  if (grsai) return generateGrsaiVideo(settings, options, grsai)
   if (isHfsyBaseUrl(settings.baseUrl)) return generateHfsyVideo(settings, options)
   if (isEvolinkBaseUrl(settings.baseUrl)) return generateEvolinkVideo(settings, options)
   if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedance|doubao-seedance/i.test(settings.model)) {
@@ -1154,35 +1351,35 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   if (options.mode) form.set('mode', options.mode)
   if (typeof options.generateAudio === 'boolean') form.set('generate_audio', String(options.generateAudio))
   for (const [index, image] of (options.referenceImages ?? []).entries()) {
-    const reference = await fetch(image, { signal: options.signal })
+    const reference = await providerFetch(image, { signal: options.signal })
     if (!reference.ok) throw new GenerationRequestError('platform', '参考图片无法读取', `图片读取失败（${reference.status}）`)
     form.append('reference_images', await reference.blob(), `reference-${index + 1}.png`)
   }
   if (options.firstFrame) {
-    const first = await fetch(options.firstFrame, { signal: options.signal })
+    const first = await providerFetch(options.firstFrame, { signal: options.signal })
     if (!first.ok) throw new GenerationRequestError('platform', '首帧图片无法读取', `图片读取失败（${first.status}）`)
     form.set('first_frame', await first.blob(), 'first-frame.png')
   }
   if (options.lastFrame) {
-    const last = await fetch(options.lastFrame, { signal: options.signal })
+    const last = await providerFetch(options.lastFrame, { signal: options.signal })
     if (!last.ok) throw new GenerationRequestError('platform', '尾帧图片无法读取', `图片读取失败（${last.status}）`)
     form.set('last_frame', await last.blob(), 'last-frame.png')
   }
   const referenceVideos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
   for (const [index, source] of referenceVideos.entries()) {
-    const video = await fetch(source, { signal: options.signal })
+    const video = await providerFetch(source, { signal: options.signal })
     if (!video.ok) throw new GenerationRequestError('platform', '参考视频无法读取', `视频读取失败（${video.status}）`)
     if (referenceVideos.length === 1) form.set('reference_video', await video.blob(), 'reference-video.mp4')
     else form.append('reference_videos', await video.blob(), `reference-video-${index + 1}.mp4`)
   }
   if (options.referenceImage) {
-    const reference = await fetch(options.referenceImage, { signal: options.signal })
+    const reference = await providerFetch(options.referenceImage, { signal: options.signal })
     if (!reference.ok) throw new GenerationRequestError('platform', '首帧图片无法读取', `图片读取失败（${reference.status}）`)
     form.set('input_reference', await reference.blob(), 'start-frame.png')
   }
   let createdResponse: Response
   try {
-    createdResponse = await fetch(endpoint(settings.baseUrl, 'videos'), { method: 'POST', headers: compatibleApiHeaders(settings), body: form, signal: options.signal })
+    createdResponse = await providerFetch(endpoint(settings.baseUrl, 'videos'), { method: 'POST', headers: compatibleApiHeaders(settings), body: form, signal: options.signal })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw createNetworkError(error)
@@ -1203,7 +1400,7 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
     await waitForDelay(2_500, options.signal)
     let pollResponse: Response
     try {
-      pollResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}`), { headers: compatibleApiHeaders(settings), signal: options.signal })
+      pollResponse = await providerFetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}`), { headers: compatibleApiHeaders(settings), signal: options.signal })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       consecutivePollErrors += 1
@@ -1238,12 +1435,70 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
       throw new GenerationRequestError('network', '视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId, resultUrls: [completedUrl] })
     }
   }
-  const contentResponse = await fetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: compatibleApiHeaders(settings), signal: options.signal })
+  const contentResponse = await providerFetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: compatibleApiHeaders(settings), signal: options.signal })
   if (!contentResponse.ok) throw await createApiError(contentResponse)
   const blob = await contentResponse.blob()
   if (!blob.size) throw new GenerationRequestError('platform', '视频服务返回了空文件', `任务 ${taskId}`)
   options.onProgress?.(100, 'completed')
   return { blob, taskId, progress: 100 }
+}
+
+async function generateGrsaiVideo(settings: ApiRequestSettings, options: VideoGenerationOptions, capabilities: NonNullable<ReturnType<typeof getGrsaiVideoCapabilities>>): Promise<GeneratedVideo> {
+  const isH3 = settings.model.toLowerCase() === 'minimax-h3'
+  const resolution = options.resolution ?? capabilities.defaultResolution
+  const maxSeconds = isH3 && resolution === '1080p' ? 10 : capabilities.maxDuration
+  const invalid = (detail: string) => new GenerationRequestError('platform', 'GRS AI 视频参数不受支持', `${detail}，生成尚未提交。`)
+  if (!capabilities.resolutions.some((value) => value === resolution)) throw invalid(`当前模型支持 ${capabilities.resolutions.join('、')}`)
+  if (!Number.isInteger(options.seconds) || options.seconds < capabilities.minDuration || options.seconds > maxSeconds) {
+    throw invalid(`${settings.model} 在 ${resolution} 下支持 ${capabilities.minDuration}–${maxSeconds} 秒`)
+  }
+  if (options.referenceVideo || options.referenceVideos?.length) throw invalid('当前 GRS AI 模型暂不接收参考视频')
+  const firstFrame = options.firstFrame ?? options.referenceImage
+  const lastFrame = options.lastFrame
+  const references = options.referenceImages?.filter(Boolean) ?? []
+  if (lastFrame && (!firstFrame || !capabilities.supportsFrames)) throw invalid('该模型的首尾帧模式不可用或缺少首帧')
+  if ((firstFrame || lastFrame) && references.length) throw invalid('首尾帧和参考图不能在同一次请求中使用')
+  if (references.length > capabilities.images) throw invalid(`当前模型最多支持 ${capabilities.images} 张参考图`)
+  if (options.aspectRatio && !capabilities.ratios.some((value) => value === options.aspectRatio)) throw invalid(`当前模型支持 ${capabilities.ratios.join('、')}`)
+  const ratio = options.aspectRatio ?? capabilities.ratios.reduce<string>((best, value) => {
+    const distance = (candidate: string) => Math.abs(Math.log(numericAspectRatio(candidate) / numericAspectRatio(options.size)))
+    return distance(value) < distance(best) ? value : best
+  }, capabilities.ratios[0])
+  const mediaInput = async (source: string) => publicImageSourceUrl(source)
+    ?? (await blobToDataUrl(await readImageSourceBlob(source, options.signal))).split(',')[1]
+  const body = {
+    model: settings.model,
+    prompt: options.prompt,
+    aspectRatio: isH3 ? ratio === '9:16' ? 'portrait' : 'landscape' : ratio,
+    resolution,
+    duration: options.seconds,
+    replyType: 'async',
+    ...(firstFrame && !isH3 ? { firstFrame: await mediaInput(firstFrame) } : {}),
+    ...(lastFrame ? { lastFrame: await mediaInput(lastFrame) } : {}),
+    ...(firstFrame && isH3 ? { images: [await mediaInput(firstFrame)] } : references.length ? { images: await Promise.all(references.map(mediaInput)) } : {}),
+  }
+  const response = await providerFetch(grsaiMediaEndpoint(settings.baseUrl, 'generate'), {
+    method: 'POST', signal: options.signal,
+    headers: { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const created: unknown = await response.json()
+  const taskId = extractProviderTaskId(created)
+  if (taskId) options.onTaskId?.(taskId)
+  const completed = await resolveGrsaiMediaResult(settings, created, options.signal, '视频', (percent, status) => {
+    if (percent !== undefined) options.onProgress?.(percent, status)
+  })
+  const sourceUrl = extractGeneratedImages(completed).find(({ url }) => /^https?:\/\//i.test(url))?.url
+  if (!sourceUrl) throw new GenerationRequestError('platform', 'GRS AI 未返回可下载的视频', '请检查服务商任务记录。', { requestId: taskId || undefined })
+  try {
+    const blob = await downloadGeneratedVideoBlob(sourceUrl, { signal: options.signal })
+    options.onProgress?.(100, 'completed')
+    return { blob, taskId, progress: 100, sourceUrl }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new GenerationRequestError('network', 'GRS AI 视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId || undefined, resultUrls: [sourceUrl] })
+  }
 }
 
 /** HFSY video models use a shared JSON create/query protocol rather than the
@@ -1271,40 +1526,78 @@ export function publicImageSourceUrl(source?: string): string | undefined {
   } catch { return undefined }
 }
 
-function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video') {
+function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video' | 'audio') {
   const url = publicImageSourceUrl(source)
   if (url) return url
-  const label = kind === 'image' ? '图片' : '视频'
+  const label = kind === 'image' ? '图片' : kind === 'video' ? '视频' : '音频'
   throw new GenerationRequestError('platform', 'HFSY 仅支持公网素材链接', `请先将本地${label}上传到可公开访问的地址，再把 URL 用作参考素材。视频生成尚未提交。`)
 }
 
-/** Limits from the HFSY public model docs; unknown IDs are not guessed. */
-export function hfsyVideoLimits(model: string) {
-  if (/^sd-2\.5-(480|720)$/.test(model)) return { minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, prompt: 5000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9'] }
-  if (/^sd-2\.0(?:-mini|-480|-fast|-fast-480)?$/.test(model)) return { minSeconds: 4, maxSeconds: 15, images: 4, videos: 3, prompt: 5000, ratios: ['9:16', '16:9', '1:1', '21:9', '4:3', '3:4'] }
-  if (/^sd-2(?:-vip(?:-720)?|-mini-(480|720)|-1080-cheap)$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 15000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'] }
-  if (/^sd-2(?:-fast)?$/.test(model)) return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, prompt: 5000, ratios: ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'] }
-  if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 0, prompt: 2000, ratios: ['9:16', '16:9'] }
-  if (model === 'sora-2') return { minSeconds: 4, maxSeconds: 12, images: 1, videos: 0, prompt: 10000, durations: [4, 8, 12] }
-  if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, prompt: 5000, durations: [6, 10, 15] }
-  if (model === 'kling-o3') return { minSeconds: 5, maxSeconds: 15, images: 2, videos: 0, prompt: 5000 }
+function hfsyFailureDetail(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return ''
+  const root = payload as Record<string, unknown>
+  const data = root.data && typeof root.data === 'object' ? root.data as Record<string, unknown> : undefined
+  for (const value of [data?.fail_reason, root.fail_reason, data?.error, root.error, root.success === false ? root.message : undefined]) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (value && typeof value === 'object' && 'message' in value && typeof value.message === 'string') return value.message.trim()
+  }
+  return root.success === false ? 'HFSY 返回请求失败' : ''
+}
+
+function hfsyTaskUrl(settings: ApiRequestSettings, kind: 'image' | 'video', taskId: string, queryParameter = false) {
+  const path = endpoint(settings.baseUrl, `${kind}/query`)
+  return queryParameter ? `${path}?id=${encodeURIComponent(taskId)}` : `${path}/${encodeURIComponent(taskId)}`
+}
+
+type HfsyVideoLimits = {
+  minSeconds: number; maxSeconds: number; images: number; videos: number; audios: number; prompt: number
+  ratios?: readonly string[]; durations?: readonly number[]; minImages?: number; minReferenceImages?: number; maxAssets?: number; audioRequiresImage?: boolean
+}
+const HFSY_VERTICAL_RATIOS = ['9:16', '16:9']
+const HFSY_VIDEO_RATIOS = [...HFSY_VERTICAL_RATIOS, '3:4', '1:1', '4:3']
+const HFSY_SEEDANCE_RATIOS = [...HFSY_VIDEO_RATIOS, '21:9']
+const HFSY_LEGACY_SEEDANCE = { minSeconds: 5, maxSeconds: 15, images: 9, videos: 3, audios: 3, prompt: 10_000, ratios: HFSY_SEEDANCE_RATIOS, audioRequiresImage: true }
+export const isHfsyNativeSeedance = (model: string) => /^doubao-seedance-2\.(?:0(?:-fast|-mini)?|5)$/i.test(model)
+
+/** Prefer per-model limits over grouped examples in the HFSY docs. */
+export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
+  model = model.trim().toLowerCase()
+  if (/^sd-2\.5(?:-(?:480|720|1080))?(?:-v2)?$/.test(model)) return {
+    minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, audios: 10,
+    prompt: model.endsWith('-v2') || model === 'sd-2.5' ? 15_000 : 10_000, ratios: HFSY_VIDEO_RATIOS,
+  }
+  if (/^sd-2\.0(?:-(?:(?:mini|fast)(?:-(?:480|720))?|480|720))?$/.test(model)) return {
+    ...HFSY_LEGACY_SEEDANCE,
+    minSeconds: model.endsWith('-mini-480') ? 5 : 4,
+    images: /-mini(?:-720)?$/.test(model) ? 4 : 9,
+    audios: /-mini(?:-720)?$/.test(model) ? 1 : 3,
+    prompt: model.endsWith('-mini') ? 5_000 : /-fast|-mini-480/.test(model) ? 10_000 : 3_500,
+    ratios: model.endsWith('-mini') ? [...HFSY_VERTICAL_RATIOS, '1:1'] : HFSY_SEEDANCE_RATIOS,
+  }
+  if (/^sd-2(?:-(?:(?:vip|mini|fast)(?:-(?:480|720))?|1080-cheap))?$/.test(model)) return {
+    ...HFSY_LEGACY_SEEDANCE,
+    prompt: model === 'sd-2' ? 5_000 : /-1080-cheap|-(?:vip|mini)$/.test(model) ? 15_000 : 10_000,
+  }
+  if (/^wan-3\.0(?:-(?:480|720|1080))?$/.test(model)) return { minSeconds: 2, maxSeconds: 30, images: 10, videos: 5, audios: 5, prompt: 5000, ratios: model === 'wan-3.0' ? HFSY_VIDEO_RATIOS : HFSY_SEEDANCE_RATIOS }
+  if (model === 'video-2.5') return { minSeconds: 4, maxSeconds: 12, images: 5, videos: 1, audios: 3, prompt: 10_000, ratios: HFSY_SEEDANCE_RATIOS }
+  if (/^muse[-_]video$/.test(model)) return { minSeconds: model === 'muse_video' ? 1 : 4, maxSeconds: 30, images: 10, videos: 10, audios: 10, prompt: 10_000, maxAssets: 10, ratios: HFSY_VERTICAL_RATIOS }
+  if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 0, audios: 3, minImages: 1, prompt: 7000, ratios: HFSY_VERTICAL_RATIOS }
+  if (model === 'sora-2') return { minSeconds: 4, maxSeconds: 12, images: 1, videos: 0, audios: 0, prompt: 10_000, durations: [4, 8, 12], ratios: HFSY_VERTICAL_RATIOS }
+  if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, audios: 0, minReferenceImages: 2, prompt: 5000, durations: [6, 10, 15], ratios: [...HFSY_VERTICAL_RATIOS, '4:3', '3:4', '3:2', '2:3'] }
+  if (model === 'kling-o3') return { minSeconds: 5, maxSeconds: 15, images: 8, videos: 0, audios: 0, prompt: 5000, ratios: [...HFSY_VERTICAL_RATIOS, '1:1'] }
   return undefined
 }
 
 async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
-  const ratio = options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1'
+  const ratio = options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio
+    : options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1'
     : /^\d+:\d+$/.test(options.size) ? options.size
     : apiYiVideoRatio(options.size) === 'adaptive' ? '16:9' : apiYiVideoRatio(options.size)
   const [ratioWidth, ratioHeight] = ratio.split(':').map(Number)
   const videos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
-  const body: Record<string, unknown> = {
-    model: settings.model,
-    prompt: options.prompt,
-    duration: options.seconds,
-    ratio,
-    orientation: ratioWidth < ratioHeight ? 'portrait' : 'landscape',
-    watermark: false,
-  }
+  const audios = Array.from(new Set(options.referenceAudios?.map((url) => url.trim()).filter(Boolean) ?? []))
+  const nativeSeedance = isHfsyNativeSeedance(settings.model)
+  const model = settings.model.toLowerCase()
   const imageSources = options.mode === 'first_last_frame'
     ? [options.firstFrame, options.lastFrame]
     : options.mode === 'image2video'
@@ -1317,26 +1610,63 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     : Array.from(new Set(imageSources.filter((url): url is string => Boolean(url))))
   const limits = hfsyVideoLimits(settings.model)
   const invalid = (detail: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', `${detail}。视频生成尚未提交。`) }
+  if (!options.prompt.trim()) invalid('请先填写视频提示词')
+  if (nativeSeedance && (!Number.isInteger(options.seconds) || (options.seconds !== -1 && (options.seconds < 4 || options.seconds > 30)))) invalid('豆包 Seedance 接口接受 4–30 秒或自动时长')
   if (limits) {
     if (!Number.isInteger(options.seconds) || options.seconds < limits.minSeconds || options.seconds > limits.maxSeconds || (limits.durations && !limits.durations.includes(options.seconds))) invalid(`${settings.model} 时长需为 ${limits.durations?.join(' / ') || `${limits.minSeconds}–${limits.maxSeconds}`} 秒`)
     if (images.length > limits.images) invalid(`${settings.model} 最多支持 ${limits.images} 张图片`)
+    if (limits.minImages && images.length < limits.minImages) invalid(`${settings.model} 至少需要 ${limits.minImages} 张参考图`)
+    if (limits.minReferenceImages && images.length && images.length < limits.minReferenceImages) invalid(`${settings.model} 使用图片参考时至少需要 ${limits.minReferenceImages} 张图`)
     if (videos.length > limits.videos) invalid(limits.videos ? `${settings.model} 最多支持 ${limits.videos} 个参考视频` : `${settings.model} 不支持视频参考，请选择支持视频参考的模型`)
-    if (options.prompt.length > limits.prompt) invalid(`${settings.model} 提示词不得超过 ${limits.prompt} 字符`)
-    if ('ratios' in limits && limits.ratios && !limits.ratios.includes(ratio)) invalid(`${settings.model} 不支持 ${ratio} 比例`)
+    if (audios.length > limits.audios) invalid(limits.audios ? `${settings.model} 最多支持 ${limits.audios} 个参考音频` : `${settings.model} 不支持音频参考`)
+    if (limits.maxAssets && images.length + videos.length + audios.length > limits.maxAssets) invalid(`${settings.model} 最多支持 ${limits.maxAssets} 个参考素材`)
+    if (audios.length && limits.audioRequiresImage && !images.length) invalid('使用音频参考时至少需要一张参考图')
+    if (Array.from(options.prompt).length > limits.prompt) invalid(`${settings.model} 提示词不得超过 ${limits.prompt} 字符`)
+    if (limits.ratios && !limits.ratios.includes(ratio)) invalid(`${settings.model} 不支持 ${ratio} 比例`)
   }
   if (options.mode === 'text2video' && (images.length || videos.length)) invalid('文生视频不能携带图片或视频，请切换参考模式')
   if (options.mode === 'image2video' && images.length !== 1) invalid('图生视频需要一张首帧图片')
   if (options.mode === 'first_last_frame' && images.length !== 2) invalid('首尾帧需要两张图片')
-  if (options.mode === 'all_reference' && !images.length && !videos.length) invalid('全能参考需要图片或视频素材')
-  const publicImages: string[] = []
-  const publicVideos: string[] = []
-  for (const image of images) publicImages.push(requireHfsyPublicMediaUrl(image, 'image'))
-  for (const video of videos) publicVideos.push(requireHfsyPublicMediaUrl(video, 'video'))
-  if (publicImages.length) body.images = publicImages
-  if (publicVideos.length) body.videos = publicVideos
+  if (options.mode === 'all_reference' && !images.length && !videos.length && !audios.length) invalid('全能参考需要图片、视频或音频素材')
+  const publicImages = images.map((image) => requireHfsyPublicMediaUrl(image, 'image'))
+  const publicVideos = videos.map((video) => requireHfsyPublicMediaUrl(video, 'video'))
+  const publicAudios = audios.map((audio) => {
+    if (!nativeSeedance) return requireHfsyPublicMediaUrl(audio, 'audio')
+    if (/^asset:\/\/[A-Za-z0-9_-]+$/.test(audio)) return audio
+    return invalid('豆包 Seedance 的参考音频须为已审核的 asset:// 素材')
+  })
+  const body = nativeSeedance ? {
+    model: settings.model,
+    duration: options.seconds,
+    ratio: options.aspectRatio === 'auto' ? undefined : ratio,
+    resolution: options.resolution,
+    generate_audio: options.generateAudio,
+    content: [
+      { type: 'text', text: options.prompt },
+      ...publicImages.map((url, index) => ({
+        type: 'image_url', image_url: { url },
+        role: options.mode === 'first_last_frame' ? (index === 0 ? 'first_frame' : 'last_frame')
+          : options.mode === 'image2video' ? 'first_frame' : 'reference_image',
+      })),
+      ...publicVideos.map((url) => ({ type: 'video_url', video_url: { url }, role: 'reference_video' })),
+      ...publicAudios.map((url) => ({ type: 'audio_url', audio_url: { url }, role: 'reference_audio' })),
+    ],
+  } : {
+    model: settings.model,
+    prompt: options.prompt,
+    duration: options.seconds,
+    ...(!['minimax-h3', 'kling-o3', 'sora-2'].includes(model) ? { ratio } : {}),
+    ...(!/^muse[-_]video$/.test(model) ? {
+      orientation: model === 'kling-o3' && ratio === '1:1' ? 'square' : ratioWidth < ratioHeight ? 'portrait' : 'landscape',
+    } : {}),
+    ...(/^(?:sd-2|sora-2|grok-imagine-video-1\.5)/.test(model) ? { watermark: false } : {}),
+    ...(publicImages.length ? { images: publicImages } : {}),
+    ...(publicVideos.length ? { videos: publicVideos } : {}),
+    ...(publicAudios.length ? { audios: publicAudios } : {}),
+  }
   let createdResponse: Response
   try {
-    createdResponse = await fetch(endpoint(settings.baseUrl, 'video/create'), {
+    createdResponse = await providerFetch(endpoint(settings.baseUrl, 'video/create'), {
       method: 'POST', signal: options.signal,
       headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
@@ -1347,20 +1677,22 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   }
   if (!createdResponse.ok) throw await createApiError(createdResponse)
   let task = await createdResponse.json() as unknown
-  if (task && typeof task === 'object' && 'success' in task && task.success === false) {
-    const detail = 'message' in task && typeof task.message === 'string' ? task.message : sanitizeAdminLogJson(task)
-    throw new GenerationRequestError('api', '视频接口拒绝了生成参数', detail)
-  }
+  const createFailure = hfsyFailureDetail(task)
+  if (createFailure) throw new GenerationRequestError('api', '视频接口拒绝了生成参数', createFailure)
   const taskId = extractTaskId(task)
   if (!taskId) throw new GenerationRequestError('platform', 'HFSY 没有返回视频任务编号', sanitizeAdminLogJson(task))
   options.onTaskId?.(taskId)
   const startedAt = Date.now()
   let pollSettings = settings
+  let queryParameter = false
   let consecutiveFailures = 0
   while (Date.now() - startedAt < 30 * 60_000) {
-    const status = videoTaskStatus(task)
+    const status = extractProviderTaskStatus(task)
+    if (['failed', 'failure', 'error', 'expired', 'cancelled', 'canceled', 'violation', 'rejected'].includes(status)) {
+      throw new GenerationRequestError('api', 'HFSY 视频生成失败', hfsyFailureDetail(task) || sanitizeAdminLogJson(task), { requestId: taskId })
+    }
     const sourceUrl = videoResultUrl(task)
-    if (sourceUrl) {
+    if (sourceUrl && (!status || /^(?:success|succeeded|completed|complete)$/.test(status))) {
       let blob: Blob
       try {
         blob = await downloadGeneratedVideoBlob(sourceUrl, {
@@ -1375,11 +1707,10 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
       options.onProgress?.(100, 'completed')
       return { blob, taskId, progress: 100, sourceUrl }
     }
-    if (['failed', 'failure', 'error', 'expired', 'cancelled', 'canceled', 'violation', 'rejected'].includes(status)) throw new GenerationRequestError('api', 'HFSY 视频生成失败', sanitizeAdminLogJson(task), { requestId: taskId })
-    options.onProgress?.(Math.min(95, Math.max(1, Number((task as Record<string, unknown>)?.progress) || 0)), status)
+    options.onProgress?.(Math.min(99, providerTaskPercent(task) ?? 0), status || 'queued')
     await waitForDelay(3_000, options.signal)
     try {
-      const poll = await fetch(`${endpoint(pollSettings.baseUrl, 'video/query')}?id=${encodeURIComponent(taskId)}`, {
+      const poll = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
         signal: options.signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
       })
       // HFSY's notice specifies api.hfsyapi.cn as the query fallback for 504s.
@@ -1387,11 +1718,15 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
         pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
         continue
       }
+      if (poll.status === 404 && !queryParameter) {
+        queryParameter = true
+        continue
+      }
       if (!poll.ok) throw await createApiError(poll)
       task = await poll.json() as unknown
-      if (task && typeof task === 'object' && 'success' in task && task.success === false) {
-        const detail = 'message' in task && typeof task.message === 'string' ? task.message : sanitizeAdminLogJson(task)
-        throw new GenerationRequestError('api', 'HFSY 视频任务查询失败', detail, { requestId: taskId })
+      const queryFailure = hfsyFailureDetail(task)
+      if (queryFailure && !/^(?:failed|failure|error|expired|cancelled|canceled|violation|rejected)$/.test(extractProviderTaskStatus(task))) {
+        throw new GenerationRequestError('api', 'HFSY 视频任务查询失败', queryFailure, { requestId: taskId })
       }
       consecutiveFailures = 0
     } catch (error) {
@@ -1408,7 +1743,7 @@ async function waitForEvolinkTask(settings: ApiRequestSettings, taskId: string, 
   const startedAt = Date.now()
   while (Date.now() - startedAt < 30 * 60_000) {
     await waitForDelay(3_000, signal)
-    const response = await fetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
+    const response = await providerFetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
       signal,
       headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, Accept: 'application/json' }),
     })
@@ -1428,7 +1763,7 @@ async function generateEvolinkVideo(settings: ApiRequestSettings, options: Video
     ...(options.referenceImages ?? []), options.firstFrame, options.lastFrame, options.referenceImage,
   ].filter((value): value is string => Boolean(value))))
   const videoUrls = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((value): value is string => Boolean(value))))
-  const response = await fetch(endpoint(settings.baseUrl, 'videos/generations'), {
+  const response = await providerFetch(endpoint(settings.baseUrl, 'videos/generations'), {
     method: 'POST', signal: options.signal,
     headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
     body: JSON.stringify({
@@ -1462,7 +1797,7 @@ async function generateEvolinkVideo(settings: ApiRequestSettings, options: Video
  * are accepted through `extra` so new documented audio models remain usable
  * without weakening the generic OpenAI-compatible request paths. */
 export async function generateRemoteAudio(settings: ApiRequestSettings, options: AudioGenerationOptions): Promise<GeneratedAudio> {
-  const response = await fetch(endpoint(settings.baseUrl, 'audios/generations'), {
+  const response = await providerFetch(endpoint(settings.baseUrl, 'audios/generations'), {
     method: 'POST', signal: options.signal,
     headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
     body: JSON.stringify({
@@ -1484,7 +1819,7 @@ export async function generateRemoteAudio(settings: ApiRequestSettings, options:
   const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
   const sourceUrl = extractProviderImages(completed)[0]?.url
   if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 音频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
-  const mediaResponse = await fetch(sourceUrl, { signal: options.signal })
+  const mediaResponse = await providerFetch(sourceUrl, { signal: options.signal })
   if (!mediaResponse.ok) throw new GenerationRequestError('network', 'Evolink 音频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
   return { blob: await mediaResponse.blob(), taskId, progress: 100, sourceUrl, payload: completed }
 }
@@ -1508,6 +1843,7 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
     generateAudio: options.generateAudio,
     referenceImageCount: (options.referenceImages?.length ?? 0) + (options.referenceImage ? 1 : 0) + (options.firstFrame ? 1 : 0) + (options.lastFrame ? 1 : 0),
     referenceVideoCount: (options.referenceVideos?.length ?? 0) + (options.referenceVideo ? 1 : 0),
+    referenceAudioCount: options.referenceAudios?.length ?? 0,
   })
   try {
     const result = await generateRemoteVideoRequest(settings, options)
@@ -1563,7 +1899,7 @@ export type CurrencyRate = {
 }
 
 export async function fetchUsdToCnyRate(): Promise<CurrencyRate> {
-  const response = await fetch('https://api.frankfurter.app/latest?from=USD&to=CNY', {
+  const response = await providerFetch('https://api.frankfurter.app/latest?from=USD&to=CNY', {
     headers: { Accept: 'application/json' },
   })
   if (!response.ok) throw new Error(`汇率服务暂不可用（${response.status}）`)
@@ -1591,7 +1927,7 @@ export async function fetchProviderModelPrices(baseUrl: string): Promise<Provide
   const normalizedBase = normalizedApiBaseUrl(baseUrl)
   if (/api\.apiyi\.com|apiyi\.com/i.test(normalizedBase)) {
     const apiYiOrigin = new URL(normalizedBase).origin
-    const response = await fetch(`${apiYiOrigin}/api/pricing`, {
+    const response = await providerFetch(`${apiYiOrigin}/api/pricing`, {
       headers: { Accept: 'application/json' },
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
@@ -1616,7 +1952,7 @@ export async function fetchProviderModelPrices(baseUrl: string): Promise<Provide
   }
   if (!isGrsaiBaseUrl(baseUrl)) return []
   const origin = new URL(normalizedApiBaseUrl(baseUrl)).origin
-  const response = await fetch(`${origin}/client/serverGrsai/getModelList`, {
+  const response = await providerFetch(`${origin}/client/serverGrsai/getModelList`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: '{}',
@@ -1650,7 +1986,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
     throw new Error('HFSY 官方公开 API 暂未提供余额查询接口；请在 HFSY 控制台查看余额。')
   }
   if (isEvolinkBaseUrl(normalizedBase)) {
-    const response = await fetch(endpoint(normalizedBase, 'credits'), {
+    const response = await providerFetch(endpoint(normalizedBase, 'credits'), {
       headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' }),
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
@@ -1662,7 +1998,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
     return { provider: 'Evolink', amount, unit: '积分', updatedAt: new Date().toISOString() }
   }
   if (/api\.apimart\.ai|apimart\.ai/i.test(normalizedBase)) {
-    const response = await fetch('https://api.apimart.ai/v1/balance', {
+    const response = await providerFetch('https://api.apimart.ai/v1/balance', {
       headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' },
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
@@ -1677,7 +2013,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
     const token = settings.balanceToken?.trim()
     if (!token) throw new Error('请填写 APIYI 个人中心生成的余额查询 AccessToken')
     const apiYiOrigin = new URL(normalizedBase).origin
-    const response = await fetch(`${apiYiOrigin}/api/user/self`, {
+    const response = await providerFetch(`${apiYiOrigin}/api/user/self`, {
       headers: { Accept: 'application/json', Authorization: token, 'Content-Type': 'application/json' },
     })
     if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
@@ -1731,7 +2067,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
   const requestCredits = async (path: 'getAPIKeyCredits' | 'getCredits', label: string) => {
     // Query the generation key itself. The common getCredits endpoint reports
     // the owning account's pool and ignores a per-key credit limit.
-    const response = await fetch(grsaiControlEndpoint(settings.baseUrl, `client/openapi/${path}`), {
+    const response = await providerFetch(grsaiControlEndpoint(settings.baseUrl, `client/openapi/${path}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiKey }),
@@ -1746,7 +2082,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
     // for older domestic nodes that have not rolled out the common endpoint.
     const url = new URL(grsaiControlEndpoint(settings.baseUrl, 'client/common/getCredits'))
     url.searchParams.set('apikey', apiKey)
-    const response = await fetch(url.toString(), { headers: { Accept: 'application/json' } })
+    const response = await providerFetch(url.toString(), { headers: { Accept: 'application/json' } })
     if (response.ok) {
       const payload = await response.json() as { code?: unknown; msg?: unknown; data?: unknown; credits?: unknown }
       return parseGrsCredits({ ...payload, data: payload.data ?? payload.credits }, '账户积分余额')
@@ -1765,6 +2101,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
 export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<void> {
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   if (!settings.apiKey.trim()) throw new Error('API Key 不能为空')
+  const signal = AbortSignal.timeout(15_000)
   const supplement = VENDOR_MODEL_SUPPLEMENTS.find((entry) => entry.match(normalizedBase))
   if (supplement?.catalogOnly) {
     // GRS documents this account endpoint specifically for querying an API key's
@@ -1772,10 +2109,11 @@ export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 
     // generation, unlike the static local catalog which proves nothing about it.
     let response: Response
     try {
-      response = await fetch(grsaiControlEndpoint(settings.baseUrl, 'client/openapi/getAPIKeyCredits'), {
+      response = await providerFetch(grsaiControlEndpoint(settings.baseUrl, 'client/openapi/getAPIKeyCredits'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey: settings.apiKey.trim() }),
+        signal,
       })
     } catch (error) {
       throw new Error(error instanceof Error ? `无法验证 GRS AI API Key：${error.message}` : '无法验证 GRS AI API Key，请检查地址和网络')
@@ -1794,8 +2132,9 @@ export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 
   }
   let response: Response
   try {
-    response = await fetch(endpoint(settings.baseUrl, 'models'), {
+    response = await providerFetch(endpoint(settings.baseUrl, 'models'), {
       headers: compatibleApiHeaders({ ...settings, apiKey: settings.apiKey.trim() }),
+      signal,
     })
   } catch (error) {
     throw new Error(error instanceof Error ? `无法连接接口：${error.message}` : '无法连接接口，请检查地址和网络')
@@ -1854,26 +2193,44 @@ function extractVisionaryGeneratedImages(payload: unknown): GeneratedImage[] {
   return candidates.flatMap((candidate) => extractGeneratedImages(candidate))
 }
 
-async function resolveGrsaiImageResult(
+function providerTaskPercent(payload: unknown) {
+  const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+  return [record.data, record.result, record].flat()
+    .map((candidate) => (candidate as { progress?: unknown } | null)?.progress)
+    .map((value) => typeof value === 'string' && /^\d+(?:\.\d+)?%?$/.test(value.trim()) ? Number.parseFloat(value) : value)
+    .find((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100)
+}
+
+function reportImageTaskProgress(payload: unknown, onProgress?: ImageTaskProgressCallback, fallbackStatus = '') {
+  if (!onProgress) return
+  const percent = providerTaskPercent(payload)
+  const status = extractProviderTaskStatus(payload) || fallbackStatus
+  if (percent !== undefined || status) onProgress(percent, status)
+}
+
+async function resolveGrsaiMediaResult(
   settings: ApiRequestSettings,
   initialPayload: unknown,
   signal?: AbortSignal,
+  kind: '图片' | '视频' = '图片',
+  onProgress?: ImageTaskProgressCallback,
 ) {
   const initial = initialPayload && typeof initialPayload === 'object'
     ? initialPayload as Record<string, unknown>
     : {}
-  const taskId = String(initial.id ?? initial.taskId ?? initial.task_id ?? '').trim()
-  const initialStatus = String(initial.status ?? '').toLowerCase()
-  if (extractGeneratedImages(initialPayload).length) return initialPayload
-  if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(initialStatus)) {
+  const taskId = extractProviderTaskId(initialPayload)
+  const initialStatus = extractProviderTaskStatus(initialPayload)
+  if (/^(?:failed|failure|violation|cancelled|canceled|expired|error)$/.test(initialStatus)) {
     throw new GenerationRequestError(
       'api',
-      initialStatus === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
+      initialStatus === 'violation' ? `${kind}生成未通过内容审核` : `GRS AI ${kind}任务生成失败`,
       String(initial.error ?? initial.message ?? `任务状态：${initialStatus}`),
       { requestId: taskId || undefined },
     )
   }
+  if (extractGeneratedImages(initialPayload).length) return initialPayload
   if (!taskId) return initialPayload
+  if (kind === '图片') reportImageTaskProgress(initialPayload, onProgress, 'queued')
 
   const startedAt = Date.now()
   let consecutiveErrors = 0
@@ -1882,7 +2239,7 @@ async function resolveGrsaiImageResult(
     await waitForDelay(GRSAI_IMAGE_POLL_INTERVAL_MS, signal)
     let response: Response
     try {
-      response = await fetch(`${endpoint(settings.baseUrl, 'api/result')}?id=${encodeURIComponent(taskId)}`, {
+      response = await providerFetch(`${grsaiMediaEndpoint(settings.baseUrl, 'result')}?id=${encodeURIComponent(taskId)}`, {
         signal,
         headers: apiYiRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
       })
@@ -1893,10 +2250,10 @@ async function resolveGrsaiImageResult(
           : null
         const errorRecord = nestedError ?? errorPayload
         const errorStatus = String(errorRecord?.status ?? '').toLowerCase()
-        if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(errorStatus)) {
+        if (/^(?:failed|failure|violation|cancelled|canceled|expired|error)$/.test(errorStatus)) {
           throw new GenerationRequestError(
             'api',
-            errorStatus === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
+            errorStatus === 'violation' ? `${kind}生成未通过内容审核` : `GRS AI ${kind}任务生成失败`,
             String(errorRecord?.error ?? errorRecord?.message ?? `任务状态：${errorStatus}`),
             { requestId: taskId },
           )
@@ -1906,25 +2263,27 @@ async function resolveGrsaiImageResult(
       }
       const payload = await response.json() as unknown
       consecutiveErrors = 0
-      const images = extractGeneratedImages(payload)
-      if (images.length) return payload
       const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
-      const status = String(record.status ?? '').toLowerCase()
-      if (/^(?:failed|failure|violation|cancelled|canceled)$/.test(status)) {
+      const status = extractProviderTaskStatus(payload)
+      const task = record.data && typeof record.data === 'object' && !Array.isArray(record.data) ? record.data as Record<string, unknown> : record
+      if (/^(?:failed|failure|violation|cancelled|canceled|expired|error)$/.test(status)) {
         throw new GenerationRequestError(
           'api',
-          status === 'violation' ? '图片生成未通过内容审核' : 'GRS AI 图像任务生成失败',
-          String(record.error ?? record.message ?? `任务状态：${status}`),
+          status === 'violation' ? `${kind}生成未通过内容审核` : `GRS AI ${kind}任务生成失败`,
+          String(task.error ?? task.message ?? `任务状态：${status}`),
           { requestId: taskId },
         )
       }
+      if (extractGeneratedImages(payload).length) return payload
+      if (kind === '图片') reportImageTaskProgress(payload, onProgress)
+      else if (typeof task.progress === 'number') onProgress?.(Math.max(0, Math.min(99, task.progress)), status)
       if (/^(?:succeeded|success|completed|complete)$/.test(status)) {
         succeededWithoutResultCount += 1
         // A successful status can arrive just before the result URL is replicated.
         if (succeededWithoutResultCount >= 20) {
           throw new GenerationRequestError(
             'platform',
-            'GRS AI 显示生成成功，但暂未返回图片地址',
+            `GRS AI 显示生成成功，但暂未返回${kind}地址`,
             `任务 ${taskId} 已成功。Disy 已额外查询多次，但结果地址仍为空；请稍后从 GRS AI 日志找回，避免重复扣费。`,
             { requestId: taskId },
           )
@@ -1956,6 +2315,7 @@ async function resolveVisionaryImageResult(
   settings: ApiRequestSettings,
   initialPayload: unknown,
   signal?: AbortSignal,
+  onProgress?: ImageTaskProgressCallback,
 ) {
   if (extractVisionaryGeneratedImages(initialPayload).length) return initialPayload
   const taskId = extractTaskId(initialPayload)
@@ -1963,6 +2323,7 @@ async function resolveVisionaryImageResult(
   if (classifyProviderPayload(initialPayload) === 'failed') {
     throw new GenerationRequestError('api', 'Visionary 图像任务生成失败', sanitizeAdminLogJson(initialPayload), { requestId: taskId })
   }
+  reportImageTaskProgress(initialPayload, onProgress, 'queued')
 
   const startedAt = Date.now()
   let consecutiveErrors = 0
@@ -1970,7 +2331,7 @@ async function resolveVisionaryImageResult(
   while (Date.now() - startedAt < VISIONARY_POLL_TIMEOUT_MS) {
     await waitForDelay(VISIONARY_POLL_INTERVAL_MS, signal)
     try {
-      const response = await fetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
+      const response = await providerFetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
         signal,
         headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
       })
@@ -1988,6 +2349,7 @@ async function resolveVisionaryImageResult(
       if (state === 'failed') {
         throw new GenerationRequestError('api', 'Visionary 图像任务生成失败', sanitizeAdminLogJson(payload), { requestId: taskId })
       }
+      reportImageTaskProgress(payload, onProgress)
       if (state === 'success_without_result') {
         successWithoutResultCount += 1
         if (successWithoutResultCount >= VISIONARY_SUCCESS_WITHOUT_URL_RETRIES) {
@@ -2057,16 +2419,30 @@ async function resolveGenericProviderImageResult(
   settings: ApiRequestSettings,
   initialPayload: unknown,
   signal?: AbortSignal,
+  onProgress?: ImageTaskProgressCallback,
+  nativeHfsy = false,
 ) {
-  if (extractProviderImages(initialPayload).length) return initialPayload
-  const taskId = extractProviderTaskId(initialPayload)
-  if (!taskId) return initialPayload
-  if (classifyProviderPayload(initialPayload) === 'failed') {
-    throw new GenerationRequestError('api', '图像任务生成失败', sanitizeAdminLogJson(initialPayload), { requestId: taskId })
+  const hasResult = (payload: unknown) => {
+    if (nativeHfsy) {
+      const status = extractProviderTaskStatus(payload)
+      if (status && !/^(?:success|succeeded|completed|complete)$/.test(status)) return false
+    }
+    return extractProviderImages(payload).length > 0
   }
+  if (hasResult(initialPayload)) return initialPayload
+  const taskId = extractProviderTaskId(initialPayload)
+  const initialFailure = nativeHfsy ? hfsyFailureDetail(initialPayload) : ''
+  if (initialFailure || classifyProviderPayload(initialPayload) === 'failed') {
+    throw new GenerationRequestError('api', '图像任务生成失败', initialFailure || sanitizeAdminLogJson(initialPayload), { requestId: taskId || undefined })
+  }
+  if (!taskId && nativeHfsy) throw new GenerationRequestError('platform', 'HFSY 没有返回图片任务编号或结果', sanitizeAdminLogJson(initialPayload))
+  if (!taskId) return initialPayload
+  reportImageTaskProgress(initialPayload, onProgress, 'queued')
 
-  const candidates = genericProviderPollCandidates(settings, initialPayload, taskId)
-  const headers = providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, Accept: 'application/json' })
+  let pollSettings = settings
+  let candidates = nativeHfsy
+    ? [hfsyTaskUrl(pollSettings, 'image', taskId), hfsyTaskUrl(pollSettings, 'image', taskId, true)]
+    : genericProviderPollCandidates(settings, initialPayload, taskId)
   const startedAt = Date.now()
   let selectedEndpoint = ''
   let consecutiveErrors = 0
@@ -2078,7 +2454,15 @@ async function resolveGenericProviderImageResult(
     let transientFailureThisRound = false
     for (const candidate of roundCandidates) {
       try {
-        const response = await fetch(candidate, { signal, headers })
+        const headers = providerRelayHeaders(pollSettings, { Authorization: `Bearer ${settings.apiKey}`, Accept: 'application/json' })
+        const response = await providerFetch(candidate, { signal, headers })
+        if (nativeHfsy && response.status === 504 && new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname !== 'api.hfsyapi.cn') {
+          pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
+          candidates = [hfsyTaskUrl(pollSettings, 'image', taskId), hfsyTaskUrl(pollSettings, 'image', taskId, true)]
+          selectedEndpoint = ''
+          transientFailureThisRound = true
+          break
+        }
         if (response.status === 404 && !selectedEndpoint) continue
         if (response.status === 401 || response.status === 403) throw await createApiError(response)
         if (response.status === 429 || response.status >= 500) {
@@ -2090,11 +2474,13 @@ async function resolveGenericProviderImageResult(
         selectedEndpoint = candidate
         const payload = await response.json() as unknown
         consecutiveErrors = 0
-        if (extractProviderImages(payload).length) return payload
         const state = classifyProviderPayload(payload)
-        if (state === 'failed') {
-          throw new GenerationRequestError('api', '图像任务生成失败', sanitizeAdminLogJson(payload), { requestId: taskId })
+        const failure = nativeHfsy ? hfsyFailureDetail(payload) : ''
+        if (failure || state === 'failed') {
+          throw new GenerationRequestError('api', '图像任务生成失败', failure || sanitizeAdminLogJson(payload), { requestId: taskId })
         }
+        if (hasResult(payload)) return payload
+        reportImageTaskProgress(payload, onProgress)
         if (state === 'success_without_result') {
           successWithoutResultCount += 1
           if (successWithoutResultCount >= GENERIC_PROVIDER_SUCCESS_WITHOUT_URL_RETRIES) {
@@ -2195,11 +2581,21 @@ export async function generateRemoteImages(
   if (options.detail && !isApiYiSeedream) body.quality = options.detail
   if (!/gpt-image/i.test(settings.model)) body.response_format = 'url'
   const referenceImages = options.referenceImages?.filter(Boolean) ?? []
-  if (isHfsyBaseUrl(settings.baseUrl) && /^nano-banana-(?:2|pro)$/i.test(settings.model)) {
+  const hfsy = getHfsyImageCapabilities(settings.baseUrl, settings.model)
+  const publicHfsyReferences = hfsy ? referenceImages.map(publicImageSourceUrl) : []
+  const useHfsyNativeImage = Boolean(hfsy && publicHfsyReferences.every(Boolean))
+  if (hfsy) {
+    const invalid = (detail: string): never => { throw new GenerationRequestError('platform', 'HFSY 图片参数不符合模型要求', `${detail}。图片生成尚未提交。`) }
+    if (!options.prompt.trim() || Array.from(options.prompt).length > 5_000) invalid('提示词须为 1–5000 字符')
+    if (referenceImages.length > hfsy.images) invalid(`当前模型最多支持 ${hfsy.images} 张参考图`)
+    if (options.output && !hfsy.outputs.includes(options.output)) invalid(`当前模型没有提供 ${options.output} 输出`)
+    if (options.output === 'transparent-png' && !useHfsyNativeImage) invalid('透明背景接口需要公网参考图链接。请换用有公网源地址的图片，或移除本地参考图')
+  }
+  if (!useHfsyNativeImage && isHfsyBaseUrl(settings.baseUrl) && /^nano-banana-(?:2|pro)$/i.test(settings.model)) {
     const betaSettings = { ...settings, baseUrl: new URL(normalizedApiBaseUrl(settings.baseUrl)).origin + '/v1beta' }
     const parts: Array<Record<string, unknown>> = [{ text: options.prompt }]
     for (const fileUri of referenceImages.slice(0, 7)) parts.push({ fileData: { mimeType: /^data:image\/jpeg/i.test(fileUri) ? 'image/jpeg' : 'image/png', fileUri } })
-    const response = await fetch(endpoint(betaSettings.baseUrl, `models/${settings.model}:generateContent`), {
+    const response = await providerFetch(endpoint(betaSettings.baseUrl, `models/${settings.model}:generateContent`), {
       method: 'POST', signal: options.signal,
       headers: providerRelayHeaders(betaSettings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
       body: JSON.stringify({ contents: [{ parts }], generationConfig: { imageConfig: { imageSize: options.resolution ?? '1K', aspectRatio: options.aspectRatio ?? '1:1' } } }),
@@ -2210,31 +2606,66 @@ export async function generateRemoteImages(
     if (!rows.length) throw new GenerationRequestError('platform', 'HFSY Nano Banana 没有返回图片地址', sanitizeAdminLogJson(payload))
     return rows
   }
-  const useGrsaiUnifiedImage = isGrsaiBaseUrl(settings.baseUrl)
+  const isGrsai = isGrsaiBaseUrl(settings.baseUrl)
+  const grsaiPath = isGrsai ? grsaiImageEndpoint(settings.baseUrl) : undefined
+  const useGrsaiUnifiedImage = grsaiPath === 'api/generate'
+  const grsaiOptions = isGrsai ? resolveImageModelOptions(settings.baseUrl, settings.model, options) : options
+  const hfsyOptions = hfsy ? resolveImageModelOptions(settings.baseUrl, settings.model, options) : undefined
+  const hfsySize = hfsyOptions?.resolution && (settings.model.toLowerCase() === 'seedream-5.0-pro'
+    ? HFSY_SEEDREAM_SIZES[hfsyOptions.aspectRatio ?? '1:1']
+    : HFSY_IMAGE_SIZES[hfsyOptions.aspectRatio ?? '1:1']?.[hfsyOptions.resolution === '4K' ? 2 : hfsyOptions.resolution === '2K' ? 1 : 0])
+  const hfsyImageBody = {
+    model: settings.model,
+    prompt: options.prompt,
+    ...(hfsySize ? { size: hfsySize } : {}),
+    ...(publicHfsyReferences.length ? { reference_images: publicHfsyReferences } : {}),
+    ...(options.output === 'transparent-png' ? { background: 'transparent' } : {}),
+  }
+  if (isGrsai && options.output && options.output !== grsaiOptions.output) {
+    throw new GenerationRequestError('platform', '当前模型或接口不支持此输出格式', `${settings.model} 无法输出 ${options.output}，生成尚未提交。`)
+  }
   const useVisionaryTaskImage = isVisionaryBaseUrl(settings.baseUrl)
   const useEvolinkTaskImage = isEvolinkBaseUrl(settings.baseUrl)
-  const useStandardImageEdit = !useGrsaiUnifiedImage && !useEvolinkTaskImage && referenceImages.length > 0 && /(?:gpt-image|chatgpt-image)/i.test(settings.model)
+  const useStandardImageEdit = grsaiPath === 'images/edits' || (!isGrsai && !useEvolinkTaskImage && referenceImages.length > 0 && /(?:gpt-image|chatgpt-image)/i.test(settings.model))
+  const isGrsaiGptImage = /(?:gpt-image|chatgpt-image)/i.test(settings.model)
+  const grsaiSize = GRS_GPT_MODELS.test(settings.model)
+    ? resolveGrsaiGptSize(settings.model, grsaiOptions.aspectRatio ?? '1:1', grsaiOptions.resolution ?? '1K')
+    : requestSize
+  const outputFormat = grsaiOptions.output === 'transparent-png' ? 'png' : grsaiOptions.output
+  const background = grsaiOptions.output === 'transparent-png' ? 'transparent' : undefined
+  if (grsaiPath === 'images/generations' && isGrsaiGptImage) {
+    delete body.aspect_ratio
+    delete body.resolution
+    body.size = GRS_IMAGE_SIZES[grsaiSize]?.[0] ?? grsaiSize
+    body.quality = grsaiOptions.detail ?? 'auto'
+    body.output_format = outputFormat ?? 'png'
+    if (background) body.background = background
+    if (referenceImages.length) body.image = referenceImages
+  }
   // GRS documents `images` as raw Base64 or URL values. A browser Data URL
   // includes a MIME header that its upload worker does not decode reliably.
   const grsaiReferenceImages = referenceImages.map((source) => {
-    const dataUrl = /^data:image\/(?:png|jpe?g);base64,([\s\S]+)$/i.exec(source)
+    const dataUrl = /^data:image\/(?:png|jpe?g|webp);base64,([\s\S]+)$/i.exec(source)
     return dataUrl ? dataUrl[1].replace(/\s/g, '') : source
   })
-  const isGrsaiGptImage = /(?:gpt-image|chatgpt-image)/i.test(settings.model)
   const grsaiRequestBody: Record<string, unknown> = {
     model: settings.model,
     prompt: options.prompt,
     images: grsaiReferenceImages,
-    // GRS uses two schemas on this unified endpoint: GPT Image expects pixel
-    // dimensions, while Nano Banana expects a ratio plus imageSize.
     aspectRatio: isGrsaiGptImage
-      ? requestSize
-      : options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : '1:1',
+      ? grsaiSize
+      : grsaiOptions.aspectRatio ?? '1:1',
     // Async mode returns a task ID immediately. Polling that ID avoids losing
     // successful images when a long-lived synchronous connection is interrupted.
     replyType: 'async',
   }
-  if (!isGrsaiGptImage) grsaiRequestBody.imageSize = options.resolution ?? '1K'
+  if (isGrsaiGptImage) {
+    grsaiRequestBody.quality = grsaiOptions.detail ?? 'auto'
+    grsaiRequestBody.outputFormat = outputFormat ?? 'png'
+    if (background) grsaiRequestBody.background = background
+  } else {
+    grsaiRequestBody.imageSize = grsaiOptions.resolution ?? '1K'
+  }
   const clientRequestId = crypto.randomUUID()
   const visionaryRequestBody: Record<string, unknown> = {
     model: settings.model,
@@ -2253,7 +2684,9 @@ export async function generateRemoteImages(
     quality: /gemini-3\.1-flash-lite-image/i.test(settings.model) ? '1K' : (options.resolution ?? '1K'),
     ...(referenceImages.length ? { image_urls: referenceImages } : {}),
   }
-  const requestForLog: Record<string, unknown> = useGrsaiUnifiedImage
+  const requestForLog: Record<string, unknown> = useHfsyNativeImage
+    ? hfsyImageBody
+    : useGrsaiUnifiedImage
     ? grsaiRequestBody
     : useEvolinkTaskImage
       ? evolinkRequestBody
@@ -2314,8 +2747,15 @@ export async function generateRemoteImages(
 
   let response: Response
   try {
-    if (useGrsaiUnifiedImage) {
-      response = await fetch(endpoint(settings.baseUrl, 'api/generate'), {
+    if (useHfsyNativeImage) {
+      response = await providerFetch(endpoint(settings.baseUrl, 'image/create'), {
+        method: 'POST',
+        signal: options.signal,
+        headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
+        body: JSON.stringify(hfsyImageBody),
+      })
+    } else if (useGrsaiUnifiedImage) {
+      response = await providerFetch(grsaiMediaEndpoint(settings.baseUrl, 'generate'), {
         method: 'POST',
         signal: options.signal,
         headers: {
@@ -2326,7 +2766,7 @@ export async function generateRemoteImages(
         body: JSON.stringify(grsaiRequestBody),
       })
     } else if (useVisionaryTaskImage || useEvolinkTaskImage) {
-      response = await fetch(endpoint(settings.baseUrl, 'images/generations'), {
+      response = await providerFetch(endpoint(settings.baseUrl, 'images/generations'), {
         method: 'POST',
         signal: options.signal,
         headers: compatibleApiHeaders(settings, {
@@ -2339,18 +2779,28 @@ export async function generateRemoteImages(
       const form = new FormData()
       form.append('model', settings.model)
       form.append('prompt', options.prompt)
-      form.append('n', String(options.count))
-      form.append('size', requestSize)
-      if (options.detail) form.append('quality', options.detail)
+      if (!isGrsai) {
+        form.append('n', String(options.count))
+        form.append('size', requestSize)
+      }
+      const quality = isGrsai ? grsaiOptions.detail : options.detail
+      if (quality) form.append('quality', quality)
+      if (isGrsai) form.append('output_format', outputFormat ?? 'png')
+      if (isGrsai && !referenceImages.length) throw new GenerationRequestError('platform', '图像编辑需要参考图', '当前连接指定了 images/edits。请先添加参考图，或使用 GRS AI 默认接口。')
 
       for (const [index, imageSource] of referenceImages.entries()) {
+        const publicUrl = isGrsai ? publicImageSourceUrl(imageSource) : undefined
+        if (publicUrl) {
+          form.append('image', publicUrl)
+          continue
+        }
         let imageResponse: Response
         const imageController = new AbortController()
         const abortImageRead = () => imageController.abort()
         options.signal?.addEventListener('abort', abortImageRead, { once: true })
         const imageTimeout = window.setTimeout(() => imageController.abort(), REFERENCE_IMAGE_READ_TIMEOUT_MS)
         try {
-          imageResponse = await fetch(imageSource, { signal: imageController.signal })
+          imageResponse = await providerFetch(imageSource, { signal: imageController.signal })
         } catch (error) {
           if (options.signal?.aborted) throw new DOMException('Generation interrupted', 'AbortError')
           throw new GenerationRequestError(
@@ -2383,7 +2833,7 @@ export async function generateRemoteImages(
         form.append('image', imageBlob, `reference-${index + 1}.${extension}`)
       }
 
-      response = await fetch(endpoint(settings.baseUrl, 'images/edits'), {
+      response = await providerFetch(endpoint(settings.baseUrl, 'images/edits'), {
         method: 'POST',
         headers: compatibleApiHeaders(settings),
         body: form,
@@ -2402,7 +2852,7 @@ export async function generateRemoteImages(
           body.reference_images = referenceImages
         } else body.image_urls = referenceImages
       }
-      response = await fetch(endpoint(settings.baseUrl, 'images/generations'), {
+      response = await providerFetch(endpoint(settings.baseUrl, 'images/generations'), {
         method: 'POST',
         signal: options.signal,
         headers: {
@@ -2442,15 +2892,20 @@ export async function generateRemoteImages(
     ))
   }
   try {
-    if (useGrsaiUnifiedImage) {
-      payload = await resolveGrsaiImageResult(settings, payload, options.signal)
+    if (useHfsyNativeImage) {
+      const failure = hfsyFailureDetail(payload)
+      if (failure) throw new GenerationRequestError('api', 'HFSY 图片任务生成失败', failure, { requestId: taskId || undefined })
+      payload = await resolveGenericProviderImageResult(settings, payload, options.signal, options.onProgress, true)
+      lastPayload = payload
+    } else if (useGrsaiUnifiedImage) {
+      payload = await resolveGrsaiMediaResult(settings, payload, options.signal, '图片', options.onProgress)
       lastPayload = payload
       taskId = extractTaskId(payload) || taskId
     } else if (useVisionaryTaskImage) {
-      payload = await resolveVisionaryImageResult(settings, payload, options.signal)
+      payload = await resolveVisionaryImageResult(settings, payload, options.signal, options.onProgress)
       lastPayload = payload
     } else if (extractProviderTaskId(payload) && !extractProviderImages(payload).length) {
-      payload = await resolveGenericProviderImageResult(settings, payload, options.signal)
+      payload = await resolveGenericProviderImageResult(settings, payload, options.signal, options.onProgress)
       lastPayload = payload
       taskId = extractProviderTaskId(payload) || taskId
     }
@@ -2482,6 +2937,8 @@ export async function generateRemoteText(
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const providerLabel = resolveProviderLabel(settings.baseUrl)
+  const hfsy = isHfsyBaseUrl(settings.baseUrl)
+  const stream = hfsy && options.stream === true
   const referenceImages = options.referenceImages?.map((source) => source.trim()).filter(Boolean) ?? []
   const userContent = referenceImages.length
     ? [
@@ -2495,7 +2952,7 @@ export async function generateRemoteText(
   const requestForLog = {
     model: settings.model,
     messages: [{ role: 'user', content: typeof userContent === 'string' ? userContent : '[multimodal text + images]' }],
-    stream: false,
+    stream,
     referenceImageCount: referenceImages.length,
   }
 
@@ -2520,8 +2977,21 @@ export async function generateRemoteText(
   try {
     const nativeAnthropic = /api\.anthropic\.com/i.test(settings.baseUrl) || /\/messages\/?(?:[?#].*)?$/i.test(settings.baseUrl.trim())
     const openAiResponses = !nativeAnthropic && /\/responses\/?(?:[?#].*)?$/i.test(settings.baseUrl.trim())
+    const grsai = isGrsaiBaseUrl(settings.baseUrl) ? new URL(normalizedApiBaseUrl(settings.baseUrl)) : undefined
+    const nativeGemini = grsai && /^gemini-/i.test(settings.model) && /^\/v1beta(?:\/models(?:\/[^/]+)?)?\/?$/i.test(grsai.pathname)
+    const geminiMethod = /:streamGenerateContent\/?$/i.test(grsai?.pathname ?? '') ? 'streamGenerateContent' : 'generateContent'
     const requestPath = nativeAnthropic ? 'messages' : openAiResponses ? 'responses' : 'chat/completions'
-    const requestBody = nativeAnthropic
+    const requestUrl = nativeGemini
+      ? `${grsai.origin}/v1beta/models/${encodeURIComponent(settings.model)}:${geminiMethod}${geminiMethod === 'streamGenerateContent' ? '?alt=sse' : ''}`
+      : grsai && requestPath === 'chat/completions' ? `${grsai.origin}/v1/chat/completions` : endpoint(settings.baseUrl, requestPath)
+    const requestBody = nativeGemini
+      ? {
+          contents: [{ role: 'user', parts: [{ text: prompt }, ...await Promise.all(referenceImages.map(async (source) => {
+            const blob = await readImageSourceBlob(source, options.signal)
+            return { inlineData: { mimeType: blob.type, data: (await blobToDataUrl(blob)).split(',')[1] } }
+          }))] }],
+        }
+      : nativeAnthropic
       ? {
           model: settings.model,
           max_tokens: 4096,
@@ -2539,8 +3009,8 @@ export async function generateRemoteText(
               ? [{ role: 'user', content: [{ type: 'input_text', text: prompt }, ...referenceImages.map((image_url) => ({ type: 'input_image', image_url }))] }]
               : prompt,
           }
-        : { model: settings.model, messages: [{ role: 'user', content: userContent }], stream: false }
-    response = await fetch(endpoint(settings.baseUrl, requestPath), {
+        : { model: settings.model, messages: [{ role: 'user', content: userContent }], stream }
+    response = await providerFetch(requestUrl, {
       method: 'POST',
       signal: options.signal,
       headers: compatibleApiHeaders(settings, { 'Content-Type': 'application/json' }),
@@ -2548,6 +3018,7 @@ export async function generateRemoteText(
     })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
+    if (error instanceof GenerationRequestError) throw error
     const networkError = createNetworkError(error)
     emitTextAdminLog('failed', { error: networkError.detail, summary: networkError.message })
     throw networkError
@@ -2560,11 +3031,19 @@ export async function generateRemoteText(
   let payload: unknown
   try {
     const contentType = response.headers.get('content-type') || ''
-    if (/text\/event-stream/i.test(contentType)) {
-      const events = (await response.text()).split(/\r?\n\r?\n/).map((event) => event.split(/\r?\n/)
-        .filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n'))
-        .filter((event) => event && event !== '[DONE]')
-      payload = events.flatMap((event) => { try { return [JSON.parse(event)] } catch { return [] } })
+    if (/text\/event-stream/i.test(contentType) || hfsy) {
+      const body = await response.text()
+      if (/text\/event-stream/i.test(contentType) || /^(?:data:|event:|:)/.test(body.trimStart())) {
+        const events = body.split(/\r?\n\r?\n/).map((event) => event.split(/\r?\n/)
+          .filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n'))
+          .filter((event) => event && event !== '[DONE]')
+        payload = events.flatMap((event) => { try { return [JSON.parse(event)] } catch { return [] } })
+      } else {
+        try { payload = JSON.parse(body) } catch (error) {
+          if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) throw error
+          payload = body
+        }
+      }
     } else if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) {
       payload = await response.json()
     } else {
@@ -2576,11 +3055,20 @@ export async function generateRemoteText(
     emitTextAdminLog('failed', { error: parseError.detail, summary: parseError.message })
     throw parseError
   }
+  if (hfsy) {
+    const failure = (Array.isArray(payload) ? payload : [payload]).map(hfsyFailureDetail).find(Boolean)
+    if (failure) {
+      const taskId = extractTaskId(payload)
+      emitTextAdminLog('failed', payload, taskId)
+      throw new GenerationRequestError('api', 'HFSY 文本生成失败', failure, { requestId: taskId })
+    }
+  }
   const extractText = (value: unknown, depth = 0): string => {
     if (typeof value === 'string') return value
     if (!value || typeof value !== 'object' || depth > 7) return ''
     if (Array.isArray(value)) return value.map((item) => extractText(item, depth + 1)).filter(Boolean).join('')
     const record = value as Record<string, unknown>
+    if (record.thought === true) return ''
     for (const key of ['output_text', 'text']) {
       const text = extractText(record[key], depth + 1)
       if (text) return text
@@ -2594,7 +3082,9 @@ export async function generateRemoteText(
       })() : ''
       if (text) return text
     }
-    for (const key of ['output', 'content', 'result', 'data', 'message', 'delta']) {
+    const candidates = Array.isArray(record.candidates) ? record.candidates : []
+    if (candidates.length) return extractText(candidates[0], depth + 1)
+    for (const key of ['output', 'content', 'parts', 'result', 'data', 'message', 'delta']) {
       const text = extractText(record[key], depth + 1)
       if (text) return text
     }

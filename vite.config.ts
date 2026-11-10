@@ -14,8 +14,11 @@ import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { onRequestGet as serveToolboxMedia } from './functions/toolbox/media.js'
 
-const rightsBanner = '/*! DisyLab v1.0.5 | Copyright (c) 2026 DisyLab. All rights reserved. | LicenseRef-DisyLab-Proprietary | ash::tya origin build | Unauthorized commercial use, redistribution, white-labeling, relicensing, or removal of this notice is prohibited. | Repository: https://github.com/TyaAsh/DisyLab-Canvas */'
+const rightsBanner = '/*! DisyLab v2.0.0-preview.1 | Copyright (c) 2026 DisyLab. All rights reserved. | LicenseRef-DisyLab-Proprietary | ash::tya origin build | Unauthorized commercial use, redistribution, white-labeling, relicensing, or removal of this notice is prohibited. | Repository: https://github.com/TyaAsh/DisyLab-Canvas */'
 
 const localProxyUrl = new URL(process.env.DISYLAB_HTTPS_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890')
 
@@ -292,7 +295,7 @@ const apiYiMediaRelayPlugin: Plugin = {
         let targetUrl = new URL(target)
         const mediaHostAllowed = (url: URL) => url.protocol === 'https:'
           && !url.username && !url.password && !url.port
-          && /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$/i.test(url.hostname)
+          && /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
         if (!mediaHostAllowed(targetUrl)) {
           response.statusCode = 403
           response.end('media host not allowed')
@@ -330,6 +333,8 @@ const apiYiMediaRelayPlugin: Plugin = {
         }
         if (!upstream) throw new Error('media upstream unavailable')
         response.statusCode = upstream.status
+        response.setHeader('content-security-policy', "sandbox; default-src 'none'; style-src 'unsafe-inline'")
+        response.setHeader('x-content-type-options', 'nosniff')
         const contentType = upstream.headers['content-type']
         if (contentType) response.setHeader('content-type', contentType)
         const contentLength = upstream.headers['content-length']
@@ -347,7 +352,25 @@ const apiYiMediaRelayPlugin: Plugin = {
 }
 
 export default defineConfig({
-  plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin],
+  plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin, {
+    name: 'toolbox-shared-media',
+    configureServer(server) {
+      server.middlewares.use('/toolbox/media', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        const task = new AbortController()
+        res.once('close', () => task.abort())
+        try {
+          const response = await serveToolboxMedia({ request: new Request(`http://127.0.0.1/toolbox/media${req.url || ''}`, { signal: task.signal }) })
+          res.writeHead(response.status, Object.fromEntries(response.headers.entries()))
+          if (response.body) await pipeline(Readable.fromWeb(response.body), res)
+          else res.end()
+        } catch {
+          if (!res.headersSent) res.writeHead(502)
+          res.end()
+        }
+      })
+    },
+  }],
   server: {
     port: 1420,
     host: '127.0.0.1',

@@ -44,7 +44,7 @@ export type SkillManifest = {
   parameters: SkillParameter[]
   inputs: SkillPort[]
   output: SkillPort
-  template: { prompt: string; negativePrompt?: string }
+  template: { prompt: string; negativePrompt?: string; format?: 'plain' }
   capability: { supportedModes: string[]; requiresReference?: boolean; allowedModelCapabilities: ('text' | 'image' | 'video')[] }
   composite?: CompositeSkillDefinition
   createdAt: number

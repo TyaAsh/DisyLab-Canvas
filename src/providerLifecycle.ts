@@ -64,7 +64,15 @@ export function extractProviderImages(payload: unknown): ProviderImageResult[] {
     if (typeof value !== 'string') return ''
     const candidate = value.trim()
     if (/^(?:https?:|blob:|data:image\/)/i.test(candidate)) return candidate
-    if (candidate.length > 128 && /^[A-Za-z0-9+/=\r\n]+$/.test(candidate)) return `data:image/png;base64,${candidate.replace(/\s/g, '')}`
+    if (/^[A-Za-z0-9+/=\r\n]+$/.test(candidate)) {
+      const encoded = candidate.replace(/\s/g, '')
+      if (encoded.startsWith('R0lGODdh') || encoded.startsWith('R0lGODlh')) return `data:image/gif;base64,${encoded}`
+      const prefix = encoded.slice(0, Math.min(1024, Math.floor(encoded.length / 4) * 4))
+      try {
+        if (/^\s*(?:<\?xml[^?]*\?>\s*)?<svg(?:\s|\/?>)/i.test(atob(prefix))) return `data:image/svg+xml;base64,${encoded}`
+      } catch { return '' }
+      if (encoded.length > 128) return `data:image/png;base64,${encoded}`
+    }
     return ''
   }
   const push = (value: unknown, revisedPrompt?: unknown) => {

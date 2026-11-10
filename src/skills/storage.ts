@@ -8,6 +8,13 @@ const dbPromise = openDB('disylab-skill-system', 1, {
   },
 })
 
+const deletionListeners = new Set<(key: string) => void>()
+
+export function subscribeToSkillDeletion(listener: (key: string) => void) {
+  deletionListeners.add(listener)
+  return () => { deletionListeners.delete(listener) }
+}
+
 export async function listUserSkillManifests(): Promise<SkillManifest[]> {
   const rows = await (await dbPromise).getAll('skill_manifests') as Array<{ key: string; manifest: SkillManifest }>
   return rows.map((row) => row.manifest).filter((skill) => skill.source === 'user')
@@ -18,5 +25,8 @@ export async function saveUserSkillManifest(manifest: SkillManifest) {
 }
 
 export async function deleteUserSkillManifest(manifest: SkillManifest) {
-  await (await dbPromise).delete('skill_manifests', skillKey(manifest))
+  if (manifest.source !== 'user') throw new Error('内置 Skill 不能删除。')
+  const key = skillKey(manifest)
+  await (await dbPromise).delete('skill_manifests', key)
+  deletionListeners.forEach((listener) => listener(key))
 }

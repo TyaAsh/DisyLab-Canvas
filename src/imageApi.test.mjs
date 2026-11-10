@@ -8,10 +8,83 @@ const compile = async (file) => ts.transpileModule(await readFile(new URL(file, 
 }).outputText
 const asModule = (source) => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 const lifecycle = asModule(await compile('./providerLifecycle.ts'))
+const { inferImageOutput, imageOutputIntent } = await import(asModule(await compile('./imageOutputIntent.ts')))
 const catalog = asModule(await compile('./modelCatalog.ts'))
+const transport = asModule(await compile('./providerTransport.ts'))
+const { resolveDesktopProviderRequest } = await import(transport)
 const api = await import(asModule((await compile('./imageApi.ts'))
   .replace("'./providerLifecycle'", JSON.stringify(lifecycle))
+  .replace("'./providerTransport'", JSON.stringify(transport))
   .replaceAll("'./modelCatalog'", JSON.stringify(catalog))))
+
+test('desktop translates browser relay paths without depending on the dev server', () => {
+  const cases = [
+    ['/hfsy/v1/image/query/task_1', { 'x-disylab-hfsy-base': 'https://api.hfsyapi.cn/v1' }, 'https://api.hfsyapi.cn/v1/image/query/task_1'],
+    ['/hfsy/__root__/api/pricing', { 'x-disylab-hfsy-base': 'https://www.hfsyapi.cn/v1' }, 'https://www.hfsyapi.cn/api/pricing'],
+    ['/apiyi/seedance/v1/contents/generations/tasks', { 'x-disylab-apiyi-origin': 'https://vip.apiyi.com' }, 'https://vip.apiyi.com/v1/contents/generations/tasks'],
+    ['/visionary/tasks/job_1', {}, 'https://api.visionary.beer/v1/tasks/job_1'],
+    ['/evolink/tasks/job_1', {}, 'https://api.evolink.ai/v1/tasks/job_1'],
+  ]
+  for (const [path, headers, target] of cases) {
+    const request = resolveDesktopProviderRequest(path, { headers: { ...headers, Authorization: 'Bearer test' } })
+    assert.equal(request.url.href, target)
+    assert.deepEqual([...request.init.headers.keys()].filter((name) => name.startsWith('x-disylab-')), [])
+    assert.equal(request.init.headers.get('authorization'), 'Bearer test')
+  }
+  assert.equal(resolveDesktopProviderRequest('/prompt-library/catalog.json'), undefined)
+  assert.equal(resolveDesktopProviderRequest('data:image/png;base64,AA=='), undefined)
+  assert.equal(resolveDesktopProviderRequest('http://tauri.localhost/apiyi/media?url=https%3A%2F%2Ffile.hfsyapi.cn%2Fimage.png', undefined, 'http://tauri.localhost').url.href, 'https://file.hfsyapi.cn/image.png')
+  assert.throws(() => resolveDesktopProviderRequest('/hfsy/v1/models', { headers: { 'x-disylab-hfsy-base': 'https://example.test/v1' } }))
+})
+
+test('desktop media keeps HFSY authorization scoped to its known CDN hosts', () => {
+  const headers = { 'x-disylab-media-authorization': 'Bearer test' }
+  const trusted = resolveDesktopProviderRequest('/apiyi/media?url=https%3A%2F%2Fwww.qixinai.net%2Ffile.mp4', { headers })
+  assert.equal(trusted.init.headers.get('authorization'), 'Bearer test')
+  assert.equal(trusted.init.headers.get('referer'), 'https://www.hfsyapi.cn/')
+  assert.equal(trusted.init.maxRedirections, 0)
+  const unknown = resolveDesktopProviderRequest('/apiyi/media?url=https%3A%2F%2Fexample.test%2Ffile.mp4', { headers })
+  assert.equal(unknown.init.headers.get('authorization'), null)
+  assert.equal(unknown.init.headers.get('x-disylab-media-authorization'), null)
+})
+
+test('prompt output detection separates requested formats from reference and negated formats', () => {
+  const examples = [
+    ['一只猫点头，做成 GIF 动图', 'gif'],
+    ['制作循环动图', 'gif'],
+    ['生成 ＳＶＧ 标志', 'svg'],
+    ['背景设置为透明，保存为 PNG', 'transparent-png'],
+    ['生成透明的 PNG 图标', 'transparent-png'],
+    ['Make an icon with a transparent background', 'transparent-png'],
+    ['做个无背景 SVG', 'svg'],
+    ['参考 SVG，做成 GIF', 'gif'],
+    ['参照这个 GIF 做一个 SVG 标志', 'svg'],
+    ['Use the reference image and make a transparent PNG', 'transparent-png'],
+    ['把 GIF 转成透明底 PNG', 'transparent-png'],
+    ['不用 GIF 或 SVG，输出 PNG', 'png'],
+    ['不要输出 GIF', undefined],
+    ['Do not export SVG', undefined],
+    ['Output a PNG, not an animated GIF', 'png'],
+    ['参考上传的 GIF，画一张海报', undefined],
+    ['用 GIF 字样做一张海报', undefined],
+    ['https://example.test/logo.svg 画一个城市剪影', undefined],
+    ['@[node:reference.gif] 输出一张静态图', undefined],
+    ['生成一张普通照片', undefined],
+  ]
+  for (const [prompt, expected] of examples) assert.equal(inferImageOutput(prompt), expected, prompt)
+})
+
+test('format detection allows documented model support and blocks unsupported special requests', () => {
+  const base = 'https://grsaiapi.com/v1'
+  const flare = api.getGrsaiImageCapabilities(base, 'gpt-image-2.6-flare').outputs
+  const legacy = api.getGrsaiImageCapabilities(base, 'gpt-image-2.5').outputs
+  assert.equal(imageOutputIntent('请输出 GIF', flare).output, 'gif')
+  assert.equal(imageOutputIntent('背景透明', flare).output, 'transparent-png')
+  assert.equal(imageOutputIntent('请输出 GIF', legacy).blocked, true)
+  assert.equal(imageOutputIntent('请输出 SVG', flare).blocked, true)
+  assert.match(imageOutputIntent('生成动图').message, /尚未确认支持 GIF/)
+  assert.equal(imageOutputIntent('输出 PNG').blocked, false)
+})
 
 test('unknown model IDs stay unclassified instead of being silently treated as text', () => {
   assert.equal(api.inferModelCapability('vendor-next-gen-2026'), 'unknown')
@@ -41,6 +114,215 @@ function browserGlobal(t, name, value) {
   Object.defineProperty(globalThis, name, { configurable: true, writable: true, value })
   t.after(() => previous ? Object.defineProperty(globalThis, name, previous) : delete globalThis[name])
 }
+
+test('GRS GPT Image uses documented format, quality and resolution fields', async (t) => {
+  const bodies = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    bodies.push({ url: String(url), body: init.body instanceof FormData ? Object.fromEntries(init.body) : JSON.parse(init.body) })
+    return Response.json({ id: 'image-1', status: 'succeeded', results: [{ url: 'https://file1.aitohumanize.com/file/result.gif' }] })
+  })
+  const settings = { baseUrl: 'https://grsai.dakka.com.cn/v1', apiKey: 'test' }
+  const options = { prompt: 'animate', count: 1, aspectRatio: '9:16', resolution: '2K', detail: 'high' }
+  await api.generateRemoteImages({ ...settings, model: 'gpt-image-2.6-sunburst' }, { ...options, output: 'gif' })
+  await api.generateRemoteImages({ ...settings, model: 'gpt-image-2.6' }, { ...options, output: 'svg' })
+  await api.generateRemoteImages({ ...settings, model: 'gpt-image-2.5-sunburst' }, { ...options, detail: 'xhigh', output: 'transparent-png' })
+  await api.generateRemoteImages({ ...settings, model: 'nano-banana-2.1' }, { ...options, aspectRatio: '1:4' })
+  await api.generateRemoteImages({ ...settings, baseUrl: settings.baseUrl + '/images/generations', model: 'gpt-image-2.6-flare' }, { ...options, output: 'gif' })
+  await api.generateRemoteImages({ ...settings, baseUrl: settings.baseUrl + '/images/edits', model: 'gpt-image-2.6' }, { ...options, output: 'gif', referenceImages: ['https://example.test/source.png'] })
+  await assert.rejects(() => api.generateRemoteImages({ ...settings, model: 'gpt-image-2.5' }, { ...options, output: 'gif' }), /不支持此输出格式/)
+  assert.equal(bodies.length, 6)
+  assert.deepEqual(bodies[0], { url: `${settings.baseUrl}/api/generate`, body: { model: 'gpt-image-2.6-sunburst', prompt: 'animate', images: [], aspectRatio: '1152x2048', replyType: 'async', quality: 'high', outputFormat: 'gif' } })
+  assert.deepEqual([bodies[1].body.aspectRatio, bodies[1].body.quality, bodies[1].body.outputFormat], ['9:16', 'auto', 'svg'])
+  assert.deepEqual([bodies[2].body.quality, bodies[2].body.background, bodies[2].body.outputFormat], ['xhigh', 'transparent', 'png'])
+  assert.deepEqual([bodies[3].body.aspectRatio, bodies[3].body.imageSize, bodies[3].body.outputFormat], ['1:4', '2K', undefined])
+  assert.equal(bodies[4].url, `${settings.baseUrl}/images/generations`)
+  assert.equal(bodies[4].body.output_format, 'gif')
+  assert.equal(bodies[5].url, `${settings.baseUrl}/images/edits`)
+  assert.deepEqual([bodies[5].body.image, bodies[5].body.output_format], ['https://example.test/source.png', 'gif'])
+})
+
+test('GRS images report numeric progress and keep status-only polls distinct', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  const payloads = [
+    { data: { id: 'image-progress' } },
+    { data: { status: 'queued', progress: 0 } },
+    { status: 'success', data: { status: 'running', progress: 37 } },
+    { data: { status: 'running', progress: -1 } },
+    { data: { status: 'succeeded' } },
+    { data: { status: 'succeeded', results: [{ url: 'https://example.test/output.gif' }] } },
+  ]
+  t.mock.method(globalThis, 'fetch', async () => Response.json(payloads.shift()))
+  const progress = []
+  const images = await api.generateRemoteImages(
+    { baseUrl: 'https://grsai.dakka.com.cn/v1', apiKey: 'test', model: 'gpt-image-2.6' },
+    { prompt: 'animate', count: 1, output: 'gif', onProgress: (...event) => progress.push(event) },
+  )
+  assert.equal(images.length, 1)
+  assert.deepEqual(progress, [
+    [undefined, 'queued'],
+    [0, 'queued'],
+    [37, 'running'],
+    [undefined, 'running'],
+    [undefined, 'succeeded'],
+  ])
+})
+
+test('GRS Wan and Agnes use the native frame route and retain task IDs across polling', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push({ url: String(url), method: init.method ?? 'GET', body: init.body && JSON.parse(init.body) })
+    if (String(url).endsWith('/api/generate')) return Response.json({ id: 'video-job', status: 'queued' })
+    if (String(url).endsWith('/api/result?id=video-job')) return Response.json({ id: 'video-job', status: 'succeeded', results: [{ url: 'https://file1.aitohumanize.com/file/movie.mp4' }] })
+    return new Response(new Blob(['video'], { type: 'video/mp4' }))
+  })
+  const settings = { baseUrl: 'https://grsaiapi.com/v1', apiKey: 'test' }
+  const options = { prompt: 'motion', size: '720x1280', aspectRatio: '9:16', seconds: 12, firstFrame: 'https://example.test/first.png', lastFrame: 'https://example.test/last.png' }
+  let savedTask
+  for (const model of ['agnes-video-2.5', 'wan-3.0']) {
+    const result = await api.generateRemoteVideo({ ...settings, model }, { ...options, onTaskId: (id) => { savedTask = id } })
+    assert.equal(savedTask, 'video-job')
+    assert.equal(await result.blob.text(), 'video')
+  }
+  assert.equal(calls[0].url, `${settings.baseUrl}/api/generate`)
+  assert.deepEqual(calls[0].body, { model: 'agnes-video-2.5', prompt: 'motion', aspectRatio: '9:16', resolution: '720p', duration: 12, replyType: 'async', firstFrame: options.firstFrame, lastFrame: options.lastFrame })
+  assert.equal(calls[1].url, `${settings.baseUrl}/api/result?id=video-job`)
+  assert.equal(calls[1].method, 'GET')
+  assert.equal(calls[3].body.model, 'wan-3.0')
+  await assert.rejects(() => api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, { ...options, lastFrame: undefined, resolution: '1080p' }), /参数不受支持/)
+  assert.equal(calls.length, 6)
+  await api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, { ...options, lastFrame: undefined, seconds: 10, resolution: '1080p' })
+  assert.equal(calls[6].body.aspectRatio, 'portrait')
+  assert.deepEqual(calls[6].body.images, [options.firstFrame])
+})
+
+test('GRS uses Gemini native JSON and SSE only when the connection selects v1beta', async (t) => {
+  const urls = []
+  const gemini = { candidates: [{ content: { parts: [{ thought: true, text: 'private' }, { text: 'visible' }] } }] }
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    urls.push(String(url))
+    if (String(url).includes(':streamGenerateContent')) return new Response(`data: ${JSON.stringify(gemini)}\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+    if (String(url).endsWith(':generateContent')) {
+      assert.equal(JSON.parse(init.body).contents[0].parts[0].text, 'hello')
+      return Response.json(gemini)
+    }
+    return Response.json({ choices: [{ message: { content: 'compatible' } }] })
+  })
+  const settings = { apiKey: 'test', model: 'gemini-3.8-flash' }
+  assert.equal(await api.generateRemoteText({ ...settings, baseUrl: 'https://grsaiapi.com/v1' }, 'hello'), 'compatible')
+  assert.equal(await api.generateRemoteText({ ...settings, baseUrl: 'https://grsaiapi.com/v1beta' }, 'hello'), 'visible')
+  assert.equal(await api.generateRemoteText({ ...settings, baseUrl: 'https://grsaiapi.com/v1beta/models/example:streamGenerateContent' }, 'hello'), 'visible')
+  assert.deepEqual(urls, ['https://grsaiapi.com/v1/chat/completions', 'https://grsaiapi.com/v1beta/models/gemini-3.8-flash:generateContent', 'https://grsaiapi.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse'])
+})
+
+test('HFSY catalogue includes account-enabled documented models beyond the public plaza', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const headers = new Headers(init.headers)
+    if (String(url).endsWith('/api/pricing')) {
+      assert.equal(headers.get('authorization'), null)
+      return Response.json({ success: true, data: [{ model_name: 'minimax-h3', tags: ['视频'], enable_groups: ['default'], supported_endpoint_types: ['openai'] }] })
+    }
+    assert.equal(String(url), 'https://www.hfsyapi.cn/v1/models')
+    assert.equal(headers.get('authorization'), 'Bearer test')
+    return Response.json({ data: [{ id: 'gpt-image-2.6-flare' }, { id: 'wan-3.0-720' }, { id: 'retired-unrecognized-id' }] })
+  })
+  const result = await api.fetchRemoteModels({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test' })
+  assert.deepEqual(result.map(({ id, capability }) => [id, capability]), [['gpt-image-2.6-flare', 'image'], ['wan-3.0-720', 'video']])
+})
+
+test('HFSY native images use documented pixel sizes, transparency and GET polling', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  const requests = []
+  const url = 'https://file.hfsyapi.cn/2026/09/24/result.png'
+  const payloads = [
+    Response.json({ id: 'task_image', status: 'queued', images: [] }),
+    new Response(null, { status: 504 }),
+    Response.json({ data: { status: 'in_progress', progress: '42%', images: [{ url: 'https://file.hfsyapi.cn/preview.png' }] } }),
+    Response.json({ id: 'task_image', status: 'completed', images: [{ url, revised_prompt: 'draw' }], error: null }),
+  ]
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push({ url: String(url), method: init.method ?? 'GET', base: new Headers(init.headers).get('X-DisyLab-HFSY-Base'), body: init.body && JSON.parse(init.body) })
+    return payloads.shift()
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1/image/create', apiKey: 'test', model: 'gpt-image-2.6-flare' }
+  const options = { prompt: 'draw', count: 1, aspectRatio: '16:9', resolution: '4K', detail: 'high', referenceImages: ['https://cdn.example.test/ref.png'] }
+  const progress = []
+  const ids = []
+  const images = await api.generateRemoteImages(settings, { ...options, output: 'transparent-png', onProgress: (...event) => progress.push(event), onTaskId: (id) => ids.push(id) })
+  assert.deepEqual(requests[0], {
+    url: '/hfsy/v1/image/create', method: 'POST', base: 'https://www.hfsyapi.cn/v1',
+    body: { model: settings.model, prompt: 'draw', size: '3840x2160', reference_images: options.referenceImages, background: 'transparent' },
+  })
+  assert.deepEqual(requests.slice(1).map(({ url, method, base }) => [url, method, base]), [
+    ['/hfsy/v1/image/query/task_image', 'GET', 'https://www.hfsyapi.cn/v1'],
+    ['/hfsy/v1/image/query/task_image', 'GET', 'https://api.hfsyapi.cn/v1'],
+    ['/hfsy/v1/image/query/task_image', 'GET', 'https://api.hfsyapi.cn/v1'],
+  ])
+  assert.deepEqual(ids, ['task_image'])
+  assert.deepEqual(progress, [[undefined, 'queued'], [42, 'in_progress']])
+  assert.deepEqual(images, [{ url: `/apiyi/media?url=${encodeURIComponent(url)}`, revisedPrompt: 'draw' }])
+  assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, 'gpt-image-2.6').resolutions, ['1K'])
+  assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, 'gpt-image-2.6-sunburst').outputs, ['png', 'transparent-png'])
+  for (const output of ['gif', 'svg']) await assert.rejects(() => api.generateRemoteImages(settings, { ...options, output }), /HFSY 图片参数/)
+  await assert.rejects(() => api.generateRemoteImages({ ...settings, model: 'gpt-image-2.6' }, { ...options, referenceImages: Array(7).fill(options.referenceImages[0]) }), /HFSY 图片参数/)
+  assert.equal(requests.length, 4)
+})
+
+test('HFSY text uses chat completions, handles SSE chunks and reports error envelopes', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push([String(url), JSON.parse(init.body), new Headers(init.headers).get('authorization')])
+    if (requests.length === 1) return Response.json({ choices: [{ message: { content: '普通回答' } }] })
+    if (requests.length === 2) return new Response([
+      'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+      'data: {"choices":[{"delta":{"content":"你好"}}]}',
+      'data: {"choices":[{"delta":{"content":"世界"}}]}',
+      'data: [DONE]',
+    ].join('\r\n\r\n'), { headers: { 'content-type': 'text/plain' } })
+    return Response.json({ success: false, message: '模型未授权' })
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn', model: 'gpt-5.5', apiKey: 'test' }
+  assert.equal(await api.generateRemoteText(settings, '你好'), '普通回答')
+  assert.equal(await api.generateRemoteText(settings, '你好', { stream: true }), '你好世界')
+  await assert.rejects(() => api.generateRemoteText(settings, '你好'), (error) => error.detail === '模型未授权')
+  assert.deepEqual(requests[0], ['https://www.hfsyapi.cn/v1/chat/completions', { model: 'gpt-5.5', messages: [{ role: 'user', content: '你好' }], stream: false }, 'Bearer test'])
+  assert.equal(requests[1][1].stream, true)
+})
+
+test('HFSY routes MiniMax, Kling, Muse and native Seedance using their own fields', async (t) => {
+  const bodies = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (init?.method === 'POST') {
+      bodies.push(JSON.parse(init.body))
+      return Response.json({ data: { id: 'task_video', status: 'completed', result_url: 'https://file.hfsyapi.cn/video.mp4' } })
+    }
+    return new Response(new Blob(['video'], { type: 'video/mp4' }))
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn', apiKey: 'test' }
+  const base = { prompt: 'test', seconds: 5, size: '9:16' }
+  await assert.rejects(() => api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, base), /视频参数不符合模型要求/)
+  await api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, { ...base, referenceImages: ['https://cdn.example.test/image.png'], referenceAudios: ['https://cdn.example.test/voice.mp3'] })
+  await api.generateRemoteVideo({ ...settings, model: 'kling-o3' }, { ...base, size: 'square' })
+  await api.generateRemoteVideo({ ...settings, model: 'muse_video' }, { ...base, seconds: 1 })
+  await api.generateRemoteVideo({ ...settings, model: 'Doubao-Seedance-2.0-fast' }, {
+    ...base, mode: 'first_last_frame', firstFrame: 'https://cdn.example.test/first.png', lastFrame: 'https://cdn.example.test/last.png',
+    resolution: '720p', generateAudio: false, referenceAudios: ['asset://reviewed-audio'],
+  })
+  assert.deepEqual(bodies[0], { model: 'minimax-h3', prompt: 'test', duration: 5, orientation: 'portrait', images: ['https://cdn.example.test/image.png'], audios: ['https://cdn.example.test/voice.mp3'] })
+  assert.equal(bodies[1].orientation, 'square')
+  assert.deepEqual(bodies[2], { model: 'muse_video', prompt: 'test', duration: 1, ratio: '9:16' })
+  assert.deepEqual(bodies[3], {
+    model: 'Doubao-Seedance-2.0-fast', duration: 5, ratio: '9:16', resolution: '720p', generate_audio: false,
+    content: [
+      { type: 'text', text: 'test' },
+      { type: 'image_url', image_url: { url: 'https://cdn.example.test/first.png' }, role: 'first_frame' },
+      { type: 'image_url', image_url: { url: 'https://cdn.example.test/last.png' }, role: 'last_frame' },
+      { type: 'audio_url', audio_url: { url: 'asset://reviewed-audio' }, role: 'reference_audio' },
+    ],
+  })
+  assert.equal(api.hfsyVideoLimits('sd-2.5-1080').images, 30)
+  assert.equal(api.hfsyVideoLimits('wan-3.0-720').maxSeconds, 30)
+})
 
 test('HFSY requires public media URLs before submitting a task', async (t) => {
   let calls = 0
@@ -267,6 +549,21 @@ test('archive reader routes existing Qixinai URLs through the relay and preserve
   const image = await api.readImageSourceBlob(url)
   assert.deepEqual(calls, [`/apiyi/media?url=${encodeURIComponent(url)}`])
   assert.equal(await image.text(), await original.text())
+})
+
+test('archive reader repairs mislabeled GIF and PNG MIME types without re-encoding', async (t) => {
+  browserGlobal(t, 'window', { setTimeout, clearTimeout, location: { href: 'http://localhost/' } })
+  const samples = [
+    { bytes: Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'), type: 'image/gif' },
+    { bytes: Buffer.from('89504e470d0a1a0a', 'hex'), type: 'image/png' },
+  ]
+  let next = 0
+  t.mock.method(globalThis, 'fetch', async () => new Response(samples[next++].bytes, { headers: { 'Content-Type': 'application/octet-stream' } }))
+  for (const { bytes, type } of samples) {
+    const result = await api.readImageSourceBlob('https://example.test/image')
+    assert.equal(result.type, type)
+    assert.deepEqual(Buffer.from(await result.arrayBuffer()), bytes)
+  }
 })
 
 test('local stored image bytes can be prepared without fetching an external or blob URL', async (t) => {

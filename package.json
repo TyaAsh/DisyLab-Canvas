@@ -1,7 +1,7 @@
 {
   "name": "disy-infinite-canvas",
   "private": true,
-  "version": "1.0.5",
+  "version": "2.0.0-preview.1",
   "license": "UNLICENSED",
   "author": "DisyLab",
   "homepage": "https://tyaash.github.io/DisyLab-Canvas/",
@@ -17,9 +17,12 @@
   "scripts": {
     "dev": "vite --strictPort",
     "build": "tsc -b && vite build",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build --target x86_64-pc-windows-msvc --no-bundle",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "npm run test:providers && npm run test:relay && npm run check:prompt-library && npm run audit:workflows",
+    "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library && npm run audit:workflows",
+    "test:toolbox": "node --disable-warning=ExperimentalWarning --test src/watermark.test.mjs",
     "test:relay": "node --test functions/relay.test.mjs",
     "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/storyboard.test.mjs src/agentRuntime.test.mjs",
     "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs",
@@ -31,6 +34,8 @@
   "dependencies": {
     "@gsap/react": "^2.1.2",
     "@huggingface/transformers": "^4.2.0",
+    "@tauri-apps/api": "~2.11.0",
+    "@tauri-apps/plugin-http": "^2.5.9",
     "@xyflow/react": "^12.6.0",
     "framer-motion": "^12.40.0",
     "gsap": "^3.15.0",
@@ -42,12 +47,14 @@
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "three": "^0.185.1",
+    "yaml": "^2.9.1",
     "zod": "^4.4.3",
     "zustand": "^5.0.5"
   },
   "devDependencies": {
     "@rolldown/binding-win32-x64-msvc": "^1.2.3",
     "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.12.4",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.185.4",

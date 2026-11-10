@@ -33,6 +33,11 @@ test('recognizes synchronous and Visionary completed image result shapes', () =>
   assert.equal(lifecycle.classifyProviderPayload({ data: [{ url: 'https://cdn.example/a.png' }] }), 'result')
 })
 
+test('labels bare GIF base64 as GIF, including small provider results', () => {
+  const gif = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+  assert.equal(lifecycle.extractProviderImages({ data: [{ b64_json: gif }] })[0]?.url, `data:image/gif;base64,${gif}`)
+})
+
 test('extracts Evolink audio and video URLs from result_data', () => {
   assert.deepEqual(lifecycle.extractProviderImages({ result_data: { audio_url: 'https://cdn.example/voice.mp3' } }), [
     { url: 'https://cdn.example/voice.mp3', revisedPrompt: undefined },

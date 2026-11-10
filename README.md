@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.5-77bdf2" />
+  <img alt="Version" src="https://img.shields.io/badge/version-2.0.0--preview.1-77bdf2" />
   <img alt="React" src="https://img.shields.io/badge/React-19-149eca" />
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-6-3178c6" />
   <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646cff" />
@@ -167,6 +167,7 @@ npx wrangler pages deploy dist --project-name disylab --branch main
 
 ## 文档与反馈
 
+- [2.0 前瞻版本说明](docs/Disy-2.0-preview.md)
 - [v1.0.5 版本说明](docs/Disy-v1.0.5-版本说明.md)
 - [Skill 系统实施手册](docs/Disylab-Skill-实施手册.md)
 

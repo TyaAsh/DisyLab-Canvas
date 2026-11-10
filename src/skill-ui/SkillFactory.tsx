@@ -1,34 +1,52 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
-import gsap from 'gsap'
-import { useGSAP } from '@gsap/react'
-import { BookOpen, Check, CircleHelp, Copy, FileJson, FileUp, Film, FolderUp, GripVertical, Grid3X3, Image, LayoutGrid, Pencil, Plus, RotateCcw, Route, Search, Settings2, ShieldCheck, Sparkles, Trash2, Type, WandSparkles, X, Zap } from 'lucide-react'
-import { listSkills } from '../skills/registry'
-import { importSkillFile } from '../skills/importExport'
-import { deleteUserSkillManifest, saveUserSkillManifest } from '../skills/storage'
+import { ArrowLeft, ArrowUpRight, Check, ChevronDown, CircleHelp, Copy, FileText, FileUp, Film, FolderUp, Grid3X3, Image, LayoutGrid, MessageCircle, Pencil, Play, Plus, Route, Search, Settings2, Sparkles, Star, Trash2, Type, X, Zap } from 'lucide-react'
+import { listSkills, officialSkills } from '../skills/registry'
+import { importSkillFile, isSkillImportFile } from '../skills/importExport'
+import { deleteUserSkillManifest, saveUserSkillManifest, subscribeToSkillDeletion } from '../skills/storage'
 import { categoryContainsSkill, defaultSkillCategories, loadSkillCategories, makeSkillCategory, saveSkillCategories, type SkillCategory } from '../skills/categories'
 import { skillKey, type SkillKind, type SkillManifest } from '../skills/types'
+import { getFilmSkillShowcase } from '../skills/manifests/official/film'
+import { toggleSkillFavorite, useSkillFavorites } from './useSkillFavorites'
+import { skillOpening } from '../skills/conversation'
 
-type Props = { open: boolean; onClose: () => void; onLaunch: (skill: SkillManifest) => void }
-type FactoryView = 'browse' | 'manage' | 'categories' | 'guide'
+type Props = { open: boolean; initialView?: 'browse' | 'manage'; initialSkillSlug?: string; onClose: () => void; onLaunch: (skill: SkillManifest) => void }
+type FactoryView = 'browse' | 'favorites' | 'mine' | 'manage' | 'categories' | 'guide'
+const libraryTabs = [
+  { id: 'browse', label: 'Skill' },
+  { id: 'favorites', label: '收藏' },
+  { id: 'mine', label: '我的' },
+] as const
+const builtInCovers = new Set(['cinematic-lighting-grade', 'copy-polish', 'structured-summary', 'creative-brief', 'story-outline', 'tone-rewrite', 'visual-prompt-architect'])
+const exampleMarkdown = `---
+name: creative-brief
+description: 将零散的创意整理成可执行的项目需求。
+---
+
+根据用户给出的素材，整理项目目标、目标受众和核心卖点。
+最后列出建议的交付物和需要用户确认的信息。`
 const exampleManifest = `{"id":"user.product-poster","slug":"product-poster","version":"1.0.0","name":"产品海报","description":"将产品卖点整理成海报提示词。","kind":"image","execution":"configured","source":"user","enabled":true,"parameters":[],"inputs":[],"output":{"name":"image","type":"image"},"template":{"prompt":"设计海报：{{subject}}"},"capability":{"supportedModes":["image_generation"],"allowedModelCapabilities":["image"]},"createdAt":0,"updatedAt":0}`
 const categoryIcon = (c: SkillCategory) => c.id === 'all' ? Sparkles : c.kind === 'composite' ? Route : c.kind === 'storyboard_comic' ? Grid3X3 : c.kind === 'image' ? Image : c.kind === 'video' ? Film : c.kind === 'text' ? Type : LayoutGrid
 const kindLabel = (kind: SkillKind) => kind === 'composite' ? '复合 Skill' : kind === 'storyboard_comic' ? '多阶段工作流' : kind === 'image' ? '图像 Skill' : kind === 'video' ? '视频 Skill' : '文本 Skill'
 
-export function SkillFactory({ open, onClose, onLaunch }: Props) {
-  const factoryRef = useRef<HTMLDivElement>(null)
+export function SkillFactory({ open, initialView = 'browse', initialSkillSlug = '', onClose, onLaunch }: Props) {
   const fileRef = useRef<HTMLInputElement>(null)
   const folderRef = useRef<HTMLInputElement>(null)
   const reduceMotion = useReducedMotion()
-  const [skills, setSkills] = useState<SkillManifest[]>([])
+  const [skills, setSkills] = useState(officialSkills)
+  const favorites = useSkillFavorites()
   const [categories, setCategories] = useState<SkillCategory[]>(loadSkillCategories)
   const [categoryId, setCategoryId] = useState('all')
   const [selectedId, setSelectedId] = useState('all')
   const [categoryName, setCategoryName] = useState('')
   const [query, setQuery] = useState('')
-  const [view, setView] = useState<FactoryView>('browse')
+  const [view, setView] = useState<FactoryView>(initialView)
+  const [detailSlug, setDetailSlug] = useState(initialSkillSlug)
   const [notice, setNotice] = useState('')
   const [pendingDelete, setPendingDelete] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [savingUsage, setSavingUsage] = useState(false)
   const [draggedCategoryId, setDraggedCategoryId] = useState('')
   const [dropCategoryId, setDropCategoryId] = useState('')
   const refresh = () => listSkills().then(setSkills)
@@ -45,67 +63,477 @@ export function SkillFactory({ open, onClose, onLaunch }: Props) {
   }
   const selectForEdit = (item: SkillCategory) => { setSelectedId(item.id); setCategoryName(item.label); setPendingDelete('') }
 
-  useEffect(() => { if (open) { setView('browse'); setNotice(''); setPendingDelete(''); void refresh() } }, [open])
+  useEffect(() => {
+    if (!open) return
+    setView(initialView)
+    setDetailSlug(initialSkillSlug)
+    setNotice('')
+    setPendingDelete('')
+    void refresh().catch(() => setNotice('暂时无法读取本地 Skill。'))
+  }, [open, initialView, initialSkillSlug])
+  useEffect(() => subscribeToSkillDeletion((key) => {
+    setSkills((current) => current.filter((skill) => skillKey(skill) !== key))
+  }), [])
   useEffect(() => {
     if (!open) return
     const closeWithEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.key !== 'Escape' || document.fullscreenElement) return
       event.preventDefault()
       event.stopImmediatePropagation()
-      onClose()
+      const menu = document.querySelector<HTMLElement>('.skill-usage-menu:popover-open')
+      if (menu) menu.hidePopover()
+      else if (detailSlug) setDetailSlug('')
+      else onClose()
     }
     window.addEventListener('keydown', closeWithEscape, true)
     return () => window.removeEventListener('keydown', closeWithEscape, true)
-  }, [onClose, open])
-  const upload = async (files: FileList | null) => {
-    if (!files?.length) return
-    const manifests = Array.from(files).filter((file) => /\.json$/i.test(file.name)); let imported = 0; const errors: string[] = []
-    for (const file of manifests) { try { await saveUserSkillManifest(await importSkillFile(file)); imported++ } catch (error) { errors.push(error instanceof Error ? error.message : `${file.name} 导入失败`) } }
-    await refresh(); setNotice(errors.length ? `已导入 ${imported} 个；${errors[0]}` : manifests.length ? `已安全导入 ${imported} 个 Skill` : '文件夹中没有找到 JSON Manifest')
+  }, [detailSlug, onClose, open])
+  const upload = async (files: FileList | null, fromFolder: boolean) => {
+    if (!files?.length || uploading) return
+    const candidates = Array.from(files).filter(isSkillImportFile)
+    let imported = 0
+    const errors: string[] = []
+    setUploading(true)
+    setNotice('')
+    try {
+      for (const file of candidates) {
+        try {
+          const manifest = await importSkillFile(file, fromFolder)
+          if (!manifest) continue
+          await saveUserSkillManifest(manifest)
+          imported++
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : `${file.name} 导入失败`)
+        }
+      }
+      if (imported) await refresh()
+      setNotice(errors.length ? `已导入 ${imported} 个。 ${errors[0]}` : imported ? `已导入 ${imported} 个 Skill。` : '请选择 SKILL.md 或有效的 DisyLab JSON。')
+    } catch {
+      setNotice('已保存导入的 Skill，请重新打开技能库查看。')
+    } finally {
+      setUploading(false)
+    }
+  }
+  const removeSkill = async (skill: SkillManifest) => {
+    if (deleting || savingUsage) return
+    const key = skillKey(skill)
+    if (pendingDelete !== key) { setPendingDelete(key); return }
+    setDeleting(true)
+    setNotice('')
+    try {
+      await deleteUserSkillManifest(skill)
+      setPendingDelete('')
+      setNotice(`已删除 ${skill.name}`)
+    } catch {
+      setNotice('删除失败，请重试。')
+    } finally {
+      setDeleting(false)
+    }
+  }
+  const changeSkillUsage = async (skill: SkillManifest, execution: SkillManifest['execution']) => {
+    if (deleting || savingUsage || skill.execution === execution) return
+    const updated = { ...skill, execution, updatedAt: Date.now() }
+    setSavingUsage(true)
+    setNotice('')
+    try {
+      await saveUserSkillManifest(updated)
+      setSkills((current) => current.map((item) => skillKey(item) === skillKey(skill) ? updated : item))
+      setNotice(`已更新「${skill.name}」的使用方式。`)
+    } catch {
+      setNotice('使用方式保存失败，请重试。')
+    } finally {
+      setSavingUsage(false)
+    }
   }
   const activeCategory = categories.find((item) => item.id === categoryId) ?? defaultSkillCategories[0]
   const selected = categories.find((item) => item.id === selectedId) ?? categories[0]
   const userSkills = skills.filter((skill) => skill.source === 'user')
   const factorySkills = useMemo(() => skills.filter((skill) => skill.factoryVisible !== false), [skills])
-  const shown = useMemo(() => factorySkills
-    .filter((skill) => categoryContainsSkill(activeCategory, skill) && `${skill.name} ${skill.description}`.toLowerCase().includes(query.trim().toLowerCase()))
-    .sort((a, b) => Number(a.kind === 'composite') - Number(b.kind === 'composite')),
-  [factorySkills, activeCategory, query])
-  const shownKey = shown.map(skillKey).join('|')
-  useGSAP(() => { if (!reduceMotion) gsap.timeline({ defaults: { ease: 'power3.out' } }).from('.skill-factory-modal>header>*:not(.skill-factory-close)', { autoAlpha: 0, y: -9, duration: .34, stagger: .045 }).from('.skill-factory-shell>aside>*', { autoAlpha: 0, x: -14, duration: .32, stagger: .055 }, '<.06') }, { scope: factoryRef })
-  useGSAP(() => { if (!reduceMotion && shown.length) gsap.fromTo('.skill-factory-grid article', { autoAlpha: 0, y: 18, scale: .975 }, { autoAlpha: 1, y: 0, scale: 1, duration: .38, stagger: .035, ease: 'power3.out', clearProps: 'transform,opacity,visibility' }) }, { dependencies: [shownKey, reduceMotion], scope: factoryRef, revertOnUpdate: true })
+  const libraryView = view === 'browse' || view === 'favorites' || view === 'mine'
+  const detailSkill = detailSlug ? factorySkills.find((skill) => skillKey(skill) === detailSlug || (skill.source === 'official' && skill.slug === detailSlug)) : undefined
+  const showcase = detailSkill && getFilmSkillShowcase(detailSkill)
+  const activeTab = view === 'favorites' ? 'favorites' : view === 'mine' || view === 'manage' || view === 'guide' ? 'mine' : 'browse'
+  const searchTerm = query.trim().replace(/^\//, '').toLowerCase()
+  const shown = factorySkills.filter((skill) => {
+    if (view === 'browse' && !categoryContainsSkill(activeCategory, skill)) return false
+    if (view === 'favorites' && !favorites.has(skillKey(skill))) return false
+    if (view === 'mine' && skill.source !== 'user') return false
+    return !searchTerm || [skill.name, skill.description, skill.slug].some((value) => value.toLowerCase().includes(searchTerm))
+  })
   if (!open) return null
 
-  return <motion.div ref={factoryRef} className="skill-factory-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onPointerDown={(e) => e.target === e.currentTarget && onClose()}>
-    <motion.section className="skill-factory-modal" role="dialog" aria-modal="true" aria-labelledby="skill-factory-title" initial={reduceMotion ? false : { opacity: 0, y: 22, scale: .976 }} animate={{ opacity: 1, y: 0, scale: 1 }} onPointerDown={(e) => e.stopPropagation()}>
-      <header><div className="skill-factory-title"><h2 id="skill-factory-title">技能库</h2><small>{factorySkills.length} 个可用技能</small></div>{view === 'browse' && <label><Search size={15}/><input autoFocus value={query} placeholder="搜索创作能力、任务或交付类型" onChange={(e) => setQuery(e.target.value)}/></label>}<button type="button" className="skill-factory-close" aria-label="关闭技能库" title="关闭" onClick={onClose}><X size={20} strokeWidth={2.15}/></button></header>
-      <div className="skill-factory-shell">
-        <aside><small>能力分类</small><nav className="skill-category-nav">{categories.map((item) => { const Icon = categoryIcon(item); const draggable = item.id !== 'all'; return <button type="button" key={item.id} draggable={draggable} className={`${view === 'browse' && categoryId === item.id ? 'is-active ' : ''}${draggedCategoryId === item.id ? 'is-dragging ' : ''}${dropCategoryId === item.id ? 'is-drop-target' : ''}`} onDragStart={(event) => { if (!draggable) return; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', item.id); setDraggedCategoryId(item.id) }} onDragOver={(event) => { if (!draggable || !draggedCategoryId || draggedCategoryId === item.id) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropCategoryId(item.id) }} onDragLeave={() => dropCategoryId === item.id && setDropCategoryId('')} onDrop={(event) => { event.preventDefault(); moveCategory(draggedCategoryId || event.dataTransfer.getData('text/plain'), item.id); setDraggedCategoryId(''); setDropCategoryId('') }} onDragEnd={() => { setDraggedCategoryId(''); setDropCategoryId('') }} onClick={() => { setCategoryId(item.id); setView('browse') }}>{draggable && <GripVertical className="skill-category-grip" size={13}/>}<Icon size={16}/><span>{item.label}</span><em>{factorySkills.filter((s) => categoryContainsSkill(item, s)).length}</em></button> })}</nav><div className="skill-factory-nav-divider"/><small>Skill 管理</small><nav><button type="button" className={view === 'categories' ? 'is-active' : ''} onClick={() => { setView('categories'); selectForEdit(categories[0] ?? defaultSkillCategories[0]) }}><LayoutGrid size={16}/><span>分类管理</span><em>{Math.max(0, categories.length - 1)}</em></button></nav><div className={`skill-factory-side-note ${view === 'browse' ? '' : 'is-safe'}`}>{view === 'browse' ? <><WandSparkles size={18}/><b>拖拽调整分类</b><p>除“全部 Skill”外，分类顺序会保存在当前设备。</p></> : <><ShieldCheck size={18}/><b>本地安全配置</b><p>分类保存在本机，不会改写 Skill Manifest。</p></>}</div></aside>
-        <main>
-          {view === 'browse' && <Browse skills={shown} category={activeCategory} query={query} onLaunch={onLaunch}/>} 
-          {view === 'manage' && <Manage userSkills={userSkills} notice={notice} pendingDelete={pendingDelete} fileRef={fileRef} folderRef={folderRef} setView={setView} setNotice={setNotice} setPendingDelete={setPendingDelete} upload={upload} refresh={refresh}/>} 
-          {view === 'categories' && selected && <CategoryEditor skills={factorySkills} categories={categories} selected={selected} name={categoryName} notice={notice} pendingDelete={pendingDelete} setName={setCategoryName} setNotice={setNotice} setPendingDelete={setPendingDelete} select={selectForEdit} update={updateCategories} add={() => { const item = makeSkillCategory('新分类'); updateCategories([...categories, item]); selectForEdit(item) }} deleted={(next, label) => { setCategoryId('all'); selectForEdit(next[0] ?? defaultSkillCategories[0]); setNotice(`已删除分类“${label}”`) }}/>} 
-          {view === 'guide' && <Guide notice={notice} setView={setView} setNotice={setNotice}/>} 
-        </main>
-      </div>
+  return <motion.div className="skill-factory-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onPointerDown={(event) => event.target === event.currentTarget && onClose()}>
+    <motion.section className={`skill-factory-modal ${detailSkill ? 'has-skill-detail' : ''} ${view === 'categories' ? 'has-category-editor' : ''}`} role="dialog" aria-modal="true" aria-label={detailSkill?.name ?? (view === 'categories' ? '分类管理' : '技能库')} initial={reduceMotion ? false : { opacity: 0, y: 12, scale: .99 }} animate={{ opacity: 1, y: 0, scale: 1 }} onPointerDown={(event) => event.stopPropagation()}>
+      {detailSkill ? <FilmSkillDetail key={detailSlug} skill={detailSkill} showcase={showcase} favorite={favorites.has(skillKey(detailSkill))}
+        onBack={() => setDetailSlug('')} onClose={onClose} onLaunch={() => onLaunch(detailSkill)} /> : <>
+      {view === 'categories' ? <header className="skill-category-topbar">
+        <button type="button" autoFocus className="skill-detail-back" onClick={() => { setView('browse'); setNotice(''); setPendingDelete('') }}><ArrowLeft size={16} />返回技能库</button>
+        <button type="button" aria-label="关闭分类管理" title="关闭" onClick={onClose}><X size={19} /></button>
+      </header> : <header>
+        <nav className="skill-library-tabs" aria-label="技能库视图">
+          {libraryTabs.map(({ id, label }) => <button key={id} type="button" aria-pressed={activeTab === id} onClick={() => {
+            setView(id)
+            setQuery('')
+            setPendingDelete('')
+          }}>{label}</button>)}
+        </nav>
+        <div className="skill-library-actions">
+          {view === 'browse' && <button type="button" aria-label="分类管理" title="分类管理" onClick={() => {
+            setView('categories')
+            selectForEdit(activeCategory)
+          }}><Settings2 size={16} /></button>}
+          {view === 'mine' && <button type="button" className="skill-library-manage" onClick={() => setView('manage')}><Settings2 size={15} />管理 Skill</button>}
+          <button type="button" autoFocus={!libraryView} aria-label="关闭技能库" title="关闭" onClick={onClose}><X size={20} /></button>
+        </div>
+      </header>}
+      {libraryView && <div className="skill-library-toolbar">
+        {view === 'browse' && <nav className="skill-category-nav" aria-label="能力分类">
+          {categories.map((item) => {
+            const draggable = item.id !== 'all'
+            return <button key={item.id} type="button" draggable={draggable} aria-pressed={activeCategory.id === item.id}
+              className={`${draggedCategoryId === item.id ? 'is-dragging' : ''} ${dropCategoryId === item.id ? 'is-drop-target' : ''}`}
+              onClick={() => setCategoryId(item.id)}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = 'move'
+                event.dataTransfer.setData('text/plain', item.id)
+                setDraggedCategoryId(item.id)
+              }}
+              onDragOver={(event) => {
+                if (!draggable || !draggedCategoryId || draggedCategoryId === item.id) return
+                event.preventDefault()
+                event.dataTransfer.dropEffect = 'move'
+                setDropCategoryId(item.id)
+              }}
+              onDragLeave={() => setDropCategoryId('')}
+              onDrop={(event) => {
+                event.preventDefault()
+                moveCategory(draggedCategoryId, item.id)
+                setDraggedCategoryId('')
+                setDropCategoryId('')
+              }}
+              onDragEnd={() => { setDraggedCategoryId(''); setDropCategoryId('') }}
+            >{item.label}</button>
+          })}
+        </nav>}
+        <label className="skill-library-search">
+          <input autoFocus type="search" aria-label="搜索 Skill" placeholder="搜索 Skill" value={query} onChange={(event) => setQuery(event.target.value)} />
+          <Search size={16} aria-hidden="true" />
+        </label>
+      </div>}
+      <main className="skill-library-content" key={view}>
+        {libraryView && <>
+          {notice && <div className="skill-manager-notice" role="status">{notice}</div>}
+          <Browse skills={shown} favorites={favorites} view={activeTab} searching={Boolean(searchTerm)} onShowcase={setDetailSlug} onLaunch={onLaunch} />
+        </>}
+        {view === 'manage' && <Manage userSkills={userSkills} notice={notice} pendingDelete={pendingDelete} uploading={uploading}
+          deleting={deleting} savingUsage={savingUsage} changeSkillUsage={changeSkillUsage} fileRef={fileRef} folderRef={folderRef}
+          showGuide={() => setView('guide')} upload={upload} removeSkill={removeSkill} />}
+        {view === 'categories' && selected && <CategoryEditor key={selected.id} skills={factorySkills} categories={categories} selected={selected} name={categoryName} notice={notice} pendingDelete={pendingDelete} setName={setCategoryName} setNotice={setNotice} setPendingDelete={setPendingDelete} select={selectForEdit} update={updateCategories} add={() => { const item = makeSkillCategory('新分类'); updateCategories([...categories, item]); selectForEdit(item) }} deleted={(next, label) => { setCategoryId('all'); selectForEdit(next[0] ?? defaultSkillCategories[0]); setNotice(`已删除分类“${label}”`) }} />}
+        {view === 'guide' && <Guide notice={notice} setView={setView} setNotice={setNotice} />}
+      </main>
+      </>}
     </motion.section>
   </motion.div>
 }
 
-function Browse({ skills, category, query, onLaunch }: { skills: SkillManifest[]; category: SkillCategory; query: string; onLaunch: (skill: SkillManifest) => void }) {
-  return <><div className="skill-factory-heading"><div><small>{category.label}</small><h3>{query ? `“${query}”的结果` : '选择一个 Skill 开始创作'}</h3></div><span>{skills.length} 个可用能力</span></div><div className="skill-factory-grid">{skills.map((skill) => <motion.article layout key={skillKey(skill)} className={skill.kind === 'composite' ? 'is-composite' : skill.kind === 'storyboard_comic' ? 'is-storyboard' : ''}><div className="skill-card-icon">{skill.kind === 'composite' ? <Route size={20}/> : skill.kind === 'storyboard_comic' ? <Grid3X3 size={20}/> : skill.kind === 'image' ? <Image size={20}/> : skill.kind === 'video' ? <Film size={20}/> : <BookOpen size={20}/>}</div><small>{kindLabel(skill.kind)} · {skill.kind === 'composite' ? `${skill.composite?.stages.length ?? 0} 阶段审核` : skill.execution === 'instant' ? '直接执行' : '配置后执行'}</small><h4>{skill.name}</h4><p>{skill.description}</p><footer><button type="button" onClick={() => onLaunch(skill)}>{skill.kind === 'composite' ? <Route size={14}/> : skill.execution === 'instant' ? <Zap size={14}/> : <Sparkles size={14}/>} {skill.kind === 'composite' ? '进入工作台' : '开始使用'}</button></footer></motion.article>)}</div>{!skills.length && <div className="skill-factory-empty"><Search size={26}/><b>没有找到匹配的 Skill</b><span>换一个关键词，或者切换能力分类。</span></div>}</>
+function Browse({ skills, favorites, view, searching, onShowcase, onLaunch }: {
+  skills: SkillManifest[]
+  favorites: Set<string>
+  view: typeof libraryTabs[number]['id']
+  searching: boolean
+  onShowcase: (slug: string) => void
+  onLaunch: (skill: SkillManifest) => void
+}) {
+  if (!skills.length) {
+    const emptyTitle = searching ? '没有找到匹配的 Skill' : view === 'favorites' ? '还没有收藏的 Skill' : view === 'mine' ? '还没有自己的 Skill' : '这个分类暂时没有 Skill'
+    const emptyDescription = searching ? '试试技能名称、描述或调用词。' : view === 'favorites' ? '点击卡片上的星标即可收藏。' : view === 'mine' ? '可以在 Agent 中创建，或通过「管理 Skill」导入。' : '可以切回「推荐」查看全部技能。'
+    const Icon = view === 'favorites' && !searching ? Star : Search
+    return <div className="skill-factory-empty" role="status"><Icon size={24} /><b>{emptyTitle}</b><span>{emptyDescription}</span></div>
+  }
+
+  return <div className="skill-factory-grid">{skills.map((skill) => {
+    const key = skillKey(skill)
+    const favorite = favorites.has(key)
+    const showcase = getFilmSkillShowcase(skill)
+    const cover = skill.source === 'official' && (showcase || builtInCovers.has(skill.slug)) ? skill.slug : 'disy'
+    return <article key={key}>
+      <div className="skill-card-cover" data-cover={cover === 'disy' ? 'disy' : 'artwork'}>
+        <img src={`${import.meta.env.BASE_URL}skill-covers/${cover}.webp`} alt="" decoding="async" />
+      </div>
+      <div className="skill-card-body">
+        <div className="skill-card-heading">
+          <h4 title={skill.name}>{skill.name}</h4>
+          <button type="button" className="skill-card-favorite" aria-pressed={favorite} aria-label={`${favorite ? '取消收藏' : '收藏'} ${skill.name}`} title={favorite ? '取消收藏' : '收藏'} onClick={() => toggleSkillFavorite(key)}><Star size={16} /></button>
+        </div>
+        <p title={skill.description}>{skill.description}</p>
+        <footer>
+          <small>{showcase ? '成片制作' : kindLabel(skill.kind)}</small>
+          <div className="skill-card-footer-actions">
+            {showcase && <button type="button" className="skill-card-launch" onClick={() => onShowcase(key)}><Play size={13} />预览</button>}
+            <button type="button" className="skill-card-launch is-primary" onClick={() => onLaunch(skill)}>开始对话<ArrowUpRight size={14} /></button>
+          </div>
+        </footer>
+      </div>
+    </article>
+  })}</div>
 }
 
-type ManageProps = { userSkills: SkillManifest[]; notice: string; pendingDelete: string; fileRef: React.RefObject<HTMLInputElement | null>; folderRef: React.RefObject<HTMLInputElement | null>; setView: (v: FactoryView) => void; setNotice: (v: string) => void; setPendingDelete: (v: string) => void; upload: (f: FileList | null) => Promise<void>; refresh: () => Promise<void> }
-function Manage({ userSkills, notice, pendingDelete, fileRef, folderRef, setView, setNotice, setPendingDelete, upload, refresh }: ManageProps) {
-  return <section className="skill-manager"><div className="skill-factory-heading"><div><small>MY SKILLS</small><h3>上传、更新与删除用户 Skill</h3></div><button type="button" onClick={() => setView('guide')}><CircleHelp size={15}/>上传指南</button></div><div className="skill-manager-upload"><button type="button" onClick={() => fileRef.current?.click()}><FileUp size={22}/><span><b>上传 Skill 文件</b><small>选择 .disy-skill.json 或 .json</small></span></button><button type="button" onClick={() => folderRef.current?.click()}><FolderUp size={22}/><span><b>上传 Skill 文件夹</b><small>扫描文件夹内所有 JSON Manifest</small></span></button></div>{notice && <div className="skill-manager-notice">{notice}</div>}<div className="skill-manager-list"><header><span>已上传 Skill</span><em>{userSkills.length}</em></header>{userSkills.map((skill) => { const key = skillKey(skill); return <article key={key}><i><FileJson size={17}/></i><span><b>{skill.name}</b><small>{skill.slug} · v{skill.version}</small></span><button className={pendingDelete === key ? 'is-confirming' : ''} type="button" onClick={async () => { if (pendingDelete !== key) return setPendingDelete(key); await deleteUserSkillManifest(skill); setPendingDelete(''); await refresh(); setNotice(`已删除 ${skill.name}`) }}>{pendingDelete === key ? '确认删除' : <Trash2 size={15}/>}</button></article>})}{!userSkills.length && <div className="skill-manager-empty"><FileJson size={24}/><b>还没有用户 Skill</b><span>上传后会立即出现在技能库中。</span></div>}</div><input ref={fileRef} hidden type="file" accept=".json,.disy-skill.json" onChange={(e) => { void upload(e.target.files); e.target.value = '' }}/><input ref={folderRef} hidden type="file" multiple {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)} onChange={(e) => { void upload(e.target.files); e.target.value = '' }}/></section>
+function FilmSkillDetail({ skill, showcase, favorite, onBack, onClose, onLaunch }: {
+  skill: SkillManifest
+  showcase: ReturnType<typeof getFilmSkillShowcase>
+  favorite: boolean
+  onBack: () => void
+  onClose: () => void
+  onLaunch: () => void
+}) {
+  const [videoFailed, setVideoFailed] = useState(false)
+  const cover = `${import.meta.env.BASE_URL}skill-covers/${skill.slug}.webp`
+  const videoUrl = showcase?.referenceVideo && import.meta.env.BASE_URL + showcase.referenceVideo
+  return <>
+    <header className="skill-detail-bar">
+      <button className="skill-detail-back" type="button" autoFocus onClick={onBack}><ArrowLeft size={16} />返回技能库</button>
+      <button type="button" aria-label="关闭技能详情" title="关闭" onClick={onClose}><X size={20} /></button>
+    </header>
+    <main className="skill-library-content skill-detail-content">
+      <div className="skill-detail-title">
+        <div><h2>{skill.name}</h2><p>{showcase ? 'DisyLab 原创 · 通用视频 Skill' : kindLabel(skill.kind)}</p></div>
+        <div className="skill-detail-actions">
+          <button type="button" className="skill-card-favorite" aria-pressed={favorite} aria-label={favorite ? '取消收藏' : '收藏 Skill'} onClick={() => toggleSkillFavorite(skillKey(skill))}><Star size={17} /></button>
+          <button type="button" className="skill-detail-launch" onClick={onLaunch}>开始对话<ArrowUpRight size={16} /></button>
+        </div>
+      </div>
+      {showcase && <figure className="skill-detail-preview">
+        {videoUrl && !videoFailed
+          ? <video controls playsInline preload="metadata" src={videoUrl} poster={cover} aria-label="参考成片" onError={() => setVideoFailed(true)} />
+          : <img className="skill-detail-cover" src={cover} alt="" />}
+        <figcaption>
+          <span>{videoFailed ? '参考成片加载失败。' : videoUrl ? 'DisyLab 参考成片' : '技能封面'}</span>
+        </figcaption>
+      </figure>}
+      <section className="skill-detail-description">
+        <h3>可以这样开聊</h3>
+        <p>{skillOpening(skill)}</p>
+      </section>
+    </main>
+  </>
+}
+
+
+type ManageProps = {
+  userSkills: SkillManifest[]
+  notice: string
+  pendingDelete: string
+  uploading: boolean
+  deleting: boolean
+  savingUsage: boolean
+  changeSkillUsage: (skill: SkillManifest, execution: SkillManifest['execution']) => Promise<void>
+  fileRef: React.RefObject<HTMLInputElement | null>
+  folderRef: React.RefObject<HTMLInputElement | null>
+  showGuide: () => void
+  upload: (files: FileList | null, fromFolder: boolean) => Promise<void>
+  removeSkill: (skill: SkillManifest) => Promise<void>
+}
+
+function Manage({ userSkills, notice, pendingDelete, uploading, deleting, savingUsage, changeSkillUsage, fileRef, folderRef, showGuide, upload, removeSkill }: ManageProps) {
+  return <section className="skill-manager">
+    <div className="skill-factory-heading">
+      <h3>管理自建和导入的 Skill</h3>
+      <button type="button" aria-label="上传指南" onClick={showGuide}><CircleHelp size={15} />上传指南</button>
+    </div>
+    <div className="skill-manager-upload">
+      <button type="button" disabled={uploading} onClick={() => fileRef.current?.click()}>
+        <FileUp size={21} /><span><b>上传 Skill 文件</b><small>推荐 SKILL.md，也支持 DisyLab JSON</small></span>
+      </button>
+      <button type="button" disabled={uploading} onClick={() => folderRef.current?.click()}>
+        <FolderUp size={21} /><span><b>上传 Skill 文件夹</b><small>选择含有 SKILL.md 或 DisyLab JSON 的文件夹</small></span>
+      </button>
+    </div>
+    {uploading && <div className="skill-manager-notice" role="status">正在导入…</div>}
+    {notice && <div className="skill-manager-notice" role="status">{notice}</div>}
+    <div className="skill-manager-list">
+      <header><span>我的 Skill</span><em>{userSkills.length}</em></header>
+      {userSkills.map((skill) => {
+        const key = skillKey(skill)
+        const confirming = pendingDelete === key
+        return <article key={key}>
+          <i><FileText size={17} /></i>
+          <span><b>{skill.name}</b><small>{skill.slug} · v{skill.version}</small></span>
+          <SkillUsageMenu skill={skill} disabled={savingUsage || deleting} onChange={(execution) => void changeSkillUsage(skill, execution)} />
+          <button className={confirming ? 'is-confirming' : ''} type="button" disabled={deleting || savingUsage}
+            aria-label={`${confirming ? '确认删除' : '删除'} ${skill.name}`}
+            onClick={() => void removeSkill(skill)}>{confirming ? '确认删除' : <Trash2 size={15} />}</button>
+        </article>
+      })}
+      {!userSkills.length && <div className="skill-manager-empty"><FileText size={24} /><b>还没有用户 Skill</b><span>创建或导入后会出现在这里。</span></div>}
+    </div>
+    <input ref={fileRef} hidden type="file" accept=".md,.json" onChange={(event) => { void upload(event.target.files, false); event.target.value = '' }} />
+    <input ref={folderRef} hidden type="file" multiple {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)} onChange={(event) => { void upload(event.target.files, true); event.target.value = '' }} />
+  </section>
+}
+
+const skillUsageOptions = [
+  { value: 'instant', label: '直接应用', detail: '在画布节点里一步完成', icon: Zap },
+  { value: 'configured', label: '对话引导', detail: '由 Disy 在对话中逐步引导', icon: MessageCircle },
+] as const
+
+function SkillUsageMenu({ skill, disabled, onChange }: { skill: SkillManifest; disabled: boolean; onChange: (execution: SkillManifest['execution']) => void }) {
+  const id = useId()
+  const trigger = useRef<HTMLButtonElement>(null)
+  const menu = useRef<HTMLDivElement>(null)
+  const active = skillUsageOptions.find(({ value }) => value === skill.execution) ?? skillUsageOptions[1]
+  const ActiveIcon = active.icon
+  useEffect(() => {
+    const close = () => { if (menu.current?.matches(':popover-open')) menu.current.hidePopover() }
+    const scroller = trigger.current?.closest('.skill-library-content')
+    scroller?.addEventListener('scroll', close)
+    window.addEventListener('resize', close)
+    return () => { scroller?.removeEventListener('scroll', close); window.removeEventListener('resize', close) }
+  }, [])
+  return <div className="skill-manager-usage">
+    <button type="button" ref={trigger} popoverTarget={id} disabled={disabled} className="skill-usage-trigger"
+      aria-label={`${skill.name}的使用方式：${active.label}`} title="更改使用方式" onClick={() => {
+        const rect = trigger.current?.getBoundingClientRect()
+        if (!rect || !menu.current) return
+        const width = Math.min(250, window.innerWidth - 24)
+        menu.current.style.left = `${Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12))}px`
+        const above = rect.bottom + 170 > window.innerHeight && rect.top > window.innerHeight - rect.bottom
+        menu.current.style.top = above ? 'auto' : `${rect.bottom + 6}px`
+        menu.current.style.bottom = above ? `${window.innerHeight - rect.top + 6}px` : 'auto'
+      }}><ActiveIcon size={14} aria-hidden="true" /><span>{active.label}</span><ChevronDown size={13} aria-hidden="true" /></button>
+    <div ref={menu} id={id} popover="auto" className="skill-usage-menu" role="group" aria-label="使用方式" onKeyDown={(event) => {
+      if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return
+      event.preventDefault()
+      const items = Array.from(event.currentTarget.querySelectorAll('button'))
+      const index = items.indexOf(document.activeElement as HTMLButtonElement)
+      items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus()
+    }}>
+      <span className="skill-usage-heading">使用方式</span>
+      {skillUsageOptions.map(({ value, label, detail, icon: Icon }) => <button type="button" key={value}
+        autoFocus={skill.execution === value} aria-pressed={skill.execution === value} onClick={() => {
+          menu.current?.hidePopover()
+          trigger.current?.focus()
+          if (value !== skill.execution) onChange(value)
+        }}>
+        <Icon size={16} aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span>
+        {value === skill.execution && <Check size={16} aria-hidden="true" />}
+      </button>)}
+    </div>
+  </div>
 }
 
 type EditorProps = { skills: SkillManifest[]; categories: SkillCategory[]; selected: SkillCategory; name: string; notice: string; pendingDelete: string; setName: (v: string) => void; setNotice: (v: string) => void; setPendingDelete: (v: string) => void; select: (c: SkillCategory) => void; update: (c: SkillCategory[]) => void; add: () => void; deleted: (c: SkillCategory[], label: string) => void }
 function CategoryEditor({ skills, categories, selected, name, notice, pendingDelete, setName, setNotice, setPendingDelete, select, update, add, deleted }: EditorProps) {
-  const saveName = () => { const value = name.trim(); if (!value) return; update(categories.map((c) => c.id === selected.id ? { ...c, label: value } : c)); setNotice('分类名称已保存') }
-  return <section className="skill-category-manager"><div className="skill-factory-heading"><div><small>ORGANIZE SKILLS</small><h3>管理能力分类</h3></div><button type="button" onClick={add}><Plus size={15}/>新增分类</button></div><div className="skill-category-workspace"><div className="skill-category-list"><header><span>分类</span><em>{categories.length}</em></header>{categories.map((item) => { const Icon = categoryIcon(item); return <button type="button" key={item.id} className={selected.id === item.id ? 'is-active' : ''} onClick={() => select(item)}><i><Icon size={16}/></i><span><b>{item.label}</b><small>{item.id === 'all' ? '聚合全部 Skill' : item.kind ? '按类型自动收录' : '自定义收录'}</small></span><em>{skills.filter((s) => categoryContainsSkill(item, s)).length}</em></button> })}</div><div className="skill-category-editor"><header><span><Pencil size={16}/><b>编辑分类</b></span><small>{selected.system ? '系统分类' : '自定义分类'}</small></header><label><span>分类名称</span><div><input value={name} maxLength={24} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && saveName()}/><button type="button" disabled={!name.trim() || name.trim() === selected.label} onClick={saveName}><Check size={15}/>保存</button></div></label>{selected.id === 'all' ? <Rule icon={<Sparkles size={18}/>} title="固定聚合分类" text="始终包含所有能力，可以重命名，但不能删除或调整归属。"/> : selected.kind ? <Rule icon={<RotateCcw size={18}/>} title="自动收录规则" text={`按照 ${kindLabel(selected.kind)} 类型自动更新。你可以重命名或删除它。`}/> : <div className="skill-category-members"><header><span>包含的 Skill</span><em>{selected.skillKeys.length} 个已选择</em></header><div>{skills.map((skill) => { const key = skillKey(skill); const checked = selected.skillKeys.includes(key); return <button type="button" key={key} className={checked ? 'is-selected' : ''} onClick={() => { const keys = checked ? selected.skillKeys.filter((k) => k !== key) : [...selected.skillKeys, key]; update(categories.map((c) => c.id === selected.id ? { ...c, skillKeys: keys } : c)) }}><i>{checked && <Check size={13}/>}</i><span><b>{skill.name}</b><small>{kindLabel(skill.kind)} · {skill.source === 'official' ? '官方' : '用户'}</small></span></button> })}</div></div>}<footer><span>删除分类不会删除其中的 Skill。</span><button type="button" disabled={selected.id === 'all'} className={pendingDelete === `category:${selected.id}` ? 'is-confirming' : ''} onClick={() => { const key = `category:${selected.id}`; if (pendingDelete !== key) return setPendingDelete(key); const next = categories.filter((c) => c.id !== selected.id); update(next); deleted(next, selected.label) }}>{pendingDelete === `category:${selected.id}` ? '再次点击确认删除' : <><Trash2 size={14}/>删除分类</>}</button></footer></div></div>{notice && <div className="skill-manager-notice">{notice}</div>}</section>
+  const [renaming, setRenaming] = useState(false)
+  const members = skills.filter((skill) => categoryContainsSkill(selected, skill))
+  const automatic = selected.id === 'all' || Boolean(selected.kind)
+  const deleteKey = `category:${selected.id}`
+  const confirming = pendingDelete === deleteKey
+  const Icon = categoryIcon(selected)
+
+  const saveName = () => {
+    const label = name.trim()
+    if (!label) return
+    update(categories.map((category) => category.id === selected.id ? { ...category, label } : category))
+    setRenaming(false)
+    setNotice('分类名称已保存')
+  }
+  const toggleMember = (key: string) => {
+    const skillKeys = selected.skillKeys.includes(key)
+      ? selected.skillKeys.filter((item) => item !== key)
+      : [...selected.skillKeys, key]
+    update(categories.map((category) => category.id === selected.id ? { ...category, skillKeys } : category))
+  }
+  const confirmDelete = () => {
+    const next = categories.filter((category) => category.id !== selected.id)
+    update(next)
+    deleted(next, selected.label)
+  }
+
+  return <section className="skill-category-manager">
+    <header className="skill-category-heading">
+      <div><h2>分类管理</h2><p>整理技能库里的分类和技能。</p></div>
+      <button type="button" className="skill-category-add" onClick={add}><Plus size={17} />新增分类</button>
+    </header>
+    <div className="skill-category-workspace">
+      <nav className="skill-category-list" aria-label="分类列表">
+        {categories.map((category) => {
+          const CategoryIcon = categoryIcon(category)
+          return <button type="button" key={category.id} aria-pressed={selected.id === category.id} onClick={() => select(category)}>
+            <CategoryIcon size={17} /><span>{category.label}</span>
+            <em>{skills.filter((skill) => categoryContainsSkill(category, skill)).length}</em>
+          </button>
+        })}
+      </nav>
+      <div className="skill-category-editor">
+        <header className="skill-category-summary">
+          <span className="skill-category-symbol"><Icon size={22} /></span>
+          <div><h3>{selected.label}</h3><p>{members.length} 个技能 <span aria-hidden="true">·</span> {selected.id === 'all' ? '包含所有技能' : selected.kind ? '按类型自动收录' : '手动选择收录'}</p></div>
+          <div className="skill-category-tools">
+            <button type="button" aria-label="重命名分类" title="重命名" onClick={() => { setPendingDelete(''); setRenaming(true) }}><Pencil size={16} /></button>
+            {selected.id !== 'all' && <button type="button" aria-label="删除分类" title="删除分类" onClick={() => { setRenaming(false); setPendingDelete(confirming ? '' : deleteKey) }}><Trash2 size={16} /></button>}
+          </div>
+        </header>
+        {renaming && <form className="skill-category-rename" onSubmit={(event) => { event.preventDefault(); saveName() }}>
+          <input autoFocus aria-label="分类名称" value={name} maxLength={24} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setName(event.target.value)} />
+          <button type="button" onClick={() => { setName(selected.label); setRenaming(false) }}>取消</button>
+          <button type="submit" className="skill-category-add" disabled={!name.trim() || name.trim() === selected.label}>保存</button>
+        </form>}
+        {confirming && <div className="skill-category-delete">
+          <span>删除「{selected.label}」？其中的技能会保留。</span>
+          <button type="button" onClick={() => setPendingDelete('')}>取消</button>
+          <button type="button" className="is-danger" onClick={confirmDelete}>确认删除</button>
+        </div>}
+        <div className="skill-category-members">
+          <h4>{automatic ? '已收录' : '选择要收录的技能'}</h4>
+          {(automatic ? members : skills).length ? <ul>
+            {(automatic ? members : skills).map((skill) => {
+              const key = skillKey(skill)
+              const SkillIcon = skill.kind === 'video' ? Film : skill.kind === 'image' ? Image : FileText
+              return <li key={key}>
+                {automatic
+                  ? <div className="skill-category-member"><SkillIcon size={16} /><span title={skill.name}>{skill.name}</span></div>
+                  : <label className="skill-category-member"><input type="checkbox" checked={selected.skillKeys.includes(key)} onChange={() => toggleMember(key)} /><span title={skill.name}>{skill.name}</span></label>}
+              </li>
+            })}
+          </ul> : <p className="skill-category-empty">这个分类还没有技能。</p>}
+        </div>
+      </div>
+    </div>
+    {notice && <div className="skill-manager-notice" role="status">{notice}</div>}
+  </section>
 }
-function Rule({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="skill-category-rule">{icon}<span><b>{title}</b><small>{text}</small></span></div> }
-function Guide({ notice, setView, setNotice }: { notice: string; setView: (v: FactoryView) => void; setNotice: (v: string) => void }) { return <section className="skill-upload-guide"><div className="skill-factory-heading"><div><small>UPLOAD MANUAL</small><h3>用户 Skill 上传指南</h3></div><button type="button" onClick={() => setView('manage')}><Settings2 size={15}/>前往管理</button></div><div className="skill-guide-steps"><article><i>01</i><div><b>准备 Manifest</b><p>创建 UTF-8 JSON 文件。</p></div></article><article><i>02</i><div><b>选择上传方式</b><p>支持单文件或文件夹批量上传。</p></div></article><article><i>03</i><div><b>通过安全校验</b><p>拒绝 API Key、脚本和自定义端点。</p></div></article><article><i>04</i><div><b>更新与删除</b><p>内置 Skill 不可删除。</p></div></article></div><div className="skill-guide-example"><header><span><FileJson size={17}/><b>最小可用示例</b></span><button type="button" onClick={() => void navigator.clipboard.writeText(exampleManifest).then(() => setNotice('示例 Manifest 已复制'))}><Copy size={14}/>复制示例</button></header><pre>{exampleManifest}</pre></div>{notice && <div className="skill-manager-notice">{notice}</div>}</section> }
+function Guide({ notice, setView, setNotice }: { notice: string; setView: (v: FactoryView) => void; setNotice: (v: string) => void }) {
+  const copy = async (example: string) => {
+    try {
+      await navigator.clipboard.writeText(example)
+      setNotice('已复制示例。')
+    } catch {
+      setNotice('复制失败，请选中示例后手动复制。')
+    }
+  }
+
+  return <section className="skill-upload-guide">
+    <div className="skill-factory-heading">
+      <h3>Skill 上传指南</h3>
+      <button type="button" aria-label="返回上传" onClick={() => { setNotice(''); setView('manage') }}><Settings2 size={15} />返回上传</button>
+    </div>
+    <div className="skill-guide-steps">
+      <article><i>01</i><div><b>准备 SKILL.md</b><p>文件顶部填写 name 和 description，下面写清步骤、输入和期望输出。建议用 UTF-8 保存。</p></div></article>
+      <article><i>02</i><div><b>上传文件或文件夹</b><p>可选单个 SKILL.md，也可选择包含它的文件夹。文件夹里有多个 Skill 时会逐个导入。</p></div></article>
+      <article><i>03</i><div><b>导入为文本 Skill</b><p>DisyLab 读取 SKILL.md 里的文字指令。请把完成任务必需的内容写在正文里。</p></div></article>
+      <article><i>04</i><div><b>兼容 DisyLab JSON</b><p>已有 DisyLab Skill 可直接上传 .disy-skill.json 或 .json，保留其配置参数和输出类型。</p></div></article>
+    </div>
+    <div className="skill-guide-example">
+      <header>
+        <span><FileText size={17} /><b>SKILL.md 示例</b></span>
+        <div className="skill-guide-copy">
+          <button type="button" onClick={() => void copy(exampleMarkdown)}><Copy size={14} />复制 Markdown</button>
+          <button type="button" onClick={() => void copy(exampleManifest)}>复制 JSON 示例</button>
+        </div>
+      </header>
+      <pre>{exampleMarkdown}</pre>
+    </div>
+    {notice && <div className="skill-manager-notice" role="status">{notice}</div>}
+  </section>
+}
 

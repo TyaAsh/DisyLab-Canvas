@@ -2,6 +2,8 @@ import Handlebars from 'handlebars'
 import type { SkillManifest } from './types'
 
 export function renderSkillPrompt(skill: SkillManifest, subject: string, overrides: Record<string, string | number | boolean> = {}) {
+  const task = '\n\n本次任务\n' + subject
+  if (skill.template.format === 'plain') return skill.template.prompt.slice(0, Math.max(0, 24000 - task.length)) + task.slice(0, 24000)
   const defaults = Object.fromEntries(skill.parameters.map((parameter) => [
     parameter.name,
     parameter.bind === 'prompt' ? subject : parameter.default,

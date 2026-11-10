@@ -1,3 +1,4 @@
+import { providerFetch } from '../providerTransport'
 import type { ComicAssetCategory, ComicWorkflowState } from './storyboard'
 
 type ExportEntry = { path: string; data: Uint8Array }
@@ -9,7 +10,7 @@ const bytes = (value: string) => encoder.encode(value)
 const extFromType = (type: string) => type.includes('jpeg') ? 'jpg' : type.includes('webp') ? 'webp' : 'png'
 
 async function fetchEntry(path: string, url: string): Promise<ExportEntry> {
-  const response = await fetch(url)
+  const response = await providerFetch(url)
   if (!response.ok) throw new Error(`无法读取素材：${path}`)
   const blob = await response.blob()
   const extension = extFromType(blob.type)

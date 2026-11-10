@@ -7,7 +7,7 @@ const CORS = {
 function mediaHostAllowed(url) {
   return url.protocol === 'https:'
     && !url.username && !url.password && !url.port
-    && /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$/i.test(url.hostname)
+    && /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
 }
 
 export async function onRequest({ request }) {
@@ -40,6 +40,8 @@ export async function onRequest({ request }) {
     }
     if (!upstream) return new Response('media upstream connection failed', { status: 502, headers: CORS })
     const headers = new Headers(CORS)
+    headers.set('Content-Security-Policy', "sandbox; default-src 'none'; style-src 'unsafe-inline'")
+    headers.set('X-Content-Type-Options', 'nosniff')
     for (const name of ['content-type', 'content-length', 'cache-control', 'etag', 'last-modified']) {
       const value = upstream.headers.get(name)
       if (value) headers.set(name, value)

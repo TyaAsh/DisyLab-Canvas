@@ -1,0 +1,79 @@
+.toolbox-drop-zone {
+  display: grid; justify-items: center; align-content: center; gap: 5px;
+  width: 100%; min-height: 116px; padding: 14px;
+  border: 1px dashed #526a86; border-radius: 14px;
+  color: #eef4fd; background: linear-gradient(145deg, #252f3d, #1b222c);
+  box-shadow: inset 0 1px #ffffff08;
+  transition: border-color .16s ease, background .16s ease;
+}
+.toolbox-drop-zone:enabled:is(:hover, .is-drag-over) { border-color: #98c4ff; background: #28384b; }
+.toolbox-drop-zone:disabled { opacity: .55; }
+.toolbox-drop-zone strong { font-size: 13px; }
+.toolbox-drop-zone small { color: #b3c2d4; font-size: 12px; line-height: 1.5; }
+.toolbox-drop-icon { display: grid; place-items: center; width: 34px; height: 34px; margin-bottom: 2px; border-radius: 10px; color: #b2d3ff; background: #85b7ff20; }
+.toolbox-panel input[type="range"] { accent-color: #8ebcff; }
+.toolbox-panel select { color-scheme: dark; }
+.toolbox-panel :is(button, select, input[type="range"], a):focus-visible { outline: 2px solid #9ac8ff; outline-offset: 2px; }
+
+.toolbox-panel.is-watermark-tool { width: min(712px, calc(100vw - 86px)); }
+.watermark-tool { display: grid; gap: 10px; }
+.watermark-file { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.watermark-file > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.watermark-file > div { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; }
+.watermark-tool :is(.watermark-file, .watermark-player-controls, .watermark-options, .watermark-export) button,
+.watermark-tool .watermark-primary {
+  display: inline-flex; align-items: center; justify-content: center; flex: none; gap: 6px;
+  min-height: 34px; padding: 4px 10px; border: 1px solid #859db54a; border-radius: 8px;
+  color: #e1eaf6; background: #222b36; font-size: 12px; font-weight: 650; text-decoration: none;
+}
+.watermark-tool :is(.watermark-file, .watermark-player-controls, .watermark-options, .watermark-export) button:enabled:hover { border-color: #8ebcff; background: #334861; }
+.watermark-tool button:disabled { opacity: .45; }
+.watermark-tool button[aria-pressed="true"] { border-color: #7aaceb; background: #304864; }
+.watermark-stage {
+  position: relative; isolation: isolate; width: min(100%, calc(37dvh * var(--video-ratio))); aspect-ratio: var(--video-ratio);
+  margin-inline: auto; overflow: hidden; border-radius: 11px; background: #0b0f15;
+  box-shadow: 0 0 0 1px #ffffff18;
+}
+.watermark-stage[data-ready="true"][data-preview="false"] { cursor: crosshair; touch-action: none; user-select: none; }
+.watermark-stage > :is(video, canvas, img) { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.watermark-stage > canvas { background: #0b0f15; }
+.watermark-region {
+  position: absolute; min-width: 0; min-height: 0; padding: 0;
+  border: 1px solid #b4d8ff; border-radius: 3px; background: #609fff35; color: #fff; cursor: move;
+  box-shadow: 0 0 0 1px #19283f99;
+}
+.watermark-region.is-selected { border: 2px solid #b7dcff; background: #609fff44; }
+.watermark-region.is-draft { border-style: dashed; pointer-events: none; }
+.watermark-region > span { position: absolute; top: 1px; left: 1px; padding: 0 4px; border-radius: 3px; background: #193554; font-size: 10px; line-height: 15px; pointer-events: none; }
+.watermark-resize { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border: 1px solid #193554; border-radius: 3px 0 2px 0; background: #b7dcff; cursor: nwse-resize; }
+.watermark-player-controls { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.watermark-player-controls > button { padding-inline: 0; }
+.watermark-player-controls > input { width: 100%; }
+.watermark-player-controls > span { color: #c1c9d5; font-size: 12px; font-variant-numeric: tabular-nums; }
+.watermark-options, .watermark-export { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.watermark-options > div, .watermark-export > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.watermark-options > p, .watermark-export > small, .watermark-export > div { margin: 0; color: #c1c9d5; font-size: 12px; }
+.watermark-export { border-top: 1px solid #ffffff19; padding-top: 9px; }
+.watermark-tool .watermark-primary { border-color: transparent; background: #c3ddff; color: #13243c; }
+.watermark-tool .watermark-primary:is(a, :enabled):hover { border-color: #d9ebff; background: #d9ebff; color: #13243c; }
+.watermark-result { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 10px; border-top: 1px solid #ffffff19; padding-top: 9px; }
+.watermark-result > :is(video, img) { width: min(100%, 350px); max-height: 160px; object-fit: contain; border-radius: 8px; background: #0b0f15; }
+.watermark-status { margin: 0; color: #ffd0b6; font-size: 12px; }
+.watermark-original { color: #c5dfff; font-size: 12px; padding-inline: 7px; }
+.watermark-link { display: grid; gap: 8px; padding: 12px; border: 1px solid #69819d55; border-radius: 12px; background: #202832; }
+.watermark-link > label { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.watermark-link > label svg { color: #b2d3ff; }
+.watermark-link-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.watermark-link :is(input, select, button) { min-width: 0; min-height: 37px; padding: 5px 9px; border: 1px solid #7089a25e; border-radius: 7px; background: #131b25; color: #eef4fd; font-size: 12px; }
+.watermark-link input::placeholder { color: #a8b8cc; }
+.watermark-link button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #c3ddff; color: #13243c; font-weight: 680; }
+.watermark-link button:enabled:hover { background: #dfedff; }
+.watermark-link button:disabled { background: #324052; color: #c5cfdc; }
+.watermark-link .watermark-link-pick { flex-wrap: wrap; color: #c8d7e8; }
+
+@media (max-width: 620px) {
+  .toolbox-panel.is-watermark-tool { width: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toolbox-drop-zone { transition: none; }
+}

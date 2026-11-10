@@ -13,6 +13,15 @@ export type AgentMessage = {
   content: string
   createdAt: string
   references?: AgentImageReference[]
+  skillUseId?: string
+  questions?: AgentQuestion[]
+  filmPlan?: {
+    skillSlug: string
+    subject: string
+    values: Record<string, string | number | boolean>
+    references: AgentImageReference[]
+    nodeId?: string
+  }
   textNode?: {
     title: string
     content: string
@@ -20,6 +29,8 @@ export type AgentMessage = {
   }
   decision?: AgentDecision
 }
+
+export type AgentQuestion = { prompt: string; options: string[]; example?: string }
 
 export type AgentImageReference = {
   nodeId: string
@@ -167,6 +178,8 @@ export interface CanvasAgentService {
 
 export type AgentReply = {
   reply: string
+  questions?: AgentQuestion[]
+  filmDraft?: { subject: string; values: Record<string, unknown> }
   decision?: AgentDecision
   imagePlan?: AgentImagePlanDraft
   imagePlans?: AgentImagePlanDraft[]
@@ -268,7 +281,7 @@ function extractFirstJsonContainer(value: string) {
 function normalizeAgentReplyRecord(value: unknown): Record<string, unknown> | null {
   if (Array.isArray(value)) {
     const records = value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode'].some((field) => field in record))
+    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode', 'filmDraft', 'questions'].some((field) => field in record))
     return protocolRecords.length ? Object.assign({}, ...protocolRecords) : null
   }
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -301,13 +314,13 @@ function extractMalformedReply(value: string) {
 
 function looksLikeAgentProtocolPayload(value: string) {
   const cleaned = value.trim()
-  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode)(?:["']|\\["'])?\s*:/i.test(cleaned)
+  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode|filmDraft|questions)(?:["']|\\["'])?\s*:/i.test(cleaned)
   if (!hasProtocolField) return false
   return /^```(?:json|js)?/i.test(cleaned)
     || /^[\[{"']/.test(cleaned)
-    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode)\s*:/i.test(cleaned)
-    || /^(?:reply|imagePlans?|videoPlans?|textNode)\s*:/i.test(cleaned)
-    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode)\s*:/i.test(cleaned)
+    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
+    || /^(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
+    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
 }
 
 export function normalizeAgentMessageContent(content: string) {
@@ -331,6 +344,23 @@ export function parseAgentReply(raw: string): AgentReply {
     const value = parseAgentReplyRecord(cleaned)
     if (!value) throw new Error('Invalid Agent response payload')
     const reply = typeof value.reply === 'string' ? value.reply.trim() : ''
+    const questions: AgentQuestion[] = []
+    if (Array.isArray(value.questions)) {
+      for (const item of value.questions.slice(0, 4)) {
+        if (typeof item?.prompt !== 'string') continue
+        const prompt = item.prompt.trim().slice(0, 180)
+        if (!prompt || questions.some((question) => question.prompt === prompt)) continue
+        const options = Array.isArray(item.options)
+          ? [...new Set<string>(item.options.filter((option: unknown) => typeof option === 'string').map((option: string) => option.trim().slice(0, 120)).filter(Boolean))].slice(0, 5)
+          : []
+        questions.push({ prompt, options, example: typeof item.example === 'string' ? item.example.trim().slice(0, 160) : undefined })
+      }
+    }
+    const draft = value.filmDraft && typeof value.filmDraft === 'object' ? value.filmDraft as Record<string, unknown> : null
+    const filmDraft = typeof draft?.subject === 'string' && draft.subject.trim()
+      && draft.values && typeof draft.values === 'object' && !Array.isArray(draft.values)
+      ? { subject: draft.subject.trim().slice(0, 8000), values: draft.values as Record<string, unknown> }
+      : undefined
     const decisionValue = value.decision && typeof value.decision === 'object' && !Array.isArray(value.decision)
       ? value.decision as Record<string, unknown>
       : null
@@ -392,10 +422,14 @@ export function parseAgentReply(raw: string): AgentReply {
       : undefined
     return {
       reply: reply
+        || (questions.length ? '先确认几个细节，我们就能继续。' : '')
         || (imagePlans.length ? `我已整理好${imagePlans.length > 1 ? `${imagePlans.length}份` : '一份'}图像方案，请选择并确认后生成。` : '')
         || (videoPlans.length ? `我已整理好${videoPlans.length > 1 ? `${videoPlans.length}份` : '一份'}视频方案，请确认后生成。` : '')
+        || (filmDraft ? '成片方案整理好了，可以先看一眼再开始制作。' : '')
         || (textNode ? '我已整理好最终文本，并放入画布文本节点。' : '这次回复格式异常，请重新发送一次。'),
       decision,
+      questions: questions.length ? questions : undefined,
+      filmDraft,
       imagePlan: imagePlans[0],
       imagePlans: imagePlans.length ? imagePlans : undefined,
       videoPlan: videoPlans[0],

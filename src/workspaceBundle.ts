@@ -7,6 +7,8 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
+import { providerFetch } from './providerTransport'
+
 /** Binary DisyLab workspace bundle — avoids giant base64 JSON string limits. */
 
 const MAGIC = 'DISYLAB1'
@@ -189,7 +191,7 @@ export async function fetchMediaBlob(source: string, timeoutMs = 3500): Promise<
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch(trimmed, { signal: controller.signal })
+    const response = await providerFetch(trimmed, { signal: controller.signal })
     if (!response.ok) return null
     const blob = await response.blob()
     return blob.size ? blob : null
