@@ -11,6 +11,9 @@ import { isDesktopApp, providerFetch } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
 import { inferModelCapability, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
+import { apiProviderForBase } from './apiProviders'
+import { checkMuseWebAccount, isMuseWebBase, listMuseWebModels, runMuseWebTask } from './museWeb'
+import { checkJimengAccount, isJimengCliBase, jimengImageRatios, jimengImageResolutions, listJimengModels, parseJimengJson, readJimengMedia, runJimengCli } from './jimengCli'
 
 export { inferModelCapability } from './modelCatalog'
 
@@ -137,6 +140,21 @@ function blobToDataUrl(blob: Blob) {
     reader.onerror = () => reject(reader.error ?? new Error('参考图片读取失败'))
     reader.readAsDataURL(blob)
   })
+}
+
+async function museWebReferences(sources: (string | undefined)[], signal?: AbortSignal) {
+  const distinct = [...new Set(sources.filter((source): source is string => Boolean(source)))]
+  if (distinct.length > 8) throw new Error('Muse 网页连接最多支持 8 张参考图。')
+  let totalBytes = 0
+  const references: string[] = []
+  for (const source of distinct) {
+    const blob = await readImageSourceBlob(source, signal)
+    totalBytes += blob.size
+    if (totalBytes > 24_000_000) throw new Error('Muse 参考图超过 24 MB，请缩小后重试。')
+    if (!/^image\/(?:png|jpeg|webp|gif)$/.test(blob.type)) throw new Error('Muse 参考图请使用 PNG、JPEG、WebP 或 GIF。')
+    references.push(await blobToDataUrl(blob))
+  }
+  return references
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
@@ -395,7 +413,8 @@ function normalizedApiBaseUrl(baseUrl: string) {
     host = 'api.visionary.beer'
   }
   if (!url.pathname || url.pathname === '/') {
-    const defaultPath = host === 'api.openai.com' || host === 'api.anthropic.com' || host === 'api.deepseek.com' || /siliconflow\.cn$/i.test(host)
+    const preset = apiProviderForBase(url.href)
+    const defaultPath = preset ? new URL(preset.baseUrl).pathname : host === 'api.openai.com' || host === 'api.anthropic.com' || host === 'api.deepseek.com' || /siliconflow\.cn$/i.test(host)
       ? '/v1'
       : /(?:api\.apiyi\.com|apiyi\.com|apimart\.ai)$/i.test(host)
         ? '/v1'
@@ -433,7 +452,12 @@ function endpoint(baseUrl: string, path: string) {
     return `/evolink/${path.replace(/^\//, '')}`
   }
   const url = new URL(normalizedApiBaseUrl(baseUrl))
-  url.pathname = `${url.pathname.replace(/\/$/, '')}/${path.replace(/^\//, '')}`
+  const [pathname, query] = path.split('?')
+  url.pathname = pathname.startsWith('/') ? pathname : `${url.pathname.replace(/\/$/, '')}/${pathname}`
+  if (query) url.search = query
+  const provider = apiProviderForBase(url.href)
+  if (typeof window !== 'undefined' && !isDesktopApp() && provider && ['relayon', 'minimax', 'xai', 'ark', 'muse'].includes(provider.id)
+    && url.origin === new URL(provider.baseUrl).origin) return `/provider/${provider.id}${url.pathname}${url.search}`
   return url.toString()
 }
 
@@ -569,7 +593,29 @@ export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
 }
 
 export function getImageModelCapabilities(baseUrl: string, model: string) {
-  return getGrsaiImageCapabilities(baseUrl, model) ?? getHfsyImageCapabilities(baseUrl, model)
+  const known = getGrsaiImageCapabilities(baseUrl, model) ?? getHfsyImageCapabilities(baseUrl, model)
+  if (known) return known
+  const provider = apiProviderForBase(baseUrl)?.id
+  const common = { outputs: ['png'] as readonly ImageOutput[], customRatio: false }
+  if (isJimengCliBase(baseUrl)) return {
+    ...common, ratios: jimengImageRatios, resolutions: jimengImageResolutions(model),
+    images: /^3\./.test(model) ? 0 : 10, qualities: [] as readonly ImageQuality[],
+  }
+  if (provider === 'xai') return {
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+    resolutions: ['1K', '2K'] as readonly ImageResolution[], images: /2\.0/.test(model) ? 5 : 1,
+    qualities: (/2\.0/.test(model) ? ['low', 'medium', 'high'] : []) as readonly ImageQuality[],
+  }
+  if (provider === 'muse') return {
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+    resolutions: [] as readonly ImageResolution[], images: 4, qualities: [] as readonly ImageQuality[],
+  }
+  if (provider === 'ark') return {
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'],
+    resolutions: (/5[-.]0[-.]pro/.test(model) ? ['1K', '2K'] : /5[-.]0/.test(model) ? ['2K'] : ['2K', '4K']) as readonly ImageResolution[],
+    images: /4[-.]0/.test(model) ? 10 : 14, qualities: [] as readonly ImageQuality[],
+  }
+  return undefined
 }
 
 function numericAspectRatio(value: string) {
@@ -683,7 +729,8 @@ export function resolveProviderLabel(baseUrl: string) {
   if (/(?:www\.|api\.|apigo\.)?hfsyapi\.cn/.test(normalized)) return 'HFSY'
   if (/api\.apimart\.ai|apimart\.ai/.test(normalized)) return 'APIMart'
   if (/gptgod\.online|gptgod\.com/.test(normalized)) return 'GPTGod'
-  if (/ark\.cn-beijing\.volces\.com/.test(normalized)) return '即梦'
+  const provider = apiProviderForBase(normalized)
+  if (provider) return provider.name
   if (/api\.openai\.com/.test(normalized)) return 'OpenAI'
   if (/api\.siliconflow\.cn|siliconflow/.test(normalized)) return '硅基流动'
   if (/api\.deepseek\.com/.test(normalized)) return 'DeepSeek'
@@ -768,6 +815,170 @@ function videoResultUrl(payload: unknown): string {
 
 function videoTaskStatus(payload: unknown, fallback = 'queued') {
   return extractProviderTaskStatus(payload) || fallback
+}
+
+async function nativeImageSource(source: string, signal?: AbortSignal) {
+  if (/^(?:https:\/\/|data:image\/)/i.test(source)) return source
+  return mediaSourceForApiYi(source, signal)
+}
+
+async function prepareJimengInputs(references: string[], signal?: AbortSignal) {
+  if (references.length > 10) throw new GenerationRequestError('platform', '即梦最多接受 10 张参考图', '请减少参考图后再提交。')
+  const files = await Promise.all(references.map((source) => readImageSourceBlob(source, signal, '即梦参考图')))
+  if (files.reduce((sum, file) => sum + file.size, 0) > 30_000_000) throw new GenerationRequestError('platform', '即梦参考图太大', '请将参考图总大小降到 30 MB 以内。')
+  return Promise.all(files.map(async (file) => Array.from(new Uint8Array(await file.arrayBuffer()))))
+}
+
+async function generateJimengMedia(kind: 'image' | 'video', input: NonNullable<Parameters<typeof runJimengCli>[1]>, options: {
+  signal?: AbortSignal
+  onTaskId?: (taskId: string) => void
+  onProgress?: (progress: number, status: string) => void
+}) {
+  options.signal?.throwIfAborted()
+  let result = parseJimengJson(await runJimengCli(kind, input))
+  const taskId = String(result?.submit_id ?? (result?.data as Record<string, unknown> | undefined)?.submit_id ?? '')
+  if (!/^[\w-]{1,256}$/.test(taskId)) throw new GenerationRequestError('api', '即梦没有返回任务编号', '请先在即梦任务记录确认是否已提交。')
+  options.onTaskId?.(taskId)
+  const started = Date.now()
+  let failures = 0
+  while (Date.now() - started < 30 * 60_000) {
+    options.signal?.throwIfAborted()
+    const task = (result?.data ?? result) as Record<string, unknown> | undefined
+    const status = String(task?.gen_status ?? task?.status ?? '').toLowerCase()
+    if (/^(?:fail|failed|failure|error|cancelled|canceled|rejected)$/.test(status)) {
+      throw new GenerationRequestError('api', '即梦生成失败', String(task?.fail_reason ?? task?.message ?? '请在即梦查看任务详情。'), { requestId: taskId })
+    }
+    if (/^(?:success|succeeded|completed|done)$/.test(status)) {
+      try {
+        await runJimengCli('download', { id: taskId })
+        const media = await readJimengMedia(taskId, kind === 'video')
+        options.signal?.throwIfAborted()
+        options.onProgress?.(100, 'completed')
+        return { bytes: new Uint8Array(media), taskId }
+      } catch (error) {
+        if (options.signal?.aborted) throw error
+        throw new GenerationRequestError('network', '即梦任务已完成，但下载失败', '请先在即梦任务记录下载，不要重复提交。', { requestId: taskId })
+      }
+    }
+    options.onProgress?.(0, status || 'queued')
+    await waitForDelay(4_000, options.signal)
+    try {
+      result = parseJimengJson(await runJimengCli('query', { id: taskId }))
+      if (!result) throw new Error('即梦未返回任务状态')
+      failures = 0
+    } catch {
+      if (++failures >= 3) throw new GenerationRequestError('network', '即梦任务查询暂时中断', '任务可能仍在运行，请在即梦任务记录查询。', { requestId: taskId })
+    }
+  }
+  throw new GenerationRequestError('network', '即梦等待超时', '任务可能仍在运行，请在即梦任务记录查询。', { requestId: taskId })
+}
+
+async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const h3 = provider === 'minimax' && /^minimax-h3/i.test(settings.model)
+  const first = options.firstFrame ?? (options.mode === 'image2video' ? options.referenceImage : undefined)
+  const last = options.lastFrame
+  const images = Array.from(new Set([...(options.referenceImages ?? []), options.referenceImage].filter((url): url is string => Boolean(url && url !== first))))
+  const videos = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((url): url is string => Boolean(url))))
+  const audios = options.referenceAudios ?? []
+  const ratio = options.aspectRatio === 'auto' ? undefined : options.aspectRatio
+    ?? (options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1' : /^\d+:\d+$/.test(options.size) ? options.size : '16:9')
+  const invalid = (message: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', message) }
+  if (!options.prompt.trim()) invalid('请填写视频提示词')
+  if (provider === 'xai' && audios.length) invalid('Grok 视频只接受官方预设音色，不支持此处的音频素材')
+  if (provider === 'xai' && videos.length && (videos.length > 1 || first || last || images.length)) invalid('Grok 视频编辑仅接受一个视频素材，请移除其他参考')
+  if (provider === 'minimax' && !h3 && (last || videos.length || audios.length || images.length > 1)) invalid('此海螺模型仅支持一张首帧图，多素材请使用 H3')
+  if (provider === 'xai' && last && !/video-1\.5/i.test(settings.model)) invalid('尾帧需要 Grok Imagine Video 1.5')
+  const firstSource = first ? await nativeImageSource(first, options.signal) : undefined
+  const lastSource = last ? await nativeImageSource(last, options.signal) : undefined
+  const references = await Promise.all(images.map((url) => nativeImageSource(url, options.signal)))
+  const content = [
+    { type: 'text', text: options.prompt },
+    ...(firstSource ? [{ type: 'image_url', image_url: { url: firstSource }, role: 'first_frame' }] : []),
+    ...(lastSource ? [{ type: 'image_url', image_url: { url: lastSource }, role: 'last_frame' }] : []),
+    ...references.map((url) => ({ type: 'image_url', image_url: { url }, role: 'reference_image' })),
+    ...videos.map((url) => ({ type: 'video_url', video_url: { url }, role: 'reference_video' })),
+    ...audios.map((url) => ({ type: 'audio_url', audio_url: { url }, role: 'reference_audio' })),
+  ]
+  const model = settings.model
+  const resolution = options.resolution?.replace(/k$/, 'K')
+  const createPath = provider === 'ark' ? 'contents/generations/tasks'
+    : provider === 'xai' ? (videos.length ? 'videos/edits' : 'videos/generations')
+      : h3 ? '/v2/video_generation' : 'video_generation'
+  const body = provider === 'ark' ? {
+    model, content, duration: options.seconds, ratio: ratio ?? 'adaptive', resolution,
+    generate_audio: options.generateAudio, watermark: false,
+  } : provider === 'xai' ? {
+    model, prompt: options.prompt,
+    ...(videos.length ? { video: { url: videos[0] } } : {
+      duration: options.seconds, aspect_ratio: ratio, resolution, generate_audio: options.generateAudio,
+      ...(firstSource ? { image: { url: firstSource } } : {}),
+      ...(lastSource ? { last_frame: { url: lastSource } } : {}),
+      ...(references.length ? { reference_images: references.map((url) => ({ url })) } : {}),
+    }),
+  } : h3 ? {
+    model, content, duration: options.seconds, resolution: /^720p$/i.test(resolution ?? '') ? '768P' : (resolution ?? '768P').toUpperCase(),
+    ratio: firstSource || lastSource ? 'adaptive' : ratio ?? '16:9',
+  } : {
+    model, prompt: options.prompt, duration: options.seconds, resolution: (resolution ?? '720P').toUpperCase(),
+    first_frame_image: firstSource ?? references[0],
+  }
+  const request = async (path: string, payload?: object) => {
+    const response = await providerFetch(endpoint(settings.baseUrl, path), {
+      method: payload ? 'POST' : 'GET', signal: options.signal,
+      headers: compatibleApiHeaders(settings, payload ? { 'Content-Type': 'application/json' } : undefined),
+      body: payload ? JSON.stringify(payload) : undefined,
+    })
+    if (!response.ok) throw await createApiError(response)
+    const result = await response.json() as Record<string, unknown>
+    const base = result.base_resp as { status_code?: number; status_msg?: string } | undefined
+    if (base?.status_code) throw new GenerationRequestError('api', '厂商拒绝了视频请求', base.status_msg ?? String(base.status_code))
+    return result
+  }
+  let result = await request(createPath, body)
+  const unwrap = (value: Record<string, unknown>) => (value.task ?? value) as Record<string, unknown>
+  const taskId = extractTaskId(unwrap(result))
+  if (!taskId) throw new GenerationRequestError('platform', '厂商没有返回视频任务编号', sanitizeAdminLogJson(result))
+  options.onTaskId?.(taskId)
+  const id = encodeURIComponent(taskId)
+  const pollPath = provider === 'ark' ? `contents/generations/tasks/${id}`
+    : provider === 'xai' ? `videos/${id}` : h3 ? `/v2/query/video_generation/${id}` : `query/video_generation?task_id=${id}`
+  const started = Date.now()
+  let failures = 0
+  while (Date.now() - started < 30 * 60_000) {
+    const task = unwrap(result)
+    const status = videoTaskStatus(task)
+    if (/^(?:fail(?:ed|ure)?|error|expired|cancell?ed|rejected)$/.test(status)) {
+      throw new GenerationRequestError('api', '视频生成失败', sanitizeAdminLogJson(task.error ?? task), { requestId: taskId })
+    }
+    const completed = /^(?:done|success|succeeded|completed|complete)$/.test(status)
+    if (completed) {
+      let sourceUrl = videoResultUrl((task.video as object | undefined) ?? task)
+      if (!sourceUrl && provider === 'minimax' && !h3 && task.file_id) {
+        const fileResult = await request(`files/retrieve?file_id=${encodeURIComponent(String(task.file_id))}`)
+        const file = fileResult.file as { download_url?: string } | undefined
+        sourceUrl = file?.download_url ?? ''
+      }
+      if (!/^https?:\/\//i.test(sourceUrl)) throw new GenerationRequestError('platform', '视频已生成但厂商没有返回下载地址', sanitizeAdminLogJson(task), { requestId: taskId })
+      try {
+        const blob = await downloadGeneratedVideoBlob(sourceUrl, { signal: options.signal })
+        options.onProgress?.(100, 'completed')
+        return { blob, taskId, progress: 100, sourceUrl }
+      } catch (error) {
+        if (options.signal?.aborted) throw error
+        throw new GenerationRequestError('network', '视频已生成但本地下载失败', error instanceof Error ? error.message : String(error), { requestId: taskId, resultUrls: [sourceUrl] })
+      }
+    }
+    options.onProgress?.(providerTaskPercent(task) ?? 0, status)
+    await waitForDelay(3_000, options.signal)
+    try {
+      result = await request(pollPath)
+      failures = 0
+    } catch (error) {
+      if (options.signal?.aborted || (error instanceof GenerationRequestError && (error.status == null || (error.status < 500 && ![408, 429].includes(error.status))))) throw error
+      if (++failures >= 3) throw new GenerationRequestError('network', '视频任务查询暂时中断', '任务可能仍在生成，请在厂商控制台查询。', { requestId: taskId })
+    }
+  }
+  throw new GenerationRequestError('network', '视频生成等待超时', '任务可能仍在生成，请在厂商控制台查询。', { requestId: taskId })
 }
 
 async function waitForReplicatedVideoUrl(taskUrl: string, headers: HeadersInit, initialPayload: unknown, signal?: AbortSignal) {
@@ -1300,6 +1511,8 @@ async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'b
 }
 
 export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<RemoteModel[]> {
+  if (isMuseWebBase(settings.baseUrl)) return listMuseWebModels()
+  if (isJimengCliBase(settings.baseUrl)) return listJimengModels()
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   const signal = AbortSignal.timeout(15_000)
   if (isHfsyBaseUrl(normalizedBase)) return fetchHfsyMarketplaceCatalog(settings, signal)
@@ -1330,9 +1543,36 @@ export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'base
 /** OpenAI-compatible asynchronous video job. Large media stays as a Blob and is
  * never converted to base64, keeping React state and canvas snapshots small. */
 async function generateRemoteVideoRequest(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  if (isMuseWebBase(settings.baseUrl)) {
+    if (options.referenceVideo || options.referenceVideos?.length || options.referenceAudios?.length) {
+      throw new GenerationRequestError('platform', 'Muse 网页连接目前支持图片参考', '请移除视频或音频参考后重试。')
+    }
+    const references = await museWebReferences([options.firstFrame, options.lastFrame, options.referenceImage, ...(options.referenceImages ?? [])], options.signal)
+    const result = await runMuseWebTask({
+      kind: 'video', prompt: `请直接生成并返回可播放的视频文件。时长 ${options.seconds} 秒，比例 ${options.aspectRatio ?? options.size}${options.resolution ? `，分辨率 ${options.resolution}` : ''}。\n\n${options.prompt}`,
+      references, signal: options.signal, onSubmitted: options.onTaskId,
+    })
+    if (!result.blob) throw new Error('Muse 没有返回视频文件。')
+    return { blob: result.blob, taskId: result.taskId, progress: 100 }
+  }
+  if (isJimengCliBase(settings.baseUrl)) {
+    const frames = Array.from(new Set([options.firstFrame, options.referenceImage, ...(options.referenceImages ?? [])].filter((source): source is string => Boolean(source))))
+    if (frames.length > 1 || options.lastFrame || options.referenceVideo || options.referenceVideos?.length || options.referenceAudios?.length) {
+      throw new GenerationRequestError('platform', '当前即梦连接支持文生视频和单图首帧', '请保留一张首帧，或改用支持首尾帧和全能参考的连接。')
+    }
+    const inputs = await prepareJimengInputs(frames, options.signal)
+    const ratio = options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : undefined
+    const { bytes, taskId } = await generateJimengMedia('video', {
+      model: settings.model, prompt: options.prompt, ratio, inputs,
+      resolution: options.resolution ?? '720p', duration: options.seconds,
+    }, options)
+    return { blob: new Blob([bytes], { type: 'video/mp4' }), taskId, progress: 100 }
+  }
   const grsai = getGrsaiVideoCapabilities(settings.baseUrl, settings.model)
   if (grsai) return generateGrsaiVideo(settings, options, grsai)
   if (isHfsyBaseUrl(settings.baseUrl)) return generateHfsyVideo(settings, options)
+  const provider = apiProviderForBase(settings.baseUrl)?.id
+  if (provider === 'xai' || provider === 'ark' || provider === 'minimax') return generateNativeProviderVideo(provider, settings, options)
   if (isEvolinkBaseUrl(settings.baseUrl)) return generateEvolinkVideo(settings, options)
   if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedance|doubao-seedance/i.test(settings.model)) {
     return generateApiYiSeedanceVideo(settings, options)
@@ -1659,7 +1899,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     ...(!/^muse[-_]video$/.test(model) ? {
       orientation: model === 'kling-o3' && ratio === '1:1' ? 'square' : ratioWidth < ratioHeight ? 'portrait' : 'landscape',
     } : {}),
-    ...(/^(?:sd-2|sora-2|grok-imagine-video-1\.5)/.test(model) ? { watermark: false } : {}),
+    ...(/^(?:sd-2|sora-2|grok-imagine-video-1\.5|muse-video$)/.test(model) ? { watermark: false } : {}),
     ...(publicImages.length ? { images: publicImages } : {}),
     ...(publicVideos.length ? { videos: publicVideos } : {}),
     ...(publicAudios.length ? { audios: publicAudios } : {}),
@@ -1685,6 +1925,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   const startedAt = Date.now()
   let pollSettings = settings
   let queryParameter = false
+  let pollMethod = model === 'muse-video' ? 'POST' : 'GET'
   let consecutiveFailures = 0
   while (Date.now() - startedAt < 30 * 60_000) {
     const status = extractProviderTaskStatus(task)
@@ -1711,11 +1952,16 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     await waitForDelay(3_000, options.signal)
     try {
       const poll = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
+        method: pollMethod,
         signal: options.signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
       })
       // HFSY's notice specifies api.hfsyapi.cn as the query fallback for 504s.
       if (poll.status === 504 && /^(?:www\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname)) {
         pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
+        continue
+      }
+      if ([404, 405].includes(poll.status) && pollMethod === 'POST') {
+        pollMethod = 'GET'
         continue
       }
       if (poll.status === 404 && !queryParameter) {
@@ -1797,6 +2043,27 @@ async function generateEvolinkVideo(settings: ApiRequestSettings, options: Video
  * are accepted through `extra` so new documented audio models remain usable
  * without weakening the generic OpenAI-compatible request paths. */
 export async function generateRemoteAudio(settings: ApiRequestSettings, options: AudioGenerationOptions): Promise<GeneratedAudio> {
+  if (apiProviderForBase(settings.baseUrl)?.id === 'minimax') {
+    if (!options.voice?.trim()) throw new GenerationRequestError('platform', '请选择 MiniMax 音色', '需要 MiniMax 控制台提供的 voice_id。')
+    const response = await providerFetch(endpoint(settings.baseUrl, 't2a_v2'), {
+      method: 'POST', signal: options.signal,
+      headers: compatibleApiHeaders(settings, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ model: settings.model, text: options.prompt, stream: false, output_format: 'hex',
+        voice_setting: { voice_id: options.voice }, audio_setting: { format: 'mp3' } }),
+    })
+    if (!response.ok) throw await createApiError(response)
+    const payload = await response.json() as { trace_id?: string; data?: { audio?: string }; base_resp?: { status_code?: number; status_msg?: string } }
+    const audio = payload.data?.audio
+    if (payload.base_resp?.status_code || !audio || !/^(?:[a-f0-9]{2})+$/i.test(audio)) {
+      throw new GenerationRequestError('api', 'MiniMax 未返回有效语音', payload.base_resp?.status_msg ?? '缺少音频数据')
+    }
+    const bytes = new Uint8Array(audio.length / 2)
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(audio.slice(i * 2, i * 2 + 2), 16)
+    const taskId = payload.trace_id ?? crypto.randomUUID()
+    options.onTaskId?.(taskId)
+    options.onProgress?.(100, 'completed')
+    return { blob: new Blob([bytes], { type: 'audio/mpeg' }), taskId, progress: 100, payload: { trace_id: payload.trace_id, base_resp: payload.base_resp } }
+  }
   const response = await providerFetch(endpoint(settings.baseUrl, 'audios/generations'), {
     method: 'POST', signal: options.signal,
     headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
@@ -2099,6 +2366,11 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
 
 /** Validate credentials without performing a billable generation request. */
 export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<void> {
+  if (isMuseWebBase(settings.baseUrl)) return checkMuseWebAccount()
+  if (isJimengCliBase(settings.baseUrl)) {
+    await checkJimengAccount()
+    return
+  }
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   if (!settings.apiKey.trim()) throw new Error('API Key 不能为空')
   const signal = AbortSignal.timeout(15_000)
@@ -2557,6 +2829,92 @@ export async function generateRemoteImages(
   options: ImageGenerationOptions,
 ): Promise<GeneratedImage[]> {
   const startedAtMs = Date.now()
+  if (isMuseWebBase(settings.baseUrl)) {
+    const references = await museWebReferences(options.referenceImages ?? [], options.signal)
+    const images: GeneratedImage[] = []
+    for (let index = 0; index < options.count; index++) {
+      const result = await runMuseWebTask({
+        kind: 'image',
+        prompt: `请直接生成并返回一张图片${options.aspectRatio ? `，画面比例 ${options.aspectRatio}` : ''}${options.resolution ? `，分辨率 ${options.resolution}` : ''}。\n\n${options.prompt}`,
+        references, signal: options.signal, onSubmitted: options.onTaskId,
+      })
+      if (!result.blob) throw new Error('Muse 没有返回图片文件。')
+      images.push({ url: await blobToDataUrl(result.blob) })
+    }
+    return images
+  }
+  if (isJimengCliBase(settings.baseUrl)) {
+    const references = options.referenceImages ?? []
+    if (references.length && /^3\./.test(settings.model)) throw new GenerationRequestError('platform', '当前即梦模型不支持参考图', '请改用即梦 4.0 或更新的版本。')
+    const inputs = await prepareJimengInputs(references, options.signal)
+    const specs = resolveImageModelOptions(settings.baseUrl, settings.model, options)
+    const images: GeneratedImage[] = []
+    for (let i = 0; i < options.count; i++) {
+      const { bytes } = await generateJimengMedia('image', {
+        model: settings.model, prompt: options.prompt, ratio: specs.aspectRatio,
+        resolution: specs.resolution ?? '2K', inputs,
+      }, { signal: options.signal, onTaskId: options.onTaskId })
+      const mime = bytes[0] === 0xff ? 'image/jpeg' : bytes[0] === 0x52 ? 'image/webp' : 'image/png'
+      const url = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result))
+        reader.onerror = () => reject(new Error('无法读取即梦生成图片'))
+        reader.readAsDataURL(new Blob([bytes], { type: mime }))
+      })
+      images.push({ url })
+    }
+    return images
+  }
+  const provider = apiProviderForBase(settings.baseUrl)?.id
+  if (provider === 'xai' || provider === 'ark' || provider === 'muse') {
+    const referenceImages = options.referenceImages?.filter(Boolean) ?? []
+    const capabilities = getImageModelCapabilities(settings.baseUrl, settings.model)!
+    const maxReferences = 'images' in capabilities ? capabilities.images : 1
+    if (referenceImages.length > maxReferences) throw new GenerationRequestError('platform', '参考图太多', `当前模型最多支持 ${maxReferences} 张参考图。`)
+    const { aspectRatio, resolution, detail } = resolveImageModelOptions(settings.baseUrl, settings.model, options)
+    const ratio = aspectRatio === 'auto' ? undefined : aspectRatio
+    const references = provider === 'muse' ? [] : await Promise.all(referenceImages.map((url) => nativeImageSource(url, options.signal)))
+    const size = resolveImageRequestSize(settings.model, ratio, resolution)
+    const count = options.count
+    const model = settings.model
+    const path = referenceImages.length && provider !== 'ark' ? 'images/edits' : 'images/generations'
+    let body: FormData | Record<string, unknown>
+    if (provider === 'xai') {
+      body = { model, prompt: options.prompt, n: count, aspect_ratio: ratio, resolution: resolution?.toLowerCase(),
+        quality: detail, response_format: 'b64_json',
+        ...(references.length === 1 ? { image: { url: references[0] } } : references.length ? { images: references.map((url) => ({ url })) } : {}) }
+    } else if (provider === 'ark') {
+      const [w, h] = (ratio ?? '1:1').split(':').map(Number)
+      const scale = resolution === '4K' ? 4096 : resolution === '1K' ? 1024 : 2048
+      const round = (px: number) => Math.round(px / 16) * 16
+      const arkSize = ratio ? `${round(scale * Math.sqrt(w / h))}x${round(scale * Math.sqrt(h / w))}` : resolution ?? '2K'
+      body = { model, prompt: options.prompt, size: arkSize, response_format: 'b64_json', watermark: false,
+        sequential_image_generation: count > 1 ? 'auto' : 'disabled',
+        ...(count > 1 ? { sequential_image_generation_options: { max_images: count } } : {}),
+        ...(references.length ? { image: references } : {}) }
+    } else if (referenceImages.length) {
+      body = new FormData()
+      body.set('model', model); body.set('prompt', options.prompt); body.set('size', size); body.set('n', String(count))
+      for (const [index, url] of referenceImages.entries()) {
+        const source = await providerFetch(url, { signal: options.signal })
+        if (!source.ok) throw new GenerationRequestError('platform', '参考图无法读取', `图片读取失败（${source.status}）`)
+        const blob = await source.blob()
+        body.append('image', blob, `reference-${index + 1}.${blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png'}`)
+      }
+    } else {
+      body = { model, prompt: options.prompt, size, n: count, response_format: 'b64_json' }
+    }
+    const response = await providerFetch(endpoint(settings.baseUrl, path), {
+      method: 'POST', signal: options.signal,
+      headers: compatibleApiHeaders(settings, body instanceof FormData ? undefined : { 'Content-Type': 'application/json' }),
+      body: body instanceof FormData ? body : JSON.stringify(body),
+    })
+    if (!response.ok) throw await createApiError(response)
+    const result = await response.json() as unknown
+    const images = extractGeneratedImages(result)
+    if (!images.length) throw new GenerationRequestError('platform', '厂商没有返回图片', sanitizeAdminLogJson(result))
+    return images
+  }
   const startedAt = new Date(startedAtMs).toISOString()
   const requestSize = resolveImageRequestSize(settings.model, options.aspectRatio, options.resolution)
   const isApiYiSeedream = /api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedream/i.test(settings.model)
@@ -2934,6 +3292,14 @@ export async function generateRemoteText(
   prompt: string,
   options: TextGenerationOptions = {},
 ) {
+  if (isMuseWebBase(settings.baseUrl)) {
+    const references = await museWebReferences(options.referenceImages ?? [], options.signal)
+    const result = await runMuseWebTask({
+      kind: 'text', prompt: `请在当前对话中直接回复文字。\n\n${prompt}`, references, signal: options.signal,
+    })
+    if (!result.text) throw new Error('Muse 没有返回文字。')
+    return result.text
+  }
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const providerLabel = resolveProviderLabel(settings.baseUrl)

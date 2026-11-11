@@ -11,10 +11,16 @@ const lifecycle = asModule(await compile('./providerLifecycle.ts'))
 const { inferImageOutput, imageOutputIntent } = await import(asModule(await compile('./imageOutputIntent.ts')))
 const catalog = asModule(await compile('./modelCatalog.ts'))
 const transport = asModule(await compile('./providerTransport.ts'))
+const providers = asModule(await compile('./apiProviders.ts'))
+const jimeng = asModule((await compile('./jimengCli.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
+const museWeb = asModule((await compile('./museWeb.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
 const { resolveDesktopProviderRequest } = await import(transport)
 const api = await import(asModule((await compile('./imageApi.ts'))
   .replace("'./providerLifecycle'", JSON.stringify(lifecycle))
   .replace("'./providerTransport'", JSON.stringify(transport))
+  .replace("'./apiProviders'", JSON.stringify(providers))
+  .replace("'./jimengCli'", JSON.stringify(jimeng))
+  .replace("'./museWeb'", JSON.stringify(museWeb))
   .replaceAll("'./modelCatalog'", JSON.stringify(catalog))))
 
 test('desktop translates browser relay paths without depending on the dev server', () => {
@@ -322,6 +328,70 @@ test('HFSY routes MiniMax, Kling, Muse and native Seedance using their own field
   })
   assert.equal(api.hfsyVideoLimits('sd-2.5-1080').images, 30)
   assert.equal(api.hfsyVideoLimits('wan-3.0-720').maxSeconds, 30)
+})
+
+test('new vendor adapters use native video paths and archive the completed result', async (t) => {
+  const requests = []
+  const win = { setTimeout: (run) => setTimeout(run, 0), clearTimeout }
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const path = String(url)
+    requests.push({ path, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined })
+    const result = 'https://cdn.example.test/video.mp4'
+    if (path === '/provider/ark/api/v3/contents/generations/tasks') return Response.json({ id: 'ark-1' })
+    if (path.endsWith('/tasks/ark-1')) return Response.json({ status: 'succeeded', content: { video_url: result } })
+    if (path.endsWith('/videos/generations')) return Response.json({ request_id: 'xai-1' })
+    if (path.endsWith('/videos/xai-1')) return Response.json({ status: 'done', video: { url: result } })
+    if (path === '/provider/minimax/v2/video_generation') return Response.json({ task: { id: 'mini-1', status: 'processing' } })
+    if (path.endsWith('/query/video_generation/mini-1')) return Response.json({ task: { status: 'succeeded', content: { url: result } } })
+    if (path === '/hfsy/v1/video/create') return Response.json({ id: 'muse-1', status: 'IN_PROGRESS' })
+    if (path.endsWith('/video/query/muse-1')) return Response.json({ success: true, data: { status: 'completed', result_url: result } })
+    return new Response(new Blob(['video'], { type: 'video/mp4' }))
+  })
+  globalThis.window = win
+  try {
+    const options = { prompt: 'test', seconds: 5, size: '3:4', aspectRatio: '3:4', resolution: '720p' }
+    const ark = await api.generateRemoteVideo({ baseUrl: 'https://ark.cn-beijing.volces.com/api/v3', apiKey: 'test', model: 'doubao-seedance-2-0-260128' }, { ...options, mode: 'image2video', firstFrame: 'https://cdn.example.test/first.png' })
+    assert.equal(ark.taskId, 'ark-1')
+    assert.deepEqual(requests[0].body.content[1], { type: 'image_url', image_url: { url: 'https://cdn.example.test/first.png' }, role: 'first_frame' })
+    const grok = await api.generateRemoteVideo({ baseUrl: 'https://api.x.ai/v1', apiKey: 'test', model: 'grok-imagine-video-1.5' }, options)
+    assert.equal(grok.taskId, 'xai-1')
+    assert.equal(requests.find(({ path }) => path.endsWith('/videos/generations')).body.aspect_ratio, '3:4')
+    const mini = await api.generateRemoteVideo({ baseUrl: 'https://api.minimaxi.com/v1', apiKey: 'test', model: 'MiniMax-H3' }, { ...options, aspectRatio: '16:9' })
+    assert.equal(mini.taskId, 'mini-1')
+    assert.equal(requests.find(({ path }) => path.endsWith('/v2/video_generation')).body.ratio, '16:9')
+    const muse = await api.generateRemoteVideo({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'muse-video' }, { ...options, aspectRatio: '9:16' })
+    assert.equal(muse.taskId, 'muse-1')
+    assert.equal(requests.find(({ path }) => path.endsWith('/video/query/muse-1')).method, 'POST')
+  } finally { delete globalThis.window }
+})
+
+test('vendor catalog supports Muse and Grok image requests and does not offer retired presets', async (t) => {
+  const { API_PROVIDER_PRESETS } = await import(providers)
+  assert.deepEqual(API_PROVIDER_PRESETS.slice(0, 2).map(({ id }) => id), ['grsai', 'hfsy'])
+  assert.equal(API_PROVIDER_PRESETS.some(({ id }) => id === 'evolink'), false)
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push([String(url), JSON.parse(init.body)])
+    return Response.json({ data: [{ url: 'https://cdn.example.test/image.png' }] })
+  })
+  const config = { prompt: 'test', count: 2, aspectRatio: '3:4', resolution: '2K' }
+  await api.generateRemoteImages({ baseUrl: 'https://api.x.ai/v1', apiKey: 'test', model: 'grok-imagine-image-2.0' }, config)
+  await api.generateRemoteImages({ baseUrl: 'https://api.meta.ai/v1', apiKey: 'test', model: 'muse-image-1.0' }, config)
+  assert.deepEqual(calls[0], ['https://api.x.ai/v1/images/generations', { model: 'grok-imagine-image-2.0', prompt: 'test', n: 2, aspect_ratio: '3:4', resolution: '2k', quality: 'low', response_format: 'b64_json' }])
+  assert.equal(calls[1][0], 'https://api.meta.ai/v1/images/generations')
+  assert.equal(calls[1][1].n, 2)
+})
+
+test('Jimeng extracts its device flow and model choices without accepting other authorization hosts', async () => {
+  const { parseJimengChallenge, parseJimengModelHelp } = await import(jimeng)
+  const plain = 'verification_uri: https://jimeng.jianying.com/passport/open/scan_user_code?user_code=mock\nuser_code: MOCK-1234\ndevice_code: dev-mock'
+  const parsed = parseJimengChallenge(plain)
+  assert.equal(new URL(parsed.url).pathname, '/ai-tool/cli-auth')
+  assert.equal(parsed.userCode, 'MOCK-1234')
+  assert.equal(parsed.deviceCode, 'dev-mock')
+  assert.equal(parseJimengChallenge(plain.replace('jimeng.jianying.com', 'example.test')), undefined)
+  const images = parseJimengModelHelp('Supported combinations:\n- model_version: 3.0, 4.7, 5.0Pro\n- ratio: 1:1', 'image')
+  assert.deepEqual(images.map(({ id, capability }) => [id, capability]), [['3.0', 'image'], ['4.7', 'image'], ['5.0Pro', 'image']])
 })
 
 test('HFSY requires public media URLs before submitting a task', async (t) => {

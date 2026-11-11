@@ -7,22 +7,36 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
-import { Fragment, useEffect, useId, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { Fragment, useEffect, useId, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowLeft, ArrowUp, Check, ChevronDown, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, SlidersHorizontal, Sparkles, Trash2, Wrench, X } from 'lucide-react'
-import { compactReferenceName, normalizeAgentMessageContent, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
-import type { ImageOutput } from './imageApi'
+import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
+import { compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
+import { resolveImageModelOptions, type ImageOutput, type ImageGenerationOptions } from './imageApi'
 import { imageOutputIntent } from './imageOutputIntent'
 import { AgentSkillCreator } from './skill-ui/AgentSkillCreator'
 import { AgentSkillMenu } from './skill-ui/AgentSkillMenu'
 import { AgentFilmReview } from './skill-ui/AgentFilmReview'
 import { AgentQuestions } from './skill-ui/AgentQuestions'
+import { AgentCanvasEditReview } from './skill-ui/AgentCanvasEditReview'
+import { AgentSelect, getModelBrand, type SelectOption } from './skill-ui/AgentSelect'
+import { AgentMemory, AgentProjectGuide, AgentTasks, AgentTeam, type AgentProjectView } from './skill-ui/AgentProjectPane'
+import { activeAgentTeamRoles, getAgentTeamTemplate, PROJECT_MEMORY_LENGTH, type AgentProjectSettings, type AgentTask } from './agentProject'
+import type { AgentCanvasEditDraft } from './agentCanvasEdits'
 import { skillOpening } from './skills/conversation'
 import type { FilmReview, FilmReviewAnswer } from './skills/filmProduction'
 import type { SkillManifest } from './skills/types'
 
-export type AgentModelOption = { key: string; name: string; connectionName: string; outputs?: readonly ImageOutput[] }
+export type AgentModelOption = {
+  key: string; name: string; connectionName: string; outputs?: readonly ImageOutput[]
+  imageParameters?: { baseUrl: string; modelId: string; ratios: SelectOption[]; resolutions: SelectOption[]; qualities: SelectOption[] }
+}
 export type AgentConversationOption = { id: string; title: string; updatedAt: string }
+
+function conversationDate(value: string) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return undefined
+  return date.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
 
 const AGENT_PANEL_WIDTH_KEY = 'disylab.agent-panel-width'
 const AGENT_PANEL_PLACEMENT_KEY = 'disylab.agent-panel-placement'
@@ -99,180 +113,14 @@ function getInitialAgentPanelWidth() {
   return Math.min(maximum, Math.max(AGENT_PANEL_DEFAULT_WIDTH, preferred))
 }
 
-type ModelBrand = 'openai' | 'gemini' | 'claude' | 'doubao' | 'jimeng' | 'kimi' | 'grok' | 'deepseek' | 'qwen' | 'glm' | 'minimax' | 'google' | 'generic'
-type SelectOption = { value: string; label: string; brand?: ModelBrand }
-
-const brandMeta: Record<ModelBrand, { label: string; glyph: string; color: string; background: string }> = {
-  openai: { label: 'OpenAI', glyph: '◎', color: '#e8f3ef', background: 'rgba(90, 145, 128, .2)' },
-  gemini: { label: 'Gemini', glyph: '✦', color: '#9fc5ff', background: 'rgba(68, 119, 216, .2)' },
-  claude: { label: 'Claude', glyph: 'C', color: '#e8b994', background: 'rgba(181, 102, 55, .2)' },
-  doubao: { label: '豆包', glyph: '豆', color: '#a9b8ff', background: 'rgba(92, 104, 224, .2)' },
-  jimeng: { label: '即梦', glyph: '即', color: '#f1a8dc', background: 'rgba(203, 72, 161, .2)' },
-  google: { label: 'Google', glyph: 'G', color: '#9fcbff', background: 'rgba(65, 133, 221, .2)' },
-  kimi: { label: 'Kimi', glyph: 'K', color: '#b9b6ff', background: 'rgba(116, 103, 224, .2)' },
-  grok: { label: 'Grok', glyph: 'xAI', color: '#e4e9ed', background: 'rgba(155, 165, 174, .18)' },
-  deepseek: { label: 'DeepSeek', glyph: 'D', color: '#8ac8ff', background: 'rgba(57, 133, 214, .2)' },
-  qwen: { label: '通义', glyph: 'Q', color: '#8ed9c2', background: 'rgba(53, 165, 130, .2)' },
-  glm: { label: '智谱', glyph: 'GLM', color: '#d0b5ff', background: 'rgba(130, 91, 210, .2)' },
-  minimax: { label: 'MiniMax', glyph: 'M', color: '#ffb69b', background: 'rgba(218, 103, 67, .2)' },
-  generic: { label: 'AI 模型', glyph: 'AI', color: '#b8c1cb', background: 'rgba(126, 139, 153, .16)' },
-}
-
-function getModelBrand(name: string): ModelBrand {
-  const normalized = name.toLowerCase().replace(/[\s_-]+/g, '')
-  if (/gpt|openai|dall|sora/.test(normalized)) return 'openai'
-  if (/gemini/.test(normalized)) return 'gemini'
-  if (/claude|anthropic/.test(normalized)) return 'claude'
-  if (/即梦|jimeng|dreamina|seedream|seedance/.test(normalized)) return 'jimeng'
-  if (/豆包|doubao/.test(normalized)) return 'doubao'
-  if (/kimi|moonshot/.test(normalized)) return 'kimi'
-  if (/grok|xai/.test(normalized)) return 'grok'
-  if (/deepseek/.test(normalized)) return 'deepseek'
-  if (/qwen|通义|tongyi|千问/.test(normalized)) return 'qwen'
-  if (/glm|智谱|chatglm|zhipu/.test(normalized)) return 'glm'
-  if (/minimax|hailuo|海螺/.test(normalized)) return 'minimax'
-  if (/nanobanana|imagen|google/.test(normalized)) return 'google'
-  return 'generic'
-}
-
-const brandMarkStyle: CSSProperties = {
-  width: 20,
-  height: 20,
-  flex: '0 0 20px',
-  borderRadius: 7,
-  display: 'inline-grid',
-  placeItems: 'center',
-  fontSize: 8,
-  fontWeight: 800,
-  lineHeight: 1,
-  letterSpacing: '-.02em',
-}
-
-function ModelBrandMark({ brand }: { brand: ModelBrand }) {
-  const meta = brandMeta[brand]
-  return (
-    <span
-      aria-hidden="true"
-      title={meta.label}
-      style={{ ...brandMarkStyle, color: meta.color, background: meta.background }}
-    >
-      {meta.glyph}
-    </span>
-  )
-}
-
-function AgentSelect({ ariaLabel, value, placeholder, options, icon, onChange, className = '' }: {
-  ariaLabel: string
-  value: string
-  placeholder: string
-  options: SelectOption[]
-  icon: ReactNode
-  onChange: (value: string) => void
-  className?: string
-}) {
-  const [open, setOpen] = useState(false)
-  const rootRef = useRef<HTMLDivElement>(null)
-  const menuRef = useRef<HTMLDivElement>(null)
-  const menuId = useId()
-  const selected = options.find((option) => option.value === value)
-
-  useEffect(() => {
-    if (!open) return
-    const close = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
-    }
-    document.addEventListener('pointerdown', close)
-    return () => document.removeEventListener('pointerdown', close)
-  }, [open])
-
-  useEffect(() => {
-    if (!open) return
-    const optionButtons = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]')
-    const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value))
-    window.requestAnimationFrame(() => optionButtons?.[selectedIndex]?.focus())
-  }, [open, value])
-
-  const moveOptionFocus = (direction: 1 | -1) => {
-    const optionButtons = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? [])]
-    if (!optionButtons.length) return
-    const currentIndex = optionButtons.indexOf(document.activeElement as HTMLButtonElement)
-    optionButtons[(currentIndex + direction + optionButtons.length) % optionButtons.length]?.focus()
-  }
-
-  const selectedBrand = selected?.brand
-
-  return (
-    <div ref={rootRef} className={`agent-custom-select ${className} ${open ? 'is-open' : ''}`}>
-      <button
-        type="button"
-        className="agent-select-trigger"
-        aria-label={ariaLabel}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-controls={open ? menuId : undefined}
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={(event) => {
-          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-            event.preventDefault()
-            setOpen(true)
-          }
-        }}
-      >
-        <span className="agent-select-icon" style={{ width: 20, display: 'inline-grid', placeItems: 'center' }}>
-          {selectedBrand ? <ModelBrandMark brand={selectedBrand} /> : icon}
-        </span>
-        <span className={`agent-select-value ${selected ? '' : 'is-placeholder'}`}>{selected?.label ?? placeholder}</span>
-        <ChevronDown size={14} className="agent-select-chevron" />
-      </button>
-      {open && (
-        <div
-          ref={menuRef}
-          id={menuId}
-          className="agent-select-menu"
-          role="listbox"
-          aria-label={`${ariaLabel}选项`}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') {
-              event.preventDefault()
-              setOpen(false)
-              rootRef.current?.querySelector<HTMLButtonElement>('.agent-select-trigger')?.focus()
-            } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-              event.preventDefault()
-              moveOptionFocus(event.key === 'ArrowDown' ? 1 : -1)
-            } else if (event.key === 'Home' || event.key === 'End') {
-              event.preventDefault()
-              const optionButtons = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]')
-              optionButtons?.[event.key === 'Home' ? 0 : optionButtons.length - 1]?.focus()
-            }
-          }}
-        >
-          {options.length ? options.map((option) => (
-            <button
-              type="button"
-              role="option"
-              aria-selected={option.value === value}
-              className={option.value === value ? 'is-selected' : ''}
-              key={option.value}
-              onClick={() => {
-                onChange(option.value)
-                setOpen(false)
-                window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.agent-select-trigger')?.focus())
-              }}
-            >
-              <span style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-                {option.brand && <ModelBrandMark brand={option.brand} />}
-                <strong style={{ minWidth: 0 }}>{option.label}</strong>
-              </span>
-              {option.value === value && <Check size={14} />}
-            </button>
-          )) : <p>暂无可用选项</p>}
-        </div>
-      )}
-    </div>
-  )
-}
-
 type Props = {
+  projectId: string
+  projectSettings: AgentProjectSettings
+  onSaveProjectSettings: (update: (settings: AgentProjectSettings) => AgentProjectSettings) => Promise<void>
+  tasks: AgentTask[]
+  onTaskCenterOpen: (open: boolean) => void
+  onOpenTask: (task: AgentTask) => Promise<boolean>
+  onStopTask: (id: string) => void
   messages: AgentMessage[]
   plans: AgentImagePlan[]
   videoPlans: AgentVideoPlan[]
@@ -332,7 +180,7 @@ type Props = {
   onUploadNotice: (message: string) => void
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
-  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
+  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni', team?: boolean) => void
   onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId'>>) => void
   onSelectPlanOptions: (groupPlanIds: string[], selectedPlanIds: string[]) => void
   onConfirmPlan: (id: string) => void
@@ -345,16 +193,29 @@ type Props = {
   onRemoveVideoPlanContextReference: (planId: string, nodeId: string) => void
   onTextPlanChange: (id: string, patch: Partial<Pick<AgentTextPlan, 'title' | 'content'>>) => void
   onConfirmTextPlan: (id: string) => void
+  onCanvasDraftChange: (messageId: string, update: (draft: AgentCanvasEditDraft) => AgentCanvasEditDraft) => void
+  onSaveCanvasDraft: (messageId: string) => Promise<string | null>
+  onConfirmCanvasDraft: (messageId: string) => string | null
+  onRevertCanvasDraft: (messageId: string) => string | null
   onCancelTextPlan: (id: string) => void
   onRemoveTextPlanContextReference: (planId: string, nodeId: string) => void
   onLocateCanvasNode: (nodeId: string) => void
 }
 
 export function AgentPanel(props: Props) {
+  const [projectView, setProjectView] = useState<AgentProjectView | null>(null)
+  const [memorySeed, setMemorySeed] = useState<{ id: string; content: string }>()
+  const [teamConversations, setTeamConversations] = useState<Set<string>>(() => new Set())
+  const teamEnabled = teamConversations.has(props.activeConversationId)
+  const changeProjectView = (view: AgentProjectView | null) => {
+    setMemorySeed(undefined)
+    setProjectView(view)
+    props.onTaskCenterOpen(view === 'tasks')
+  }
   const [skillMenuOpen, setSkillMenuOpen] = useState(false)
   const [skillAuthoring, setSkillAuthoring] = useState(false)
   const attachedSkill = props.skillSelection?.skill ?? null
-  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '和 Disy 对话，输入 @ 引用画布图片，或上传参考图'
+  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '和 Disy 对话，或选中画布文本，请 Disy 帮你修改'
   const latestMessage = props.messages.at(-1)
   const guidedMessage = !props.busy && !skillAuthoring && latestMessage?.role === 'assistant'
     && latestMessage.skillUseId === props.skillSelection?.id && latestMessage.questions?.length ? latestMessage : undefined
@@ -961,7 +822,7 @@ export function AgentPanel(props: Props) {
     if (!value) return
     if (!props.textModelKey) { props.onOpenApiSettings(); return }
     const invocationText = [answers, getInvocationText()].filter(Boolean).join('\n\n')
-    props.onSend(value, invocationText, getEditorReferences().filter(modeAcceptsReference), !attachedSkill && mediaKind === 'video' ? videoGenerationMode : undefined)
+    props.onSend(value, invocationText, getEditorReferences().filter(modeAcceptsReference), !attachedSkill && mediaKind === 'video' ? videoGenerationMode : undefined, teamEnabled && !attachedSkill)
     if (editorRef.current) editorRef.current.innerHTML = ''
     setDraftInvocationText('')
     setMentionOpen(false)
@@ -972,7 +833,8 @@ export function AgentPanel(props: Props) {
     setSkillAuthoring(false)
     window.requestAnimationFrame(() => editorRef.current?.focus())
   }
-  const renderPlan = (plan: AgentImagePlan) => {
+  const renderPlan = (storedPlan: AgentImagePlan) => {
+    const plan = reconcileAgentImagePlanSpecs(storedPlan)
     const statusLabel = plan.status === 'ready' ? '待确认' : plan.status === 'running' ? '生成中' : plan.status === 'completed' ? '已完成' : plan.status === 'cancelled' ? '已取消' : '失败'
     const isCompact = plan.status === 'completed' || plan.status === 'cancelled' || Boolean(plan.results?.length)
     const disabled = plan.status !== 'ready'
@@ -980,6 +842,13 @@ export function AgentPanel(props: Props) {
     const imageModel = props.imageModels.find((model) => model.key === imageModelKey)
     const imageModelAvailable = Boolean(imageModel)
     const outputIntent = imageOutputIntent(plan.prompt, imageModel?.outputs)
+    const parameters = imageModel?.imageParameters
+    const shown = parameters ? resolveImageModelOptions(parameters.baseUrl, parameters.modelId, {
+      aspectRatio: plan.aspectRatio,
+      resolution: plan.resolution as ImageGenerationOptions['resolution'],
+      detail: plan.detail as ImageGenerationOptions['detail'],
+    }) : plan
+    const costLabel = props.getImagePlanCostLabel?.(plan)
     const displayedContextReferences: AgentContextReference[] = plan.contextReferences?.length
       ? plan.contextReferences
       : (plan.references ?? []).map((reference) => ({ ...reference, kind: reference.kind ?? 'image' as const }))
@@ -1021,7 +890,7 @@ export function AgentPanel(props: Props) {
     }
     return (
       <section
-        className={`agent-plan-card is-${plan.status} ${activeReadyPlan?.id === plan.id ? 'is-parameter-target' : ''}`}
+        className={`agent-plan-card agent-image-plan-card is-${plan.status} ${activeReadyPlan?.id === plan.id ? 'is-parameter-target' : ''}`}
         key={plan.id}
         onPointerDown={() => {
           if (plan.status === 'ready') setActiveReadyPlanId(plan.id)
@@ -1031,9 +900,19 @@ export function AgentPanel(props: Props) {
         }}
       >
         <header><span><ImagePlus size={15} />图像生成确认</span><em>{statusLabel}</em></header>
-        <div className="mb-2 grid gap-1"><span className="text-[10px] text-[color:var(--muted)]">图像模型</span><AgentSelect className="w-full" ariaLabel="选择本次图像模型" value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: `${model.name} · ${model.connectionName}`, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={13} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); props.onPlanChange(plan.id, { imageConnectionId, imageModelId }) }} /></div>
-        {!imageModelAvailable && <p className="mb-2 text-[11px] text-amber-300">原图像模型已不可用，请重新选择。</p>}
-        <textarea value={plan.prompt} disabled={disabled} onChange={(event) => props.onPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑图像方案提示词" />
+        <div className="agent-image-plan-field agent-image-plan-model">
+          <span>图像模型</span>
+          <AgentSelect variant="floating" ariaLabel="选择本次图像模型" disabled={disabled} value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={14} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); props.onPlanChange(plan.id, { imageConnectionId, imageModelId }) }} />
+        </div>
+        {!imageModelAvailable && <p className="agent-image-plan-notice">请选择可用的图像模型。</p>}
+        <label className="agent-image-plan-field"><span>提示词</span><textarea value={plan.prompt} disabled={disabled} onChange={(event) => props.onPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑图像方案提示词" /></label>
+        {plan.status === 'ready' && <div className="agent-image-plan-specs" role="group" aria-label="确认本次生成规格">
+          <div className="agent-image-plan-field"><span>生成张数</span><AgentSelect variant="floating" ariaLabel="生成张数" value={String(plan.count)} placeholder="张数" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 张` }))} icon={null} onChange={(value) => props.onPlanChange(plan.id, { count: Number(value) })} /></div>
+          <div className="agent-image-plan-field"><span>画面比例</span><AgentSelect variant="floating" ariaLabel="画面比例" disabled={!imageModelAvailable} value={shown.aspectRatio ?? ''} placeholder="比例" options={parameters?.ratios ?? props.aspectOptions} icon={null} onChange={(aspectRatio) => props.onPlanChange(plan.id, { aspectRatio })} /></div>
+          {(parameters?.resolutions ?? props.resolutionOptions).length > 0 && <div className="agent-image-plan-field"><span>清晰度</span><AgentSelect variant="floating" ariaLabel="清晰度" disabled={!imageModelAvailable} value={shown.resolution ?? ''} placeholder="清晰度" options={parameters?.resolutions ?? props.resolutionOptions} icon={null} onChange={(resolution) => props.onPlanChange(plan.id, { resolution })} /></div>}
+          {(parameters?.qualities ?? props.detailOptions).length > 0 && <div className="agent-image-plan-field"><span>画质</span><AgentSelect variant="floating" ariaLabel="画质" disabled={!imageModelAvailable} value={shown.detail ?? ''} placeholder="画质" options={parameters?.qualities ?? props.detailOptions} icon={null} onChange={(detail) => props.onPlanChange(plan.id, { detail })} /></div>}
+        </div>}
+        {plan.status === 'ready' && imageModelAvailable && shown.aspectRatio !== plan.aspectRatio && <p className="agent-image-plan-notice" role="status">当前模型不支持 {plan.aspectRatio}，将使用 {shown.aspectRatio}。可换模型或修改比例。</p>}
         {plan.status === 'ready' && imageModelAvailable && outputIntent.message && <p className={`image-output-hint ${outputIntent.blocked ? 'is-unsupported' : ''}`} role="status">{outputIntent.message}</p>}
         {!!displayedContextReferences.length && renderContextReferences(displayedContextReferences, (nodeId) => props.onRemovePlanContextReference(plan.id, nodeId))}
         {!!(plan.invokedStylePresets?.length || plan.invokedStyleReferences?.length) && <div className="agent-plan-invoked-styles">
@@ -1048,7 +927,11 @@ export function AgentPanel(props: Props) {
           </div>)}
         </div>}
         {plan.error && <p className="agent-plan-error">{plan.error}</p>}
-        {plan.status === 'ready' && <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || outputIntent.blocked} title={outputIntent.blocked ? outputIntent.message : imageModelAvailable ? '使用所选模型生成图片' : '请先选择可用的图像模型'} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />确认生图{props.getImagePlanCostLabel?.(plan) ? ` · ${props.getImagePlanCostLabel(plan)}` : ''}</button></footer>}
+        {plan.status === 'ready' && <footer className="agent-plan-actions">
+          <span className="agent-image-plan-confirm-note">{costLabel ? `预计 ${costLabel}` : '确认后才开始生成'}</span>
+          <button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button>
+          <button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || outputIntent.blocked || !plan.prompt.trim()} title={outputIntent.blocked ? outputIntent.message : undefined} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />确认生成 {plan.count} 张</button>
+        </footer>}
       </section>
     )
   }
@@ -1191,6 +1074,12 @@ export function AgentPanel(props: Props) {
         }}>
         <div className="agent-panel-title"><span className="disy-agent-avatar agent-panel-avatar" aria-hidden="true"><img className="agent-panel-logo" src="/disy-logo.png" alt="" /></span><span><strong>Disy Agent</strong><small>和你一起构思，并在确认后生成</small></span>{props.backgroundRunCount > 0 && <span className="ml-2 inline-flex items-center gap-1 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-1 text-[10px] text-cyan-200" title="其他画布中的 Agent 正在后台运行"><LoaderCircle size={11} className="is-spinning" />后台 {props.backgroundRunCount}</span>}</div>
         <div className="agent-panel-header-actions">
+          <div className="agent-project-buttons" aria-label="项目工具">
+            <button type="button" aria-label="任务中心" title="任务中心" aria-pressed={projectView === 'tasks'} onClick={() => changeProjectView(projectView === 'tasks' ? null : 'tasks')}><ListTodo size={16} /></button>
+            <button type="button" aria-label="项目记忆" title="项目记忆" aria-pressed={projectView === 'memory'} onClick={() => changeProjectView(projectView === 'memory' ? null : 'memory')}><Brain size={16} /></button>
+            <button type="button" aria-label="团队协作" title={teamEnabled ? '团队协作已启用' : '团队协作'} aria-pressed={projectView === 'team'} data-team-active={teamEnabled} onClick={() => changeProjectView(projectView === 'team' ? null : 'team')}><UsersRound size={16} /></button>
+            <button type="button" aria-label="Agent 使用指南" title="使用指南" aria-pressed={projectView === 'guide'} onClick={() => changeProjectView(projectView === 'guide' ? null : 'guide')}><CircleHelp size={16} /></button>
+          </div>
           {props.agentOnly && <button className="agent-panel-api" onClick={props.onOpenApiSettings} title="配置 API"><KeyRound size={16} /><span>API 配置</span></button>}
           {!props.agentOnly && <>
             <button type="button" className="agent-panel-dock-toggle" disabled={Boolean(floatingInteraction)} aria-label={panelFloating ? '贴靠右侧' : '切换为浮窗'} title={panelFloating ? '贴靠右侧' : '切换为浮窗'} onClick={() => savePanelPlacement({ ...panelPlacement, mode: panelFloating ? 'docked' : 'floating' })}>
@@ -1200,16 +1089,20 @@ export function AgentPanel(props: Props) {
           </>}
         </div>
       </header>
-      {skillAuthoring ? <div className="agent-conversation-row agent-skill-mode">
+      {projectView ? <div className="agent-conversation-row agent-project-heading">
+        <button type="button" onClick={() => changeProjectView(null)} aria-label="返回 Agent 对话"><ArrowLeft size={16} /></button>
+        <strong>{{ tasks: '任务中心', memory: '项目记忆', team: '团队协作', guide: '使用指南' }[projectView]}</strong>
+      </div> : skillAuthoring ? <div className="agent-conversation-row agent-skill-mode">
         <button type="button" onClick={() => { setSkillAuthoring(false); window.requestAnimationFrame(() => skillButtonRef.current?.focus()) }} aria-label="返回 Agent 对话"><ArrowLeft size={16} /></button>
         <span><strong>Skill 创作</strong><small>新的 Skill</small></span>
       </div> : <div className="agent-conversation-row">
         <AgentSelect
           className="agent-conversation-select"
+          variant="conversation"
           ariaLabel="选择 Agent 对话"
           value={props.activeConversationId}
           placeholder="选择对话"
-          options={props.conversations.map((conversation) => ({ value: conversation.id, label: conversation.title }))}
+          options={props.conversations.map((conversation) => ({ value: conversation.id, label: conversation.title, detail: conversationDate(conversation.updatedAt) }))}
           icon={<MessageCircle size={14} />}
           onChange={props.onSelectConversation}
         />
@@ -1223,7 +1116,22 @@ export function AgentPanel(props: Props) {
         </header>
         <img src={previewResult.url} alt="生成图片大图预览" onClick={(event) => event.stopPropagation()} />
       </div>, document.body)}
-      {skillAuthoring ? <AgentSkillCreator
+      {projectView === 'tasks' && <AgentTasks key={props.projectId} tasks={props.tasks} onStop={props.onStopTask} onOpen={async (task) => {
+        const opened = await props.onOpenTask(task)
+        if (opened) changeProjectView(null)
+        return opened
+      }} />}
+      {projectView === 'memory' && <AgentMemory key={`${props.projectId}:${memorySeed?.id ?? ''}`} settings={props.projectSettings} save={props.onSaveProjectSettings} seed={memorySeed?.content} />}
+      {projectView === 'guide' && <AgentProjectGuide open={changeProjectView} />}
+      {projectView === 'team' && <AgentTeam key={props.projectId} settings={props.projectSettings} save={props.onSaveProjectSettings} models={props.textModels} enabled={teamEnabled} onEnabled={(enabled) => {
+        setTeamConversations((current) => {
+          const next = new Set(current)
+          if (enabled) next.add(props.activeConversationId)
+          else next.delete(props.activeConversationId)
+          return next
+        })
+      }} />}
+      {skillAuthoring && !projectView ? <AgentSkillCreator
         key={props.activeConversationId}
         modelReady={props.textModels.some((model) => model.key === props.textModelKey)}
         request={props.onSkillAuthorReply}
@@ -1241,15 +1149,22 @@ export function AgentPanel(props: Props) {
           onChange={props.onTextModelChange}
         /> : <button type="button" className="agent-skill-retry" onClick={props.onOpenApiSettings}><KeyRound size={14} />配置对话模型</button>}
       /> : null}
-      <div className="agent-panel-messages-wrap" hidden={skillAuthoring}>
+      <div className="agent-panel-messages-wrap" hidden={skillAuthoring || Boolean(projectView)}>
         <div className="agent-panel-messages" ref={messagesRef}>
           {!props.messages.length && !attachedSkill && <div className="agent-empty"><span><Sparkles size={19} /></span><strong>今天想创造什么？</strong><p>聊灵感、梳理画面，或让我准备一份可确认的图像方案。</p></div>}
           {props.messages.map((message) => <Fragment key={message.id}>
             <article className={`agent-message is-${message.role}`}>
               <p>{message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}</p>
+              {message.role === 'user' && message.content.trim() && <button className="agent-message-memory" type="button" aria-label="将这条消息存为项目记忆" title="存为项目记忆" onClick={() => {
+                changeProjectView('memory')
+                setMemorySeed({ id: message.id, content: message.content.trim().slice(0, PROJECT_MEMORY_LENGTH) })
+              }}><Brain size={14} aria-hidden="true" /></button>}
               {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="metadata" /> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}</span><Focus size={12} /></button>)}</div>}
               {message.textNode?.nodeId && <button type="button" className="agent-message-to-canvas" onClick={() => props.onLocateCanvasNode(message.textNode!.nodeId!)}><Focus size={13} />查看整合文本节点</button>}
             </article>
+            {message.canvasEditDraft && !props.agentOnly && <AgentCanvasEditReview draft={message.canvasEditDraft}
+              onChange={(update) => props.onCanvasDraftChange(message.id, update)} onSave={() => props.onSaveCanvasDraft(message.id)} onApply={() => props.onConfirmCanvasDraft(message.id)}
+              onRevert={() => props.onRevertCanvasDraft(message.id)} onLocate={props.onLocateCanvasNode} />}
             {message.filmPlan?.nodeId && <button type="button" className="agent-plan-card is-collapsed" onClick={() => props.onLocateCanvasNode(message.filmPlan!.nodeId!)}>
               <span><Focus size={14} />查看画布中的成片任务</span>
             </button>}
@@ -1282,7 +1197,8 @@ export function AgentPanel(props: Props) {
           </div>}
         </div>
       </div>
-      <div className="agent-panel-composer" hidden={skillAuthoring}>
+      <div className="agent-panel-composer" hidden={skillAuthoring || Boolean(projectView)}>
+        {teamEnabled && !attachedSkill && <button type="button" className="agent-team-indicator" onClick={() => changeProjectView('team')}><UsersRound size={14} aria-hidden="true" />{getAgentTeamTemplate(props.projectSettings.team.template).label} · {activeAgentTeamRoles(props.projectSettings.team).length} 个角色</button>}
         <div
           className={`agent-composer-box reference-drop-zone ${referenceDropActive ? 'is-drop-active' : ''} ${referencesDisabled ? 'references-disabled' : ''}`}
           onDragEnter={(event) => {

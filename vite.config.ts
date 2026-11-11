@@ -17,8 +17,9 @@ import tls from 'node:tls'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { onRequestGet as serveToolboxMedia } from './functions/toolbox/media.js'
+import { onRequest as relayProvider } from './functions/provider/[[path]].js'
 
-const rightsBanner = '/*! DisyLab v2.0.0-preview.1 | Copyright (c) 2026 DisyLab. All rights reserved. | LicenseRef-DisyLab-Proprietary | ash::tya origin build | Unauthorized commercial use, redistribution, white-labeling, relicensing, or removal of this notice is prohibited. | Repository: https://github.com/TyaAsh/DisyLab-Canvas */'
+const rightsBanner = '/*! DisyLab v2.0.0 | Copyright (c) 2026 DisyLab. All rights reserved. | LicenseRef-DisyLab-Proprietary | ash::tya origin build | Unauthorized commercial use, redistribution, white-labeling, relicensing, or removal of this notice is prohibited. | Repository: https://github.com/TyaAsh/DisyLab-Canvas */'
 
 const localProxyUrl = new URL(process.env.DISYLAB_HTTPS_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890')
 
@@ -353,6 +354,30 @@ const apiYiMediaRelayPlugin: Plugin = {
 
 export default defineConfig({
   plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin, {
+    name: 'official-provider-relay',
+    configureServer(server) {
+      server.middlewares.use('/provider', async (req, res) => {
+        const task = new AbortController()
+        res.once('close', () => task.abort())
+        const method = req.method ?? 'GET'
+        try {
+          const request = new Request(`http://127.0.0.1/provider${req.url || ''}`, {
+            method,
+            headers: Object.entries(req.headers).flatMap(([key, value]) => typeof value === 'string' ? [[key, value]] : []),
+            signal: task.signal,
+            ...(method === 'POST' ? { body: Readable.toWeb(req), duplex: 'half' } : {}),
+          })
+          const response = await relayProvider({ request })
+          res.writeHead(response.status, Object.fromEntries(response.headers))
+          if (response.body) await pipeline(Readable.fromWeb(response.body), res)
+          else res.end()
+        } catch {
+          if (!res.headersSent) res.writeHead(502)
+          res.end()
+        }
+      })
+    },
+  }, {
     name: 'toolbox-shared-media',
     configureServer(server) {
       server.middlewares.use('/toolbox/media', async (req, res, next) => {

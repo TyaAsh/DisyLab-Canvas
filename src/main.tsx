@@ -11,6 +11,8 @@ import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { ReactFlowProvider } from '@xyflow/react'
 import App from './App'
+import { DesktopWindowFrame } from './DesktopWindowFrame'
+import { isDesktopApp } from './providerTransport'
 import { installProductionSourceShield } from './sourceShield'
 import './tailwind.css'
 import './styles.css'
@@ -58,12 +60,12 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error
   }
 }
 
+const app = <AppErrorBoundary>
+  <ReactFlowProvider>
+    <App />
+  </ReactFlowProvider>
+</AppErrorBoundary>
+
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <AppErrorBoundary>
-      <ReactFlowProvider>
-        <App />
-      </ReactFlowProvider>
-    </AppErrorBoundary>
-  </StrictMode>,
+  <StrictMode>{isDesktopApp() ? <DesktopWindowFrame>{app}</DesktopWindowFrame> : app}</StrictMode>,
 )

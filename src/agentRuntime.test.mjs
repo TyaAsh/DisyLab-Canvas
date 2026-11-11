@@ -22,10 +22,90 @@ const skillPrompt = await import(asModule((await compileModule('./skills/prompt.
   .replace("'handlebars'", JSON.stringify(import.meta.resolve('handlebars')))))
 const filmManifestModule = asModule(await compileModule('./skills/manifests/official/film.ts'))
 const { moveCanvasLayer } = await import(asModule(await compileModule('./canvasLayers.ts')))
+const { resolveAgentTextEditTargets, prepareAgentCanvasEdits, applyAgentCanvasEdits, revertAgentCanvasEdits } = await import(asModule(await compileModule('./agentCanvasEdits.ts')))
+const { activeAgentTeamRoles, normalizeAgentProjectSettings, projectMemoryPrompt, runAgentTeam } = await import(asModule(await compileModule('./agentProject.ts')))
 const { OFFICIAL_FILM_SKILLS } = await import(filmManifestModule)
 const skillConversation = await import(asModule((await compileModule('./skills/conversation.ts'))
   .replace("'./manifests/official/film'", JSON.stringify(filmManifestModule))
   .replace("'./guides'", JSON.stringify(asModule(await compileModule('./skills/guides.ts'))))))
+
+test('explicit image specs reach the confirmation card rather than composer defaults', () => {
+  const defaults = { aspectRatio: '1:1', resolution: '1K', detail: 'auto', count: 1 }
+  const draft = { ...defaults, prompt: '系列海报第1张，竖版3:4' }
+  assert.deepEqual(agent.resolveAgentImageDraftSettings('生成两张，比例 ３：４，2K，画质高', draft, defaults), {
+    aspectRatio: '3:4', resolution: '2K', detail: 'high', count: 2,
+  })
+  assert.deepEqual(agent.resolveAgentImageDraftSettings('做系列第2张海报', draft, defaults), { ...defaults, aspectRatio: '3:4' })
+  assert.equal(agent.resolveAgentImageDraftSettings('改成横版 16:9', draft, defaults).aspectRatio, '16:9')
+})
+
+test('ordinary clarification and explicit inspection never expose mutation proposals', () => {
+  const read = agent.inferAgentInteractionMode('检查画布为什么生成失败')
+  const write = agent.inferAgentInteractionMode('直接生成一张海报')
+  const clarification = agent.parseAgentReply('{"reply":"想做什么尺寸？","questions":[{"prompt":"横版还是竖版？","options":["横版","竖版"]}]}')
+  assert.equal(read.mode, 'inspect')
+  assert.equal(agent.agentReplyAllowsProposals(read, { decision: write }), false)
+  assert.equal(agent.agentReplyAllowsProposals(write, clarification), false)
+  assert.equal(agent.agentReplyAllowsProposals(write, {}), true)
+})
+
+test('project team templates choose distinct roles and the last role receives the prior work and memory', async () => {
+  const settings = normalizeAgentProjectSettings({
+    memory: [{ id: 'one', kind: 'constraint', text: '成片用竖版' }],
+    team: { template: 'production', models: { producer: 'local::model-a' }, disabled: ['screenwriter'] },
+  })
+  const roles = activeAgentTeamRoles(settings.team)
+  assert.deepEqual(roles.map(({ id }) => id), ['producer', 'director', 'productionReview'])
+  assert.deepEqual(activeAgentTeamRoles(normalizeAgentProjectSettings({ team: { template: 'copy' } }).team).map(({ id }) => id), ['copywriter', 'copyReview'])
+  const calls = []
+  const reply = await runAgentTeam(roles, projectMemoryPrompt(settings.memory), new AbortController().signal, async (role, prompt) => {
+    calls.push({ id: role.id, prompt })
+    return `交付 ${role.label}`
+  })
+  assert.equal(reply, '交付 执行制片')
+  assert.match(calls.at(-1).prompt, /成片用竖版/)
+  assert.match(calls.at(-1).prompt, /交付 制片人/)
+  assert.match(calls.at(-1).prompt, /交付 分镜导演/)
+})
+
+test('canvas text suggestions stay within explicitly selected or uniquely named targets', () => {
+  const nodes = [
+    { id: 'a', data: { kind: 'text', title: 'A', body: '原文 A' } },
+    { id: 'b', data: { kind: 'text', title: 'B', body: '原文 B' } },
+    { id: 'image', data: { kind: 'image', title: 'A', body: '提示词' } },
+  ]
+  assert.equal(agent.requestsAgentCanvasTextEdits('修改画布布局', false), false)
+  assert.equal(agent.requestsAgentCanvasTextEdits('把选中的文本改短', true), true)
+  assert.deepEqual(resolveAgentTextEditTargets(nodes, ['a'], '把《B》改短').map((node) => node.id), ['b'])
+  assert.deepEqual(resolveAgentTextEditTargets([...nodes, { ...nodes[0], id: 'other' }], ['b'], '改写《A》'), [])
+  const reply = agent.parseAgentReply(JSON.stringify({ textEdits: [{ nodeId: 'a', body: '新 A', kind: 'image' }, { nodeId: 'image', title: '越界' }, { nodeId: 'b', body: '' }] }))
+  assert.deepEqual(prepareAgentCanvasEdits(resolveAgentTextEditTargets(nodes, ['a', 'b'], '把选中文案改短'), reply.textEdits), [
+    { nodeId: 'a', before: { title: 'A', body: '原文 A' }, after: { body: '新 A' }, included: true },
+  ])
+})
+
+test('canvas edit approval is atomic for included targets and leaves unchecked targets and node metadata unchanged', () => {
+  const nodes = [
+    { id: 'a', position: { x: 100, y: 200 }, data: { kind: 'text', title: 'A', body: '原文 A', promptText: '已写好的提示词' } },
+    { id: 'b', data: { kind: 'text', title: 'B', body: '原文 B' } },
+  ]
+  const edits = prepareAgentCanvasEdits(nodes, [{ nodeId: 'a', body: '新 A' }, { nodeId: 'b', title: '新 B' }])
+  const modified = [nodes[0], { ...nodes[1], data: { ...nodes[1].data, body: '用户后来改的 B' } }]
+  assert.equal(applyAgentCanvasEdits(modified, edits).ok, false)
+  assert.equal(applyAgentCanvasEdits(nodes, edits, 'a').ok, false)
+  const partial = applyAgentCanvasEdits(modified, [edits[0], { ...edits[1], included: false }])
+  assert.equal(partial.ok, true)
+  assert.deepEqual(partial.nodeIds, ['a'])
+  assert.equal(partial.nodes[0].data.body, '新 A')
+  assert.equal(partial.nodes[0].data.promptText, '已写好的提示词')
+  assert.strictEqual(partial.nodes[0].position, nodes[0].position)
+  assert.strictEqual(partial.nodes[1], modified[1])
+  const approved = [edits[0], { ...edits[1], included: false }]
+  const reverted = revertAgentCanvasEdits(partial.nodes, approved)
+  assert.equal(reverted.ok, true)
+  assert.deepEqual(reverted.nodes, modified)
+  assert.equal(revertAgentCanvasEdits([nodes[0], modified[1]], approved).ok, false)
+})
 
 test('layer reordering moves a group and its descendants without changing their parents', () => {
   const nodes = [{ id: 'a' }, { id: 'b' }, { id: 'a1', parentId: 'a' }, { id: 'a2', parentId: 'a' }, { id: 'b1', parentId: 'b' }]

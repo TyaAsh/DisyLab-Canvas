@@ -7,6 +7,8 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
+import { normalizeAgentProjectSettings, type AgentProjectSettings } from './agentProject'
+
 const DATABASE_NAME = 'disy-infinite-local'
 const DATABASE_VERSION = 5
 const LEGACY_PROJECT_STORE = 'projects'
@@ -61,6 +63,7 @@ export type WorkspaceProject = {
   canvasIds: string[]
   createdAt: string
   updatedAt: string
+  agentSettings?: AgentProjectSettings
 }
 
 export type WorkspaceCanvas = Omit<LocalProject, 'id'> & {
@@ -374,8 +377,29 @@ export async function loadWorkspaceProject(id: string) {
 
 export async function saveWorkspaceProject(project: WorkspaceProject) {
   await runTransaction<void>([WORKSPACE_PROJECT_STORE], 'readwrite', (transaction) => {
-    transaction.objectStore(WORKSPACE_PROJECT_STORE).put(project)
+    const store = transaction.objectStore(WORKSPACE_PROJECT_STORE)
+    const request = store.get(project.id)
+    request.onsuccess = () => {
+      const current = request.result as WorkspaceProject | undefined
+      store.put({ ...project, agentSettings: current?.agentSettings ?? project.agentSettings })
+    }
   })
+}
+
+export async function updateProjectAgentSettings(projectId: string, update: (current: AgentProjectSettings) => AgentProjectSettings) {
+  let saved: AgentProjectSettings | undefined
+  await runTransaction<void>([WORKSPACE_PROJECT_STORE], 'readwrite', (transaction) => {
+    const store = transaction.objectStore(WORKSPACE_PROJECT_STORE)
+    const request = store.get(projectId)
+    request.onsuccess = () => {
+      const project = request.result as WorkspaceProject | undefined
+      if (!project) return
+      saved = normalizeAgentProjectSettings(update(normalizeAgentProjectSettings(project.agentSettings)))
+      store.put({ ...project, agentSettings: saved })
+    }
+  })
+  if (!saved) throw new Error('项目已不存在')
+  return saved
 }
 
 export async function renameWorkspaceProject(projectId: string, name: string) {
@@ -548,9 +572,18 @@ export async function deleteWorkspaceCanvas(projectId: string, canvasId: string)
   return next
 }
 
-export async function saveAgentSession(session: AgentSessionRecord) {
-  await runTransaction<void>([AGENT_SESSION_STORE], 'readwrite', (transaction) => {
+export async function saveAgentSession(session: AgentSessionRecord, graph?: { nodes: unknown[]; edges: unknown[] }) {
+  await runTransaction<void>(graph ? [AGENT_SESSION_STORE, CANVAS_STORE] : [AGENT_SESSION_STORE], 'readwrite', (transaction) => {
     transaction.objectStore(AGENT_SESSION_STORE).put(session)
+    if (graph) {
+      const store = transaction.objectStore(CANVAS_STORE)
+      const request = store.get(session.canvasId)
+      request.onsuccess = () => {
+        const canvas = request.result as WorkspaceCanvas | undefined
+        if (!canvas || canvas.projectId !== session.projectId) { transaction.abort(); return }
+        store.put({ ...canvas, ...graph, updatedAt: session.updatedAt })
+      }
+    }
   })
 }
 
@@ -570,6 +603,13 @@ export async function listAgentSessions(canvasId?: string) {
   } finally {
     database.close()
   }
+}
+
+export async function listProjectAgentSessions(projectId: string) {
+  const database = await openDatabase()
+  try {
+    return await requestResult(database.transaction(AGENT_SESSION_STORE, 'readonly').objectStore(AGENT_SESSION_STORE).index('projectId').getAll(projectId)) as AgentSessionRecord[]
+  } finally { database.close() }
 }
 
 export async function saveWorkspaceAuxiliaryData(data: Omit<WorkspaceAuxiliaryData, 'id' | 'updatedAt'>) {
@@ -747,7 +787,7 @@ export async function exportWorkspaceSnapshot(): Promise<WorkspaceSnapshot> {
       version: 1,
       producer: {
         name: 'DisyLab',
-        release: '2.0.0-preview.1',
+        release: '2.0.0',
         ashOrigin: 'ashhaveaniceday::disylab::origin',
         tyaCanvas: 'tya::infinite-canvas::2026',
         rights: 'LicenseRef-DisyLab-Proprietary',

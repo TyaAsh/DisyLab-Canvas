@@ -8,6 +8,9 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import { create } from 'zustand'
+import { isJimengCliBase, JIMENG_LOCAL_CREDENTIAL } from './jimengCli'
+import { isMuseWebBase, MUSE_WEB_CONNECTION } from './museWeb'
+import { isDesktopApp } from './providerTransport'
 
 const API_SETTINGS_KEY = 'disy-api-settings'
 const API_SECRETS_KEY = 'disy-api-secrets'
@@ -109,11 +112,13 @@ function readApiSettings(): ApiSettings {
       const loadedConnections = value.connections.map((item) => {
         const connection = item as Partial<ApiConnection>
         const id = typeof connection.id === 'string' ? connection.id : crypto.randomUUID()
+        const baseUrl = typeof connection.baseUrl === 'string' ? connection.baseUrl : ''
         return {
           id,
           name: typeof connection.name === 'string' ? connection.name : 'API 连接',
-          baseUrl: typeof connection.baseUrl === 'string' ? connection.baseUrl : '',
-          apiKey: secrets[id] ?? '',
+          baseUrl,
+          apiKey: isDesktopApp() && isMuseWebBase(baseUrl) ? MUSE_WEB_CONNECTION
+            : isDesktopApp() && isJimengCliBase(baseUrl) ? JIMENG_LOCAL_CREDENTIAL : secrets[id] ?? '',
           authMode: ['auto', 'bearer', 'x-api-key', 'api-key', 'x-goog-api-key'].includes(String(connection.authMode)) ? connection.authMode as ApiAuthMode : 'auto',
           balanceToken: typeof balanceTokens[id] === 'string' ? balanceTokens[id] : '',
           models: Array.isArray(connection.models)
@@ -201,7 +206,7 @@ function persistApiSettings(settings: ApiSettings) {
     ...settings,
     connections: settings.connections.map(({ apiKey: _apiKey, balanceToken: _balanceToken, ...connection }) => connection),
   }
-  const secretMap = Object.fromEntries(settings.connections.filter((connection) => connection.apiKey).map((connection) => [connection.id, connection.apiKey]))
+  const secretMap = Object.fromEntries(settings.connections.filter((connection) => connection.apiKey && !isJimengCliBase(connection.baseUrl) && !isMuseWebBase(connection.baseUrl)).map((connection) => [connection.id, connection.apiKey]))
   const balanceTokenMap = Object.fromEntries(settings.connections.filter((connection) => connection.balanceToken).map((connection) => [connection.id, connection.balanceToken]))
   const previousSecrets = sessionStorage.getItem(API_SECRETS_KEY)
   sessionStorage.setItem(API_SECRETS_KEY, JSON.stringify(secretMap))

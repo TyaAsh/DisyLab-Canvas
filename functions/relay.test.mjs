@@ -2,6 +2,22 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { onRequest as mediaRelay } from './apiyi/media.js'
 import { onRequest as hfsyRelay } from './hfsy/[[path]].js'
+import { onRequest as providerRelay } from './provider/[[path]].js'
+
+test('provider relay limits credentials to the configured vendor, route and method', async (t) => {
+  const upstream = t.mock.method(globalThis, 'fetch', async (url, init) => {
+    assert.equal(url, 'https://api.minimaxi.com/v2/query/video_generation/task-123')
+    assert.equal(init.headers.get('authorization'), 'Bearer test-only')
+    assert.equal(init.headers.get('cookie'), null)
+    assert.equal(init.redirect, 'error')
+    return Response.json({ task: { id: 'task-123' } })
+  })
+  const response = await providerRelay({ request: new Request('https://app.test/provider/minimax/v2/query/video_generation/task-123', { headers: { authorization: 'Bearer test-only', cookie: 'local=secret' } }) })
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('cache-control'), 'no-store')
+  assert.equal((await providerRelay({ request: new Request('https://app.test/provider/minimax/v1/files/delete', { method: 'POST' }) })).status, 404)
+  assert.equal(upstream.mock.callCount(), 1)
+})
 
 test('Cloudflare media relay rejects a redirect to a non-approved host', async () => {
   const originalFetch = globalThis.fetch

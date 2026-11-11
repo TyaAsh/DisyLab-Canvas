@@ -7,6 +7,8 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
+import type { AgentCanvasEditDraft, AgentCanvasEditProposal } from './agentCanvasEdits'
+
 export type AgentMessage = {
   id: string
   role: 'user' | 'assistant'
@@ -15,6 +17,8 @@ export type AgentMessage = {
   references?: AgentImageReference[]
   skillUseId?: string
   questions?: AgentQuestion[]
+  canvasEditDraft?: AgentCanvasEditDraft
+  canvasEditTargetQuestion?: boolean
   filmPlan?: {
     skillSlug: string
     subject: string
@@ -82,6 +86,8 @@ export type AgentImagePlan = {
   resolution: string
   detail: string
   count: number
+  /** Separates cards with confirmed draft settings from older composer defaults. */
+  hasDraftImageSpecs?: boolean
   imageConnectionId?: string
   imageModelId?: string
   assistantMessageId?: string
@@ -116,6 +122,9 @@ export type AgentRun = {
   status: 'running' | 'completed' | 'failed' | 'cancelled'
   startedAt: string
   updatedAt: string
+  title?: string
+  stage?: string
+  team?: boolean
 }
 
 export type AgentCanvasContextSnapshot = {
@@ -185,6 +194,7 @@ export type AgentReply = {
   imagePlans?: AgentImagePlanDraft[]
   videoPlan?: AgentVideoPlanDraft
   videoPlans?: AgentVideoPlanDraft[]
+  textEdits?: AgentCanvasEditProposal[]
   textNode?: {
     title: string
     content: string
@@ -192,6 +202,38 @@ export type AgentReply = {
 }
 
 export type AgentImagePlanDraft = Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'label'>
+
+/** The user's explicit image specs win over the model's suggested settings. */
+export function resolveAgentImageDraftSettings(
+  request: string,
+  draft: AgentImagePlanDraft,
+  defaults: Pick<AgentImagePlanDraft, 'aspectRatio' | 'resolution' | 'detail' | 'count'>,
+) {
+  const ratio = (text: string) => {
+    const value = text.normalize('NFKC')
+    const specified = /(?:比例|横版|竖版|方形|宽高比|横屏|竖屏)\s*(?:为|用|[:：])?\s*(\d{1,2}(?:\.\d+)?)[ \t]*:[ \t]*(\d{1,2}(?:\.\d+)?)(?![\d.:])/.exec(value)
+    return specified ?? /(?:^|[^\d:])(21|16|9|5|4|3|2|1)[ \t]*:[ \t]*(21|16|9|5|4|3|2|1)(?![\d.:])/.exec(value)
+  }
+  const ratioString = (match: RegExpMatchArray | null) => match && Number(match[1]) > 0 && Number(match[2]) > 0 ? `${Number(match[1])}:${Number(match[2])}` : undefined
+  const normalized = request.normalize('NFKC')
+  const count = normalized.match(/(?:^\s*|(?:数量|张数|生成|出图|做|画|给我|要|每个方案)[：:\s]*)([1-4一二两三四])\s*张/)
+  const countWords: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4 }
+  const quality = normalized.match(/(?:画质|品质|质量|精度)\s*[:：]?\s*(自动|最高|高|中|低)/)
+  const qualityWords: Record<string, string> = { 自动: 'auto', 最高: 'max', 高: 'high', 中: 'medium', 低: 'low' }
+  const suppliedResolution = normalized.match(/(?:^|[^a-z0-9])([124]K)(?![a-z0-9])/i)?.[1].toUpperCase()
+  return {
+    aspectRatio: ratioString(ratio(normalized)) ?? ratioString(ratio(draft.prompt)) ?? ratioString(ratio(draft.aspectRatio)) ?? defaults.aspectRatio,
+    resolution: suppliedResolution ?? draft.resolution ?? defaults.resolution,
+    detail: (quality && qualityWords[quality[1]]) || draft.detail || defaults.detail,
+    count: count ? (countWords[count[1]] ?? Number(count[1])) : Math.min(4, Math.max(1, Math.round(draft.count || defaults.count))),
+  }
+}
+
+export function reconcileAgentImagePlanSpecs(plan: AgentImagePlan): AgentImagePlan {
+  if (plan.hasDraftImageSpecs || plan.aspectRatio !== '1:1' || (plan.status !== 'ready' && plan.status !== 'proposed')) return plan
+  const specs = resolveAgentImageDraftSettings('', plan, plan)
+  return { ...plan, aspectRatio: specs.aspectRatio }
+}
 export type AgentVideoPlanDraft = Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'label'>
 
 export function compactReferenceName(value: string, maxLength = 8) {
@@ -238,11 +280,27 @@ export function inferAgentInteractionMode(content: string): AgentDecision {
   const explicitPlan = /(?:先|只|暂时).{0,8}(?:计划|方案|分析|思路|建议)|(?:不要|先别|暂不).{0,8}(?:执行|生成|修改|动手)|计划模式/i.test(normalized)
   const explicitExecute = /(?:开始|直接|立即|现在|马上|就按|照着|执行|落实|修改好|修复好|生成|制作|创建|删除)/i.test(normalized)
   const ambiguous = normalized.length < 5 || /^(?:这个|那个|它|继续|然后呢|怎么办)[？?。！!]*$/i.test(normalized)
+  if (/^(?:(?:请|帮我|先|只|分析一下|看一下)\s*)*(?:检查|分析|审计|评估|看看|为什么|怎么回事|找问题|排查)/.test(normalized)
+    && !/(?:然后|并且|之后|接着).{0,14}(?:执行|修改|修复|生成|制作|创建)/.test(normalized)) {
+    return { mode: 'inspect', confidence: .93, needsApproval: false, reason: '用户要求先检查或分析现状' }
+  }
   if (explicitPlan) return { mode: 'plan', confidence: .96, needsApproval: false, reason: '用户明确要求先规划或暂不执行' }
-  if (explicitExecute) return { mode: 'execute', confidence: .88, needsApproval: /(?:生成|制作|创建|删除|覆盖)/i.test(normalized), reason: '用户明确要求开始产生变更' }
+  if (explicitExecute) return { mode: 'execute', confidence: .88, needsApproval: true, reason: '用户明确要求开始产生变更' }
   if (ambiguous) return { mode: 'clarify', confidence: .72, needsApproval: false, reason: '目标或指代不足以安全执行' }
   if (inspect) return { mode: 'inspect', confidence: .82, needsApproval: false, reason: '用户请求分析现状或定位问题' }
   return { mode: 'answer', confidence: .62, needsApproval: false, reason: '未发现明确执行或规划指令' }
+}
+
+export function agentReplyAllowsProposals(local: AgentDecision, reply: Pick<AgentReply, 'decision' | 'questions'>) {
+  return local.mode !== 'inspect' && reply.decision?.mode !== 'inspect' && reply.decision?.mode !== 'clarify' && !reply.questions?.length
+}
+
+export function requestsAgentCanvasTextEdits(content: string, hasSelectedText: boolean) {
+  if (!/修改|改写|改一下|重写|润色|精简|缩短|改短|更名|重命名|替换|改成|改为|改标题|改正文/.test(content)) return false
+  const textField = /文本|文字|文案|标题|正文|脚本/.test(content)
+  return (/《[^》]+》|@\[node:/.test(content) && (textField || hasSelectedText || /改写|重写|润色|精简|改短/.test(content)))
+    || (textField && /画布|节点|选中|所选/.test(content))
+    || (hasSelectedText && /选中|所选|这段|这些|这几段|这个标题|它/.test(content))
 }
 
 export function messageExpectsVideoPlans(content: string) {
@@ -281,7 +339,7 @@ function extractFirstJsonContainer(value: string) {
 function normalizeAgentReplyRecord(value: unknown): Record<string, unknown> | null {
   if (Array.isArray(value)) {
     const records = value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode', 'filmDraft', 'questions'].some((field) => field in record))
+    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode', 'textEdits', 'filmDraft', 'questions'].some((field) => field in record))
     return protocolRecords.length ? Object.assign({}, ...protocolRecords) : null
   }
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -314,13 +372,13 @@ function extractMalformedReply(value: string) {
 
 function looksLikeAgentProtocolPayload(value: string) {
   const cleaned = value.trim()
-  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode|filmDraft|questions)(?:["']|\\["'])?\s*:/i.test(cleaned)
+  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)(?:["']|\\["'])?\s*:/i.test(cleaned)
   if (!hasProtocolField) return false
   return /^```(?:json|js)?/i.test(cleaned)
     || /^[\[{"']/.test(cleaned)
-    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
-    || /^(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
-    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode|filmDraft|questions)\s*:/i.test(cleaned)
+    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
+    || /^(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
+    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
 }
 
 export function normalizeAgentMessageContent(content: string) {
@@ -334,7 +392,11 @@ export function buildAgentConversationContext(messages: AgentMessage[], recentCo
     const content = normalizeAgentMessageContent(message.content).replace(/\s+/g, ' ').trim()
     return `${message.role === 'user' ? '用户' : 'Disy'}：${content.slice(0, 180)}`
   }).join('\n')
-  const transcript = recent.map((message) => `${message.role === 'user' ? '用户' : 'Disy'}：${message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}`).join('\n')
+  const transcript = recent.map((message, index) => {
+    const content = message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content
+    const bounded = index === recent.length - 1 || content.length <= 1600 ? content : `${content.slice(0, 1100)}\n[中段略]\n${content.slice(-480)}`
+    return `${message.role === 'user' ? '用户' : 'Disy'}：${bounded}`
+  }).join('\n')
   return summary ? `较早对话摘要（按原顺序压缩）：\n${summary}\n\n最近对话：\n${transcript}` : transcript
 }
 
@@ -420,13 +482,18 @@ export function parseAgentReply(raw: string): AgentReply {
           content: textNodeContent,
         }
       : undefined
+    const textEdits = Array.isArray(value.textEdits) ? value.textEdits.slice(0, 8).flatMap((item): AgentCanvasEditProposal[] => {
+      if (!item || typeof item !== 'object' || typeof item.nodeId !== 'string' || (!Object.hasOwn(item, 'title') && !Object.hasOwn(item, 'body'))) return []
+      return [{ nodeId: item.nodeId, title: typeof item.title === 'string' ? item.title : undefined, body: typeof item.body === 'string' ? item.body : undefined }]
+    }) : []
     return {
       reply: reply
         || (questions.length ? '先确认几个细节，我们就能继续。' : '')
         || (imagePlans.length ? `我已整理好${imagePlans.length > 1 ? `${imagePlans.length}份` : '一份'}图像方案，请选择并确认后生成。` : '')
         || (videoPlans.length ? `我已整理好${videoPlans.length > 1 ? `${videoPlans.length}份` : '一份'}视频方案，请确认后生成。` : '')
         || (filmDraft ? '成片方案整理好了，可以先看一眼再开始制作。' : '')
-        || (textNode ? '我已整理好最终文本，并放入画布文本节点。' : '这次回复格式异常，请重新发送一次。'),
+        || (textEdits.length ? '修改建议已整理好，确认后才会更新画布。' : '')
+        || (textNode ? '最终文本已整理好，确认后可加入画布。' : '这次回复格式异常，请重新发送一次。'),
       decision,
       questions: questions.length ? questions : undefined,
       filmDraft,
@@ -435,6 +502,7 @@ export function parseAgentReply(raw: string): AgentReply {
       videoPlan: videoPlans[0],
       videoPlans: videoPlans.length ? videoPlans : undefined,
       textNode,
+      textEdits: textEdits.length ? textEdits : undefined,
     }
   } catch {
     const recoveredReply = extractMalformedReply(cleaned)

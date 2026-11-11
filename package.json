@@ -1,7 +1,7 @@
 {
   "name": "disy-infinite-canvas",
   "private": true,
-  "version": "2.0.0-preview.1",
+  "version": "2.0.0",
   "license": "UNLICENSED",
   "author": "DisyLab",
   "homepage": "https://tyaash.github.io/DisyLab-Canvas/",
@@ -18,18 +18,15 @@
     "dev": "vite --strictPort",
     "build": "tsc -b && vite build",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build --target x86_64-pc-windows-msvc --no-bundle",
+    "desktop:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
     "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library && npm run audit:workflows",
     "test:toolbox": "node --disable-warning=ExperimentalWarning --test src/watermark.test.mjs",
     "test:relay": "node --test functions/relay.test.mjs",
-    "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/storyboard.test.mjs src/agentRuntime.test.mjs",
+    "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/storyboard.test.mjs src/agentRuntime.test.mjs src/museWeb.test.mjs",
     "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs",
-    "audit:workflows": "node scripts/audit-workflow-duplicates.mjs",
-    "import:local-library": "node scripts/import-local-reference-library.mjs && node scripts/rewrite-local-prompts.mjs",
-    "build:render-library": "node scripts/extend-render-reference-library.mjs",
-    "build:fintech-library": "node scripts/build-fintech-visual-library.mjs"
+    "audit:workflows": "node scripts/audit-workflow-duplicates.mjs"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
@@ -52,7 +49,6 @@
     "zustand": "^5.0.5"
   },
   "devDependencies": {
-    "@rolldown/binding-win32-x64-msvc": "^1.2.3",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.12.4",
     "@types/react": "^19.2.14",

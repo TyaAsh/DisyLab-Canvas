@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
@@ -14,6 +14,7 @@ if ((catalog.styles || []).length || (catalog.scenes || []).length || (catalog.t
 for (const item of catalog.cases) {
   if (!expectedCategories.includes(item.category)) throw new Error(`Unsupported category: ${item.category}`)
   if (!/^\/prompt-library\/local\/local-\d+\.(?:jpg|png)$/.test(item.image)) throw new Error(`Unexpected local image path: ${item.image}`)
+  await access(join(root, 'public', item.image)).catch(() => { throw new Error(`Missing library image: ${item.image}`) })
   if (!item.nanoPrompt?.includes('可直接用于文生图') || !item.nanoPrompt?.includes('如同时上传参考图')) throw new Error(`Nano prompt is not dual-mode: ${item.id}`)
   if (!item.gptImage2Prompt?.includes('仅凭本提示词即可文生图') || !item.gptImage2Prompt?.includes('若同时上传参考图')) throw new Error(`GPT Image 2 prompt is not dual-mode: ${item.id}`)
   if (requiredGptSections.some((section) => !item.gptImage2Prompt.includes(section))) throw new Error(`GPT Image 2 prompt is missing a structured section: ${item.id}`)
