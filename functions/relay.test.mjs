@@ -96,3 +96,22 @@ test('Cloudflare HFSY relay only exposes documented root endpoints', async () =>
   const response = await hfsyRelay({ request: new Request('https://app.test/hfsy/__root__/api/user/self') })
   assert.equal(response.status, 400)
 })
+
+test('media relay streams the documented xAI video host without forwarding provider credentials', async (t) => {
+  const source = 'https://vidgen.x.ai/xai-vidgen-bucket/video.mp4'
+  const upstream = t.mock.method(globalThis, 'fetch', async (url, init) => {
+    assert.equal(String(url), source)
+    assert.equal(init.headers.get('authorization'), null)
+    return new Response('full', {
+      status: 206,
+      headers: { 'content-type': 'video/mp4', 'content-range': 'bytes 0-3/4' },
+    })
+  })
+  const request = new Request(`https://app.test/apiyi/media?url=${encodeURIComponent(source)}`, {
+    headers: { 'X-DisyLab-Media-Authorization': 'Bearer test-only' },
+  })
+  const response = await mediaRelay({ request })
+  assert.equal(response.headers.get('content-range'), 'bytes 0-3/4')
+  assert.equal(await response.text(), 'full')
+  assert.equal(upstream.mock.callCount(), 1)
+})

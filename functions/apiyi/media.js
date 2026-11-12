@@ -8,6 +8,7 @@ function mediaHostAllowed(url) {
   return url.protocol === 'https:'
     && !url.username && !url.password && !url.port
     && (/(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
+      || url.hostname === 'vidgen.x.ai'
       || (url.hostname === '8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com' && url.pathname.startsWith('/video/')))
 }
 
@@ -43,7 +44,7 @@ export async function onRequest({ request }) {
     const headers = new Headers(CORS)
     headers.set('Content-Security-Policy', "sandbox; default-src 'none'; style-src 'unsafe-inline'")
     headers.set('X-Content-Type-Options', 'nosniff')
-    for (const name of ['content-type', 'content-length', 'cache-control', 'etag', 'last-modified']) {
+    for (const name of ['content-type', 'content-length', 'content-range', 'cache-control', 'etag', 'last-modified']) {
       const value = upstream.headers.get(name)
       if (value) headers.set(name, value)
     }

@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import type { AgentCanvasEditDraft, AgentCanvasEditProposal } from './agentCanvasEdits'
+import type { AgentImageOperationDraft } from './agentImageOperations'
 
 export type AgentMessage = {
   id: string
@@ -19,11 +20,13 @@ export type AgentMessage = {
   questions?: AgentQuestion[]
   canvasEditDraft?: AgentCanvasEditDraft
   canvasEditTargetQuestion?: boolean
+  imageOperation?: AgentImageOperationDraft
   retry?: {
     userMessageId: string
     invocationText: string
     videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
     useTeam: boolean
+    legacyStoryboardPlanId?: string
   }
   filmPlan?: {
     skillSlug: string
@@ -201,6 +204,7 @@ export type AgentReply = {
   decision?: AgentDecision
   imagePlan?: AgentImagePlanDraft
   imagePlans?: AgentImagePlanDraft[]
+  imagePlanIntent?: 'alternatives' | 'deliverables'
   videoPlan?: AgentVideoPlanDraft
   videoPlans?: AgentVideoPlanDraft[]
   textEdits?: AgentCanvasEditProposal[]
@@ -268,13 +272,42 @@ function parsePlanCountText(value: string) {
 }
 
 export function getRequestedAgentPlanCount(content: string) {
-  const match = content.match(/(?:给|要|来|出|提供|做|准备|整理|生成|想要)?\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个|套|份|种|款)?\s*(?:方案|方向|创意|版本)/i)
+  const match = content.match(/(?:给|要|来|出|提供|做|准备|整理|生成|想要)?\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个|套|份|种|款)?\s*(?:不同的?|备选的?|独立的?)?\s*(?:方案|方向|创意|版本)/i)
   return match ? parsePlanCountText(match[1]) : null
+}
+
+export function agentDirectionLimit(content: string) {
+  return getRequestedAgentPlanCount(content)
+    ?? (/(?:多套|多种|多个|不同|几套|几种|几个|备选|可选).{0,6}(?:方案|方向|创意|版本)|(?:头脑风暴|脑暴|brainstorm)/i.test(content) ? 3 : 1)
 }
 
 export function messageRequestsDirectImagePlan(content: string) {
   return /(?:不用|不要|无需)(?:再|先)?(?:选择|提供|给出|查看)?(?:任何|多个|这些|三套)?(?:方案|方向)/i.test(content)
     || /(?:直接|就|照着|按照|按我说的).{0,18}(?:生成|生图|出图|做|制作|设计|修复|修改)/i.test(content)
+}
+
+export function requestsAgentImageEdit(content: string) {
+  const text = content.replace(/@\[node:[^\]]+\]/g, '')
+  return /(?:换背景|替换背景|改背景|去背景|抠图|移除背景|修复原图|调色|去水印|修图|(?:把|将|给).{0,24}(?:背景|颜色|构图).{0,10}(?:改|换)|\b(?:remove|replace|change) (?:the )?background\b)/i.test(text)
+}
+
+export function resolveAgentVideoDraftSettings(
+  request: string,
+  draft: AgentVideoPlanDraft,
+  defaults: Pick<AgentVideoPlanDraft, 'aspectRatio' | 'resolution' | 'duration' | 'count'>,
+) {
+  const text = request.normalize('NFKC')
+  const aspect = /(?:^|[^\d:])(21|16|9|5|4|3|2|1)\s*:\s*(21|16|9|5|4|3|2|1)(?![\d.:])/.exec(text)
+  const duration = /(?:时长\s*(?:为|用|[:：])?\s*|(?:做|生成|制作|要)(?:一个|一段|成)?\s*|^)(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:秒|seconds?)/i.exec(text)
+    ?? /(?:^|[^\d-])(\d{1,2})\s*秒(?:钟)?(?:的)?(?:视频|短片|动画)/.exec(text)
+  const count = /(?:生成|制作|做|输出|数量\s*[:：]?)\s*([1-4一二两三四])\s*(?:条|段|个|份)/.exec(text)
+  const resolution = /(?:^|[^a-z0-9])(480p|720p|768p|1080p|2k|4k)(?![a-z0-9])/i.exec(text)
+  return {
+    aspectRatio: aspect ? `${aspect[1]}:${aspect[2]}` : /竖版|竖屏/.test(text) ? '9:16' : /横版|横屏/.test(text) ? '16:9' : draft.aspectRatio || defaults.aspectRatio,
+    resolution: resolution?.[1].toLowerCase() || draft.resolution.toLowerCase() || defaults.resolution,
+    duration: (duration && parsePlanCountText(duration[1])) || draft.duration || defaults.duration,
+    count: Math.min(4, Math.max(1, (count && parsePlanCountText(count[1])) || Math.round(draft.count || defaults.count))),
+  }
 }
 
 export function messageExpectsImagePlans(content: string) {
@@ -314,7 +347,7 @@ export function requestsAgentCanvasTextEdits(content: string, hasSelectedText: b
 
 export function messageExpectsVideoPlans(content: string) {
   return /(?:生成|制作|创作|做|出|续写|延展).{0,12}(?:视频|短片|动画|动态画面)/i.test(content)
-    || /(?:文生视频|图生视频|视频生成|生成视频)/i.test(content)
+    || /(?:文生视频|图生视频|视频生成|生成视频|(?:让|把).{0,15}(?:图|画面).{0,8}动起来|\banimate (?:this|the) image\b)/i.test(content)
 }
 
 function extractFirstJsonContainer(value: string) {
@@ -476,7 +509,7 @@ export function parseAgentReply(raw: string): AgentReply {
           prompt,
           aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '16:9',
           resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '720p',
-          duration: Math.min(15, Math.max(4, Number(candidate.duration) || 4)),
+          duration: Math.min(30, Math.max(1, Number(candidate.duration) || 4)),
           count: Math.min(4, Math.max(1, Number(candidate.count) || 1)),
         }
       })
@@ -506,6 +539,7 @@ export function parseAgentReply(raw: string): AgentReply {
       decision,
       questions: questions.length ? questions : undefined,
       filmDraft,
+      imagePlanIntent: value.imagePlanIntent === 'deliverables' || value.imagePlanIntent === 'alternatives' ? value.imagePlanIntent : undefined,
       imagePlan: imagePlans[0],
       imagePlans: imagePlans.length ? imagePlans : undefined,
       videoPlan: videoPlans[0],

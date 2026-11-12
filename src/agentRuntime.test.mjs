@@ -338,3 +338,49 @@ test('long conversations retain a compact older summary and exact recent turns',
   assert.match(context, /最近对话/)
   assert.match(context, /消息 15/)
 })
+
+test('storyboard extraction uses original cells and preserves independent aspect ratios', async () => {
+  const operations = await import(asModule(await compileModule('./agentImageOperations.ts')))
+  assert.deepEqual(operations.inferAgentImageOperation('把每一个镜头画面按顺序拆出来，一共是十张大图'), {
+    kind: 'split', requestedCount: 10, longEdge: 2048,
+  })
+  assert.deepEqual(operations.inferAgentImageOperation('把拼图每格拆出，一共十张高清大图'), {
+    kind: 'split', requestedCount: 10, longEdge: 2048,
+  })
+  assert.equal(operations.inferAgentImageOperation('分析一下这个分镜图怎么拆'), undefined)
+  assert.equal(operations.inferAgentImageOperation('生成一张新的十二格分镜图'), undefined)
+  const regions = operations.parseStoryboardRegions(JSON.stringify({ regions: [[0, 0, 600, 500], [600, 0, 1000, 500], [0, 500, 1000, 1000]] }))
+  assert.deepEqual(operations.imageRegionPixels(regions[0], 1000, 800), {
+    left: 0, top: 0, cropWidth: 600, cropHeight: 400, width: 600, height: 400,
+  })
+  assert.deepEqual(operations.imageRegionPixels(regions[1], 1000, 800, 2048), {
+    left: 600, top: 0, cropWidth: 400, cropHeight: 400, width: 2048, height: 2048,
+  })
+  assert.throws(() => operations.parseStoryboardRegions('{"regions":[[0,0,600,500],[10,10,600,500]]}'), /重叠/)
+  assert.throws(() => operations.parseStoryboardRegions('{"regions":[[0,0,600,500],[600,0,1200,500]]}'), /范围有误/)
+})
+
+test('historical one-image cards are recognized as storyboard extraction', async () => {
+  const { legacyStoryboardOperation } = await import(asModule(await compileModule('./agentImageOperations.ts')))
+  assert.equal(legacyStoryboardOperation({
+    label: '分镜拆分（10张，合并第9–10格与第11–12格）',
+    prompt: '从原分镜图按原有格线完整拆分为10张独立图像，不增删或重绘内容。',
+    count: 1,
+  }).requestedCount, 10)
+  assert.equal(legacyStoryboardOperation({
+    label: '分镜图',
+    prompt: '生成一张新的十二格分镜图',
+  }), undefined)
+})
+
+test('Agent distinguishes requested alternatives from independent deliverables and reads video specifications', () => {
+  assert.equal(agent.agentDirectionLimit('给这张海报换成白色背景'), 1)
+  assert.equal(agent.requestsAgentImageEdit('把海报背景换成白色'), true)
+  assert.equal(agent.agentDirectionLimit('给三个不同的创意方向'), 3)
+  assert.equal(agent.agentDirectionLimit('来两套方案'), 2)
+  assert.equal(agent.parseAgentReply('{"reply":"两张独立海报","imagePlanIntent":"deliverables","imagePlans":[{"prompt":"横版海报"},{"prompt":"竖版海报"}]}').imagePlanIntent, 'deliverables')
+  const defaults = { aspectRatio: '16:9', duration: 4, resolution: '720p', count: 1 }
+  assert.deepEqual(agent.resolveAgentVideoDraftSettings('做一个10秒视频，竖屏，1080p', { ...defaults, prompt: '镜头缓推' }, defaults), {
+    aspectRatio: '9:16', duration: 10, resolution: '1080p', count: 1,
+  })
+})

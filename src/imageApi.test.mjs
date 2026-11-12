@@ -815,3 +815,81 @@ test('GRS AI balance falls back to the shared account pool for an unlimited key'
   assert.equal(credits.amount, 608575)
   assert.equal(credits.scope, 'account')
 })
+
+test('video recovery reopens an expired result with the original vendor and never resubmits', async (t) => {
+  const requests = []
+  browserGlobal(t, 'window', {
+    location: { href: 'http://localhost/' },
+    setTimeout: (callback) => setTimeout(callback, 0),
+    clearTimeout,
+  })
+  const oldUrl = 'https://old.example.test/clip.mp4'
+  const newUrl = 'https://new.example.test/clip.mp4'
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    url = String(url)
+    requests.push([url, init.method ?? 'GET', new Headers(init.headers).get('authorization')])
+    if (url === '/provider/xai/v1/videos/task-42') return Response.json({ status: 'done', video: { url: newUrl } })
+    if (url === `/apiyi/media?url=${encodeURIComponent(newUrl)}`) return new Response('full video', { headers: { 'Content-Type': 'video/mp4' } })
+    return new Response('expired', { status: 403 })
+  })
+  const result = await api.readRecoverableVideo({
+    sourceUrl: oldUrl, taskId: 'task-42',
+    settings: { baseUrl: 'https://api.x.ai/v1', model: 'grok-imagine-video-1.5', apiKey: 'vendor-key' },
+  })
+  assert.equal(result.sourceUrl, newUrl)
+  assert.equal(await result.blob.text(), 'full video')
+  assert.ok(requests.every(([, method]) => method === 'GET'))
+  assert.deepEqual(requests.filter(([, , authorization]) => authorization), [['/provider/xai/v1/videos/task-42', 'GET', 'Bearer vendor-key']])
+})
+
+test('video recovery uses each provider task and content route with the original authentication mode', async (t) => {
+  const requests = []
+  const fixtures = {
+    'https://example.test/v1/videos/task-a': { status: 'completed' },
+    'https://api.minimaxi.com/v1/query/video_generation?task_id=task-a': { status: 'success', file_id: 'file-a' },
+    'https://api.minimaxi.com/v1/files/retrieve?file_id=file-a': { file: { download_url: 'https://media.example.test/full.mp4' } },
+    'https://api.apiyi.com/v1/tasks/task-a': { status: 'succeeded', output: { video_url: 'https://media.example.test/full.mp4' } },
+    'https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/task-a': { status: 'succeeded', content: { video_url: 'https://media.example.test/full.mp4' } },
+  }
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    url = String(url)
+    requests.push([url, init.method ?? 'GET', new Headers(init.headers)])
+    if (url in fixtures) return Response.json(fixtures[url])
+    if (url === 'https://media.example.test/full.mp4' || url.endsWith('/videos/task-a/content')) {
+      return new Response('video', { headers: { 'Content-Type': 'video/mp4' } })
+    }
+    throw new Error(`Unexpected URL ${url}`)
+  })
+  for (const [baseUrl, model] of [
+    ['https://example.test/v1', 'custom-video'],
+    ['https://api.minimaxi.com/v1', 'MiniMax-Hailuo-02'],
+    ['https://api.apiyi.com/v1', 'wan2.6'],
+    ['https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance'],
+  ]) {
+    const result = await api.recoverGeneratedVideoTask({ baseUrl, model, apiKey: 'provider-key', authMode: 'x-api-key' }, 'task-a')
+    assert.equal(await result.blob.text(), 'video')
+  }
+  assert.ok(requests.every(([, method]) => method === 'GET'))
+  assert.equal(requests[1][2].get('x-api-key'), 'provider-key')
+  assert.ok(requests.filter(([url]) => url === 'https://media.example.test/full.mp4').every(([, , headers]) => !headers.has('authorization') && !headers.has('x-api-key')))
+})
+
+test('video downloads reject partial responses and can read local blob URLs without a relay', async (t) => {
+  browserGlobal(t, 'window', {
+    location: { href: 'http://localhost/' },
+    setTimeout: (callback) => setTimeout(callback, 0),
+    clearTimeout,
+  })
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    seen.push(String(url))
+    if (String(url).startsWith('blob:')) return new Response('local video', { headers: { 'Content-Type': 'video/mp4' } })
+    return new Response('part', { status: 206, headers: { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-3/100' } })
+  })
+  assert.equal(await (await api.downloadGeneratedVideoBlob('blob:http://localhost/video')).text(), 'local video')
+  assert.deepEqual(seen, ['blob:http://localhost/video'])
+  await assert.rejects(() => api.downloadGeneratedVideoBlob('https://cdn.example.test/video.mp4'), (error) => {
+    assert.match(error.detail, /partial-video/)
+    return true
+  })
+})

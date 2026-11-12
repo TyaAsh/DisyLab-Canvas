@@ -13,9 +13,11 @@ import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, File
 import { compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
 import { resolveImageModelOptions, type ImageOutput, type ImageGenerationOptions } from './imageApi'
 import { imageOutputIntent } from './imageOutputIntent'
+import { legacyStoryboardOperation } from './agentImageOperations'
 import { AgentSkillCreator } from './skill-ui/AgentSkillCreator'
 import { AgentSkillMenu } from './skill-ui/AgentSkillMenu'
 import { AgentFilmReview } from './skill-ui/AgentFilmReview'
+import { AgentImageOperationReview } from './skill-ui/AgentImageOperationReview'
 import { AgentQuestions } from './skill-ui/AgentQuestions'
 import { AgentCanvasEditReview } from './skill-ui/AgentCanvasEditReview'
 import { AgentSelect, getModelBrand, type SelectOption } from './skill-ui/AgentSelect'
@@ -188,6 +190,7 @@ type Props = {
   onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId'>>) => void
   onSelectPlanOptions: (groupPlanIds: string[], selectedPlanIds: string[]) => void
   onConfirmPlan: (id: string) => void
+  onConfirmImageOperation: (id: string, indices: number[]) => Promise<void>
   getImagePlanCostLabel?: (plan: AgentImagePlan) => string | null
   onCancelPlan: (id: string) => void
   onRemovePlanContextReference: (planId: string, nodeId: string) => void
@@ -951,6 +954,15 @@ export function AgentPanel(props: Props) {
         </button>
       )
     }
+    const storyboard = plan.status === 'ready' ? legacyStoryboardOperation(plan) : undefined
+    if (storyboard) return <section className="agent-plan-card agent-image-plan-card" key={plan.id} aria-label="旧分镜方案">
+      <header><span><ImagePlus size={15} />分镜拆图</span><em>待识别原图</em></header>
+      <p>{storyboard.requestedCount ? `目标是拆出 ${storyboard.requestedCount} 张独立图片。` : '将原图中的镜头拆成独立图片。'}先识别原图边界，再确认要保留的镜头。</p>
+      <footer className="agent-plan-actions">
+        <button type="button" className="agent-plan-cancel" disabled={props.busy} onClick={() => props.onCancelPlan(plan.id)}>取消</button>
+        <button type="button" className="agent-plan-confirm" disabled={props.busy} onClick={() => props.onConfirmPlan(plan.id)}>识别原图并选择镜头</button>
+      </footer>
+    </section>
     return (
       <section
         className={`agent-plan-card agent-image-plan-card is-${plan.status} ${activeReadyPlan?.id === plan.id ? 'is-parameter-target' : ''}`}
@@ -1226,6 +1238,9 @@ export function AgentPanel(props: Props) {
               {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="metadata" /> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}</span><Focus size={12} /></button>)}</div>}
               {message.textNode?.nodeId && <button type="button" className="agent-message-to-canvas" onClick={() => props.onLocateCanvasNode(message.textNode!.nodeId!)}><Focus size={13} />查看整合文本节点</button>}
             </article>
+            {message.imageOperation && <AgentImageOperationReview draft={message.imageOperation}
+              onApply={(indices) => props.onConfirmImageOperation(message.id, indices)}
+              onLocate={props.agentOnly ? undefined : props.onLocateCanvasNode} />}
             {message.canvasEditDraft && !props.agentOnly && <AgentCanvasEditReview draft={message.canvasEditDraft}
               onChange={(update) => props.onCanvasDraftChange(message.id, update)} onSave={() => props.onSaveCanvasDraft(message.id)} onApply={() => props.onConfirmCanvasDraft(message.id)}
               onRevert={() => props.onRevertCanvasDraft(message.id)} onLocate={props.onLocateCanvasNode} />}

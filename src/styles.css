@@ -6333,3 +6333,44 @@ label.skill-category-member:hover, label.skill-category-member:has(input:checked
   .canvas-quick-create { display: none; }
   .output-history-pill > span { display: none; }
 }
+
+.canvas-video-recovery {
+  position: absolute;
+  inset: 8px 8px auto;
+  z-index: 8;
+  padding: 9px 10px;
+  border: 1px solid #f2bb72;
+  border-radius: 10px;
+  display: grid;
+  gap: 5px;
+  background: #2b2117;
+  color: #fff0dc;
+  font-size: 11px;
+}
+.canvas-video-recovery strong { color: #ffd394; font-size: 13px; }
+.canvas-video-recovery form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.canvas-video-recovery :is(button, a, .canvas-video-recovery-import) {
+  padding: 4px 7px;
+  border: 1px solid #98734b;
+  border-radius: 6px;
+  background: #44311f;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.canvas-video-recovery input[type="number"] { width: 40px; color: inherit; background: transparent; }
+.canvas-video-recovery-import input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.canvas-video-recovery-import:focus-within { outline: 2px solid #ffd394; }
+
+.agent-image-operation-preview { position: relative; isolation: isolate; border-radius: 8px; overflow: hidden; background: var(--canvas); }
+.agent-image-operation-preview img { display: block; width: 100%; height: auto; }
+.agent-image-operation-preview button {
+  position: absolute; display: grid; place-items: start; padding: 2px;
+  border: 1px solid #82c5ff; border-radius: 2px; background: #579cef1a; color: #fff;
+}
+.agent-image-operation-preview button span { padding: 1px 4px; border-radius: 3px; background: #193955; font-size: 10px; }
+.agent-image-operation-preview button[aria-pressed="false"] { border-color: #b6bdc5; background: #0008; }
+.agent-image-operation-preview button[aria-pressed="false"] span { background: #353b42; }
+.agent-image-operation-preview button:focus-visible { outline: 2px solid white; z-index: 1; }
+.canvas-video-recovery-task { overflow-wrap: anywhere; user-select: text; }
+.canvas-video-recovery :is(button:disabled, label:has(input:disabled)) { opacity: .55; cursor: default; }

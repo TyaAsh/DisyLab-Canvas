@@ -756,17 +756,18 @@ function collectRecoverableResultUrls(payload: unknown) {
 }
 
 function waitForDelay(delay: number, signal?: AbortSignal) {
+  const timers = typeof window === 'undefined' ? globalThis : window
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
       reject(new DOMException('Generation interrupted', 'AbortError'))
       return
     }
-    const timer = window.setTimeout(() => {
+    const timer = timers.setTimeout(() => {
       signal?.removeEventListener('abort', abort)
       resolve()
     }, delay)
     const abort = () => {
-      window.clearTimeout(timer)
+      timers.clearTimeout(timer)
       reject(new DOMException('Generation interrupted', 'AbortError'))
     }
     signal?.addEventListener('abort', abort, { once: true })
@@ -874,6 +875,11 @@ async function generateJimengMedia(kind: 'image' | 'video', input: NonNullable<P
   throw new GenerationRequestError('network', '即梦等待超时', '任务可能仍在运行，请在即梦任务记录查询。', { requestId: taskId })
 }
 
+function nativeVideoTaskPath(provider: string, id: string, h3: boolean) {
+  return provider === 'ark' ? `contents/generations/tasks/${id}`
+    : provider === 'xai' ? `videos/${id}` : h3 ? `/v2/query/video_generation/${id}` : `query/video_generation?task_id=${id}`
+}
+
 async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
   const h3 = provider === 'minimax' && /^minimax-h3/i.test(settings.model)
   const first = options.firstFrame ?? (options.mode === 'image2video' ? options.referenceImage : undefined)
@@ -941,8 +947,7 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
   if (!taskId) throw new GenerationRequestError('platform', '厂商没有返回视频任务编号', sanitizeAdminLogJson(result))
   options.onTaskId?.(taskId)
   const id = encodeURIComponent(taskId)
-  const pollPath = provider === 'ark' ? `contents/generations/tasks/${id}`
-    : provider === 'xai' ? `videos/${id}` : h3 ? `/v2/query/video_generation/${id}` : `query/video_generation?task_id=${id}`
+  const pollPath = nativeVideoTaskPath(provider, id, h3)
   const started = Date.now()
   let failures = 0
   while (Date.now() - started < 30 * 60_000) {
@@ -1145,14 +1150,28 @@ function validGeneratedVideoType(contentType: string) {
   return !/^(?:text\/|image\/|audio\/)|application\/(?:json|problem\+json)|image\/svg\+xml/i.test(contentType)
 }
 
+async function readCompleteVideoResponse(response: Response) {
+  if (!response.ok) throw await createApiError(response)
+  if (response.status === 206) {
+    const range = /^bytes 0-(\d+)\/(\d+)$/i.exec(response.headers.get('content-range') ?? '')
+    if (!range || Number(range[1]) + 1 !== Number(range[2])) throw new Error('partial-video')
+  }
+  const blob = await response.blob()
+  const contentType = blob.type || response.headers.get('content-type') || ''
+  if (!blob.size || !validGeneratedVideoType(contentType)) throw new Error(!blob.size ? 'empty' : contentType || 'invalid-type')
+  const prefix = await blob.slice(0, 96).text().catch(() => '')
+  if (/^\s*(?:<!doctype\s+html|<html|\{\s*"?(?:error|message)"?\s*:)/i.test(prefix)) throw new Error('invalid-body')
+  return blob.type ? blob : blob.slice(0, blob.size, 'video/mp4')
+}
+
 /** Download a completed provider video into a durable local Blob. Provider
  * result URLs frequently omit CORS headers or need anti-hotlink credentials,
  * and their CDN can lag behind the completed task response. Try the controlled
  * same-origin relay (with and without scoped auth) and a direct request across
  * a short replication window before declaring the archive recoverable. */
 export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { signal?: AbortSignal; authorization?: string } = {}) {
-  const relayUrl = apiYiGeneratedMediaUrl(sourceUrl)
-  const candidates = typeof window === 'undefined'
+  const relayUrl = /^https?:\/\//i.test(sourceUrl) ? apiYiGeneratedMediaUrl(sourceUrl) : sourceUrl
+  const candidates = typeof window === 'undefined' || relayUrl === sourceUrl
     ? [{ url: sourceUrl, headers: undefined as HeadersInit | undefined }]
     : [
         ...(options.authorization ? [{ url: relayUrl, headers: { 'X-DisyLab-Media-Authorization': options.authorization } }] : []),
@@ -1168,21 +1187,11 @@ export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { s
           failures.push(`${response.status}`)
           continue
         }
-        const blob = await response.blob()
-        const contentType = blob.type || response.headers.get('content-type') || ''
-        if (!blob.size || !validGeneratedVideoType(contentType)) {
-          failures.push(!blob.size ? 'empty' : contentType || 'invalid-type')
-          continue
-        }
-        const prefix = await blob.slice(0, 96).text().catch(() => '')
-        if (/^\s*(?:<!doctype\s+html|<html|\{\s*"?(?:error|message)"?\s*:)/i.test(prefix)) {
-          failures.push('invalid-body')
-          continue
-        }
-        return blob.type ? blob : blob.slice(0, blob.size, 'video/mp4')
+        return await readCompleteVideoResponse(response)
       } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') throw error
-        failures.push(error instanceof Error ? error.name : 'network')
+        if (options.signal?.aborted || error instanceof DOMException && error.name === 'AbortError') throw error
+        failures.push(error instanceof Error && /^(?:partial-video|invalid-body|empty|text\/|image\/|audio\/|application\/)/i.test(error.message)
+          ? error.message : error instanceof Error ? error.name : 'network')
       }
     }
     if (round < 2) await waitForDelay(round ? 1_800 : 700, options.signal)
@@ -1239,13 +1248,13 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const content = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (content.ok) {
-      const blob = await content.blob()
-      if (blob.size) return { blob, taskId, progress: 100 }
+      try { return { blob: await readCompleteVideoResponse(content), taskId, progress: 100 } }
+      catch (error) { if (options.signal?.aborted) throw error }
     }
-    lastError = await createApiError(content)
+    if (!content.ok) lastError = await createApiError(content)
     if (attempt < 3) await waitForDelay(4_000, options.signal)
   }
-  throw lastError ?? new GenerationRequestError('platform', 'Veo 返回了空视频文件', `任务 ${taskId}`, { requestId: taskId })
+  throw new GenerationRequestError('network', 'Veo 视频已生成但成品文件暂不可读', lastError?.message ?? `任务 ${taskId}`, { requestId: taskId })
 }
 
 async function generateApiYiWanVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
@@ -1677,9 +1686,13 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
     }
   }
   const contentResponse = await providerFetch(endpoint(settings.baseUrl, `videos/${encodeURIComponent(taskId)}/content`), { headers: compatibleApiHeaders(settings), signal: options.signal })
-  if (!contentResponse.ok) throw await createApiError(contentResponse)
-  const blob = await contentResponse.blob()
-  if (!blob.size) throw new GenerationRequestError('platform', '视频服务返回了空文件', `任务 ${taskId}`)
+  let blob: Blob
+  try {
+    blob = await readCompleteVideoResponse(contentResponse)
+  } catch (error) {
+    if (options.signal?.aborted) throw error
+    throw new GenerationRequestError('network', '视频已生成但成品文件暂不可读', error instanceof Error ? error.message : String(error), { requestId: taskId })
+  }
   options.onProgress?.(100, 'completed')
   return { blob, taskId, progress: 100 }
 }
@@ -2081,6 +2094,87 @@ async function generateEvolinkVideo(settings: ApiRequestSettings, options: Video
   }
 }
 
+/** Reopens an existing task using the same provider routes as generation. */
+export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal): Promise<GeneratedVideo> {
+  if (!/^[\w.:-]{1,256}$/.test(taskId)) throw new Error('原视频任务编号无效')
+  signal?.throwIfAborted()
+  if (isHfsyBaseUrl(settings.baseUrl)) return resumeHfsyVideoTask(settings, taskId, { signal })
+  if (isJimengCliBase(settings.baseUrl)) {
+    const bytes = await readJimengMedia(taskId, true).catch(async () => {
+      signal?.throwIfAborted()
+      await runJimengCli('download', { id: taskId })
+      return readJimengMedia(taskId, true)
+    })
+    signal?.throwIfAborted()
+    return { blob: await readCompleteVideoResponse(new Response(new Uint8Array(bytes), { headers: { 'Content-Type': 'video/mp4' } })), taskId, progress: 100 }
+  }
+  if (isMuseWebBase(settings.baseUrl)) throw new Error('请在 Muse 网页的原对话中下载视频')
+  const id = encodeURIComponent(taskId)
+  const read = (url: string, headers: HeadersInit = compatibleApiHeaders(settings)) => providerFetch(url, { headers, signal, cache: 'no-store' })
+  const json = async (url: string, headers?: HeadersInit) => {
+    const response = await read(url, headers)
+    if (!response.ok) throw await createApiError(response)
+    return await response.json() as Record<string, unknown>
+  }
+  const download = async (sourceUrl: string): Promise<GeneratedVideo> => {
+    if (!sourceUrl) throw new GenerationRequestError('platform', '厂商暂未返回原视频链接', '请在原生成平台查看任务状态。', { requestId: taskId })
+    return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal }), taskId, progress: 100, sourceUrl }
+  }
+  if (isEvolinkBaseUrl(settings.baseUrl)) return download(extractProviderImages(await waitForEvolinkTask(settings, taskId, signal))[0]?.url ?? '')
+  if (getGrsaiVideoCapabilities(settings.baseUrl, settings.model)) {
+    const result = await resolveGrsaiMediaResult(settings, { task_id: taskId }, signal, '视频')
+    return download(extractGeneratedImages(result).find(({ url }) => /^https?:\/\//i.test(url))?.url ?? '')
+  }
+  const provider = apiProviderForBase(settings.baseUrl)?.id
+  const model = settings.model
+  if (/apiyi\.com/i.test(settings.baseUrl) && /seedance|veo-3\.1|wan2\.|happyhorse/i.test(model)) {
+    const headers = apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` })
+    if (/veo-3\.1/i.test(model)) {
+      const contentUrl = apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${id}/content`)
+      return { blob: await readCompleteVideoResponse(await read(contentUrl, headers)), taskId, progress: 100 }
+    }
+    const taskUrl = /seedance/i.test(model)
+      ? apiYiVideoEndpoint(settings, '/apiyi/seedance', `/seedance/api/v3/contents/generations/tasks/${id}`)
+      : apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${id}`)
+    const job = await json(taskUrl, headers)
+    return download(videoResultUrl(job))
+  }
+  const native = provider === 'ark' || provider === 'xai' || provider === 'minimax'
+  const h3 = provider === 'minimax' && /^minimax-h3/i.test(model)
+  const taskUrl = endpoint(settings.baseUrl, native ? nativeVideoTaskPath(provider, id, h3) : `videos/${id}`)
+  const result = await json(taskUrl)
+  const task = (result.task ?? result) as Record<string, unknown>
+  const status = videoTaskStatus(task, '')
+  if (status && !/^(?:done|success|succeeded|completed|complete)$/.test(status)) {
+    throw new GenerationRequestError('api', '原视频暂不可取回', `厂商任务状态：${status}`, { requestId: taskId })
+  }
+  const sourceUrl = videoResultUrl(task.video ?? task) || videoResultUrl(task)
+  if (sourceUrl) return download(sourceUrl)
+  if (provider === 'minimax' && !h3 && task.file_id) {
+    const file = await json(endpoint(settings.baseUrl, `files/retrieve?file_id=${encodeURIComponent(String(task.file_id))}`))
+    const url = (file.file as { download_url?: string } | undefined)?.download_url
+    return download(url ?? '')
+  }
+  if (native) return download('')
+  return { blob: await readCompleteVideoResponse(await read(endpoint(settings.baseUrl, `videos/${id}/content`))), taskId, progress: 100 }
+}
+
+export async function readRecoverableVideo(options: { sourceUrl?: string; taskId?: string; settings?: ApiRequestSettings; signal?: AbortSignal }) {
+  const { sourceUrl, taskId, settings, signal } = options
+  if (sourceUrl) {
+    try {
+      const authorization = settings && isHfsyBaseUrl(settings.baseUrl) ? `Bearer ${settings.apiKey}` : undefined
+      const sourceTimeout = taskId && settings ? AbortSignal.timeout(12_000) : undefined
+      const sourceSignal = sourceTimeout && signal ? AbortSignal.any([sourceTimeout, signal]) : sourceTimeout ?? signal
+      return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal: sourceSignal, authorization }), sourceUrl }
+    } catch (error) {
+      if (signal?.aborted || !taskId || !settings) throw error
+    }
+  }
+  if (taskId && settings) return recoverGeneratedVideoTask(settings, taskId, signal)
+  throw new Error('找不到可读取的视频文件或原任务连接')
+}
+
 /** Evolink unified asynchronous audio endpoint. Model-specific optional fields
  * are accepted through `extra` so new documented audio models remain usable
  * without weakening the generic OpenAI-compatible request paths. */
@@ -2139,6 +2233,11 @@ export async function generateRemoteAudio(settings: ApiRequestSettings, options:
  * especially useful for APIYI 5xx responses whose actionable detail is only
  * present in the one-time error body.
  */
+export function isRecoverableVideoError(error: GenerationRequestError) {
+  return Boolean((error.resultUrls?.length || error.requestId) &&
+    /视频已生成但|视频任务完成但|视频.*返回了空|任务已完成，但下载失败|视频任务查询暂时中断/.test(error.message))
+}
+
 export async function generateRemoteVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
@@ -2173,7 +2272,7 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     const normalized = normalizeGenerationError(error)
-    const generatedButDownloadPending = Boolean(normalized.resultUrls?.length && /视频已生成但(?:下载|本地归档)/.test(normalized.message))
+    const generatedButDownloadPending = isRecoverableVideoError(normalized) && !normalized.message.includes('查询暂时中断')
     options.captureAdminLog?.({
       provider,
       taskId: normalized.requestId,
