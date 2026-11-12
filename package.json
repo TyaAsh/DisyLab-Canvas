@@ -1,7 +1,7 @@
 {
   "name": "disy-infinite-canvas",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "license": "UNLICENSED",
   "author": "DisyLab",
   "homepage": "https://tyaash.github.io/DisyLab-Canvas/",
@@ -21,12 +21,11 @@
     "desktop:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library && npm run audit:workflows",
+    "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library",
     "test:toolbox": "node --disable-warning=ExperimentalWarning --test src/watermark.test.mjs",
     "test:relay": "node --test functions/relay.test.mjs",
     "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/storyboard.test.mjs src/agentRuntime.test.mjs src/museWeb.test.mjs",
-    "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs",
-    "audit:workflows": "node scripts/audit-workflow-duplicates.mjs"
+    "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",

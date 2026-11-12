@@ -39,10 +39,10 @@ function loadClip(video: HTMLVideoElement, url: string, signal: AbortSignal) {
   })
 }
 
-export async function editFilmClips(clips: FilmClip[], ratio: string, editor: Awaited<ReturnType<typeof prepareFilmEditor>>, signal: AbortSignal, onProgress: (percent: number) => void) {
+export async function editFilmClips(clips: FilmClip[], ratio: string, height: number, editor: Awaited<ReturnType<typeof prepareFilmEditor>>, signal: AbortSignal, onProgress: (percent: number) => void) {
   const { audio, mimeType } = editor
   const canvas = document.createElement('canvas')
-  const size = filmVideoSize(ratio, 720)
+  const size = filmVideoSize(ratio, height)
   canvas.width = size.width
   canvas.height = size.height
   const context = canvas.getContext('2d')

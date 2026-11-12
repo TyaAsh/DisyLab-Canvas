@@ -1,5 +1,25 @@
-import type { WorkflowTemplate, WorkflowTemplateEdge, WorkflowTemplateNode } from '../WorkflowTemplatePanel'
 import type { SkillManifest } from './types'
+
+type WorkflowTemplateNode = {
+  id: string
+  type: 'disy'
+  position: { x: number; y: number }
+  style?: { width?: number; height?: number }
+  data: Record<string, unknown> & { kind: 'text' | 'image' | 'upload' | 'video'; title: string }
+}
+
+type WorkflowTemplateEdge = { id: string; source: string; target: string; type: 'luminous' }
+
+export type WorkflowTemplate = {
+  id: string
+  title: string
+  description: string
+  category: string
+  tags: string[]
+  accent: string
+  nodes: WorkflowTemplateNode[]
+  edges: WorkflowTemplateEdge[]
+}
 
 export type CompositeWorkbenchConfig = {
   projectName: string

@@ -145,6 +145,131 @@ test('game footage does not enter the synthetic concept PV pipeline', () => {
   assert.equal(concept?.values.ratio, '16:9')
 })
 
+test('cartoon ad drafts identify missing or invalid fields before creating a confirmation card', () => {
+  const skill = OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === 'cartoon-ad')
+  const { filmDraft } = agent.parseAgentReply(JSON.stringify({
+    reply: '耳机广告可以整理成确认稿了。',
+    filmDraft: { subject: '展示纯白光滑的 tya 头戴式耳机。', values: { brand: 'tya', ratio: '16:9 横屏' } },
+  }))
+  const { draft, issue } = skillConversation.checkFilmDraft(skill, filmDraft, false)
+  assert.equal(draft, null)
+  assert.deepEqual(issue.fields.map(({ name }) => name), ['ratio', 'performance', 'logo'])
+  assert.ok(issue.questions[0].options.includes('16:9'))
+  assert.match(issue.message, /品牌 Logo 名称/)
+
+  const repaired = skillConversation.checkFilmDraft(skill, {
+    ...filmDraft, values: { brand: 'tya', ratio: '16:9', performance: '通勤者戴上耳机', logo: 'tya' },
+  }, false)
+  assert.equal(repaired.issue, null)
+  assert.equal(repaired.draft.subject, filmDraft.subject)
+  assert.equal(repaired.draft.values.duration, 30)
+})
+
+test('asking why a film confirmation card is missing can recover a draft even when labeled inspect', () => {
+  const skill = OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === 'cartoon-ad')
+  const message = '为什么还没有确认卡呀'
+  const localDecision = agent.inferAgentInteractionMode(message)
+  const requested = skillConversation.requestsFilmConfirmation(message)
+  assert.equal(localDecision.mode, 'inspect')
+  assert.equal(requested, true)
+  assert.equal(skillConversation.requestsFilmConfirmation('排查确认卡的接口代码'), false)
+
+  const reply = { reply: '请在确认卡核对成片设定。', decision: localDecision }
+  assert.equal(skillConversation.assessFilmReply(skill, reply, localDecision, requested, false).needsRepair, true)
+  const filmDraft = { subject: '展示纯白光滑的 tya 头戴式耳机。', values: { brand: 'tya', performance: '设计师戴上耳机', logo: 'tya' } }
+  assert.ok(skillConversation.assessFilmReply(skill, { ...reply, filmDraft }, localDecision, requested, false).check.draft)
+  const questions = [{ prompt: '片尾显示什么字样？', options: [] }]
+  assert.equal(skillConversation.assessFilmReply(skill, { ...reply, questions }, localDecision, requested, false).needsRepair, false)
+  assert.equal(skillConversation.assessFilmReply(skill, reply, agent.inferAgentInteractionMode('继续'), false, false).needsRepair, true)
+})
+
+test('every official film Skill waits for approved first frames before requesting video', async () => {
+  const fakeMedia = asModule(`
+    export const generateRemoteImages = (settings, options) => settings.image(options)
+    export const generateRemoteVideo = (settings, options) => settings.video(options)
+    export const publicImageSourceUrl = (url) => url
+    export const readImageSourceBlob = async () => new Blob(['mock image'])
+    export const getGrsaiVideoCapabilities = () => undefined
+    export const hfsyVideoLimits = (model) => model === 'kling-o3' ? { minSeconds: 5, maxSeconds: 15, images: 8 } : undefined
+    export const isHfsyNativeSeedance = (model) => model === 'doubao-seedance-2.0'
+    export const seedanceVideoDefaults = () => ({ ratios: ['16:9'], minDuration: 4, maxDuration: 15, defaultResolution: '720p', resolutions: ['480p', '720p'] })
+    export const resolveProviderLabel = () => 'HFSY'
+  `)
+  const { generateFilmClips, filmRequestCounts, filmStoryboardPanels, filmVideoProfile } = await import(asModule((await compileModule('./skills/filmProduction.ts'))
+    .replace("'../imageApi'", JSON.stringify(fakeMedia))
+    .replace("'./manifests/official/film'", JSON.stringify(filmManifestModule))
+    .replace("'./guides'", JSON.stringify(asModule(await compileModule('./skills/guides.ts'))))))
+  assert.equal(filmVideoProfile('mock', 'doubao-seedance-2.0').maxImages, 9)
+  assert.equal(filmVideoProfile('mock', 'kling-o3').maxImages, 8)
+  assert.deepEqual(filmStoryboardPanels(12, 6, 30), [{ board: 0, first: 8, last: 9 }, { board: 1, first: 10, last: 11 }])
+  assert.deepEqual(filmStoryboardPanels(11, 4, 15), [{ board: 0, first: 7, last: 9 }])
+
+  for (const skill of OFFICIAL_FILM_SKILLS) {
+    let approved = false
+    const imageUrls = []
+    const videoFrames = []
+    const imagesOnCanvas = new Map()
+    let videoOnCanvas = false
+    const values = Object.fromEntries(skill.parameters.filter((field) => field.default !== undefined).map((field) => [field.name, field.default]))
+    if (skill.slug === 'cartoon-ad') Object.assign(values, { logo: 'tya', duration: 30, multiscene: true })
+    const profile = { ratios: ['16:9'], minSeconds: 3, maxSeconds: 15, resolution: '720p', resolutions: ['480p', '720p'], requiresPublicImage: false }
+    await generateFilmClips({
+      skill, values, subject: '示例短片', ratio: '16:9', duration: values.duration, mapStoryboardPanels: true,
+      profile,
+      references: ['https://mock.invalid/original.png'], signal: new AbortController().signal,
+      image: { image: async ({ aspectRatio, referenceImages }) => {
+        const task = imagesOnCanvas.get(imageUrls.length)
+        assert.ok(task, skill.slug)
+        assert.equal(aspectRatio, task.aspectRatio)
+        if (task.stage === 'storyboard' && task.title.endsWith('2/2')) {
+          assert.ok(referenceImages.includes(imageUrls[4]), 'second storyboard includes the first board')
+        }
+        const url = `https://mock.invalid/image-${imageUrls.length}.png`
+        imageUrls.push(url)
+        return [{ url }]
+      } },
+      video: { video: async ({ referenceImages, prompt }) => {
+        assert.equal(approved, true, skill.slug)
+        assert.equal(videoOnCanvas, true, skill.slug)
+        if (skill.slug === 'cartoon-ad') {
+          assert.ok(referenceImages.includes(imageUrls[0]), 'video includes the character anchor')
+          assert.ok(referenceImages.some((url) => [imageUrls[4], imageUrls[5]].includes(url)), 'video includes the storyboard')
+          assert.doesNotMatch(prompt, /背景音乐|BGM/)
+          assert.match(prompt, /只按九宫格第/)
+        }
+        videoFrames.push(referenceImages[0])
+        return { blob: new Blob(['mock video']) }
+      } },
+      onProgress() {}, onLog() {},
+      async onImageStart(task) { imagesOnCanvas.set(task.index, task) },
+      async onMedia(media) {
+        if (media.kind === 'image') assert.ok(imagesOnCanvas.has(media.index), skill.slug)
+      },
+      async onVideoStart(indices) {
+        assert.equal(approved, true, skill.slug)
+        assert.ok(indices.every((index) => imagesOnCanvas.get(index)?.stage === 'keyframe'), skill.slug)
+        videoOnCanvas = true
+      },
+      async review(stage) {
+        if (stage.title === '分镜关键帧') {
+          assert.equal(videoFrames.length, 0, skill.slug)
+          assert.ok(stage.assets.length, skill.slug)
+          approved = true
+        }
+        return { action: 'continue', notes: '' }
+      },
+    })
+    assert.ok(videoFrames.length, skill.slug)
+    assert.deepEqual(filmRequestCounts(skill, values.duration, profile, values), { images: imageUrls.length, videos: videoFrames.length }, skill.slug)
+    assert.deepEqual(videoFrames, imageUrls.slice(-videoFrames.length), skill.slug)
+    if (skill.slug === 'cartoon-ad') {
+      assert.deepEqual([...imagesOnCanvas.values()].slice(0, 4).map(({ title }) => title), ['角色立绘', '独立产品道具', '角色关联道具', '场景道具'])
+      assert.equal(imagesOnCanvas.get(0).aspectRatio, '1:1')
+      assert.ok([...imagesOnCanvas.values()].some(({ title }) => title === '品牌落版图'))
+    }
+  }
+})
+
 test('SKILL.md imports YAML and preserves Markdown instructions as literal text', async () => {
   const text = '\uFEFF---\r\nname: creative-brief\r\ndescription: >-\r\n  整理创作需求。\r\n  提供可执行步骤。\r\nallowed-tools: Bash\r\n---\r\n保留 {{示例}}。'
   const skill = await skillImporter.importSkillFile(new File([text], 'SKILL.md'))

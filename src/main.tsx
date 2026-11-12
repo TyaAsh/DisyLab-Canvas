@@ -18,6 +18,12 @@ import './tailwind.css'
 import './styles.css'
 import './theme-custom.css'
 
+try {
+  localStorage.removeItem('disylab.workflow-templates.v2')
+} catch {
+  // Some browser privacy settings disable local storage.
+}
+
 // Chromium can emit this benign layout warning while React Flow measures a
 // rapidly changing canvas. Vite treats window errors as fatal HMR overlays,
 // which turns a recoverable warning into a full-screen black error layer.

@@ -296,7 +296,8 @@ const apiYiMediaRelayPlugin: Plugin = {
         let targetUrl = new URL(target)
         const mediaHostAllowed = (url: URL) => url.protocol === 'https:'
           && !url.username && !url.password && !url.port
-          && /(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
+          && (/(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
+            || (url.hostname === '8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com' && url.pathname.startsWith('/video/')))
         if (!mediaHostAllowed(targetUrl)) {
           response.statusCode = 403
           response.end('media host not allowed')

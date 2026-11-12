@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import ts from 'typescript'
+import { onRequest as referenceAssets } from '../functions/hfsy/reference-assets.js'
 
 const compile = async (file) => ts.transpileModule(await readFile(new URL(file, import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
@@ -22,6 +23,26 @@ const api = await import(asModule((await compile('./imageApi.ts'))
   .replace("'./jimengCli'", JSON.stringify(jimeng))
   .replace("'./museWeb'", JSON.stringify(museWeb))
   .replaceAll("'./modelCatalog'", JSON.stringify(catalog))))
+
+test('HFSY fast-720 recovery queries an existing task and downloads its nested result without a POST', async (t) => {
+  const source = 'https://8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com/video/clean/mock.mp4?signature=mock'
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    requests.push({ url: String(url), method: init.method ?? 'GET', auth: new Headers(init.headers).get('authorization') })
+    if (String(url).includes('/video/query?')) return Response.json({ data: [{ status: 'SUCCESS', result: { result_url: source } }] })
+    return new Response('mock-video', { headers: { 'Content-Type': 'video/mp4' } })
+  })
+  const progress = []
+  const result = await api.resumeHfsyVideoTask({ baseUrl: 'https://api.hfsyapi.cn/v1', apiKey: 'fake', model: 'sd-2-fast-720' }, 'task-fast-720', {
+    onProgress: (percent, status) => progress.push([percent, status]),
+  })
+  assert.equal(result.sourceUrl, source)
+  assert.deepEqual(requests, [
+    { url: 'https://api.hfsyapi.cn/v1/video/query?id=task-fast-720', method: 'GET', auth: 'Bearer fake' },
+    { url: source, method: 'GET', auth: null },
+  ])
+  assert.deepEqual(progress.slice(-2), [[100, 'downloading'], [100, 'completed']])
+})
 
 test('desktop translates browser relay paths without depending on the dev server', () => {
   const cases = [
@@ -405,6 +426,46 @@ test('HFSY requires public media URLs before submitting a task', async (t) => {
   assert.equal(calls, 0)
 })
 
+test('HFSY can read a local reference through KV and the link expires automatically', async (t) => {
+  const endpoint = 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets'
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64')
+  const objects = new Map()
+  const env = { HFSY_REFERENCE_ASSETS: {
+    async put(key, value, { expirationTtl, metadata }) {
+      assert.equal(expirationTtl, 14_400)
+      objects.set(key, { value, metadata })
+    },
+    async getWithMetadata(key) {
+      return objects.get(key) ?? { value: null, metadata: null }
+    },
+  } }
+  const route = (request) => referenceAssets({ request, env })
+  let submittedUrl
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url) === endpoint) return route(new Request(url, init))
+    if (String(url) === 'https://www.hfsyapi.cn/v1/models') {
+      assert.equal(new Headers(init.headers).get('authorization'), 'Bearer test-key')
+      return Response.json({ data: [{ id: 'sd-2-fast-720' }] })
+    }
+    if (String(url).endsWith('/video/create')) {
+      submittedUrl = JSON.parse(init.body).images[0]
+      const reference = await route(new Request(submittedUrl))
+      assert.equal(reference.status, 200)
+      assert.equal(reference.headers.get('content-type'), 'image/png')
+      assert.deepEqual(Buffer.from(await reference.arrayBuffer()), png)
+      return Response.json({ id: 'task-with-local-image', status: 'SUCCESS', result_url: 'https://media.aixinai.net/result.mp4' })
+    }
+    if (String(url).includes('result.mp4')) return new Response('video', { headers: { 'content-type': 'video/mp4' } })
+    throw new Error('Unexpected request')
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test-key', model: 'sd-2-fast-720' }
+  const url = await api.publishHfsyVideoReferenceImage(settings, new Blob([png], { type: 'image/png' }))
+  assert.equal(objects.size, 1)
+  await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 6, size: '1280x720', mode: 'image2video', firstFrame: url })
+  assert.equal(submittedUrl, url)
+  for (const item of objects.values()) item.metadata.expiresAt = Date.now() - 1
+  assert.equal((await route(new Request(url))).status, 404)
+})
 
 test('HFSY rejects unsupported duration and video references before network calls', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected network') })

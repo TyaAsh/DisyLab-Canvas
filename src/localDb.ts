@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import { normalizeAgentProjectSettings, type AgentProjectSettings } from './agentProject'
+import type { FilmCheckpoint } from './skills/filmProduction'
 
 const DATABASE_NAME = 'disy-infinite-local'
 const DATABASE_VERSION = 5
@@ -82,6 +83,7 @@ export type AgentSessionRecord = {
   selectedChatModelId?: string
   selectedImageModelId?: string
   selectedVideoModelId?: string
+  filmSkillSelection?: { id: string; slug: string }
   createdAt: string
   updatedAt: string
   [key: string]: unknown
@@ -623,6 +625,22 @@ export async function loadWorkspaceAuxiliaryData(): Promise<WorkspaceAuxiliaryDa
   try {
     const value = (await requestResult(database.transaction(WORKSPACE_DATA_STORE, 'readonly').objectStore(WORKSPACE_DATA_STORE).get(WORKSPACE_DATA_ID))) as WorkspaceAuxiliaryData | undefined
     return value ?? { id: WORKSPACE_DATA_ID, folders: [], generationHistory: [], outputHistory: [], publicSettings: {}, updatedAt: now() }
+  } finally {
+    database.close()
+  }
+}
+
+export async function saveFilmCheckpoint(nodeId: string, checkpoint: FilmCheckpoint) {
+  await runTransaction<void>([WORKSPACE_DATA_STORE], 'readwrite', (transaction) => {
+    transaction.objectStore(WORKSPACE_DATA_STORE).put({ id: `film-checkpoint:${nodeId}`, checkpoint })
+  })
+}
+
+export async function loadFilmCheckpoint(nodeId: string): Promise<FilmCheckpoint | undefined> {
+  const database = await openDatabase()
+  try {
+    const record = await requestResult(database.transaction(WORKSPACE_DATA_STORE, 'readonly').objectStore(WORKSPACE_DATA_STORE).get(`film-checkpoint:${nodeId}`))
+    return (record as { checkpoint: FilmCheckpoint } | undefined)?.checkpoint
   } finally {
     database.close()
   }

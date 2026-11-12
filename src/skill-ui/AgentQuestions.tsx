@@ -55,8 +55,8 @@ export function AgentQuestions({ questions, onSubmit }: {
         <button type="button" aria-label="下一题" disabled={isLast} onClick={() => setIndex(index + 1)}><ChevronRight size={16} /></button>
       </div>}
     </header>
-    {hasOptions && <div className="agent-skill-options">
-      <div role="radiogroup" aria-labelledby={headingId}>
+    {hasOptions && <>
+      <div className="agent-skill-options" role="radiogroup" aria-labelledby={headingId}>
       {question.options.map((option, optionIndex) => {
         const selected = !answer?.useCustom && answer?.text === option
         return <label key={option} className={`agent-skill-option ${selected ? 'is-selected' : ''}`}>
@@ -67,16 +67,16 @@ export function AgentQuestions({ questions, onSubmit }: {
       })}
       </div>
       <label className={`agent-guided-custom ${answer?.useCustom ? 'is-selected' : ''}`}>
-        <span className="agent-skill-index" aria-hidden="true">{question.options.length + 1}</span>
-        <input key={index} type="text" aria-label="自由回复" placeholder={example || '自由回复，输入你的想法'} maxLength={1800}
+        <span className="agent-guided-custom-label">自由回复</span>
+        <textarea key={index} rows={2} placeholder={example || '写下你的想法…'} maxLength={1800}
           value={answer?.custom ?? ''} onChange={(event) => replaceAnswer({ text: event.target.value, custom: event.target.value, useCustom: true })}
           onKeyDown={(event) => {
-            if (event.key !== 'Enter' || event.nativeEvent.isComposing || !answer?.useCustom) return
+            if (event.key !== 'Enter' || !(event.ctrlKey || event.metaKey) || event.nativeEvent.isComposing || !answer?.useCustom) return
             event.preventDefault()
             advance()
           }} />
       </label>
-    </div>}
+    </>}
     {!hasOptions && <input key={index} ref={inputRef} type="text" className="agent-guided-answer" aria-labelledby={headingId}
       placeholder={example || '在这里输入你的想法'} value={answer?.text ?? ''} maxLength={1800}
       onChange={(event) => replaceAnswer({ text: event.target.value })}

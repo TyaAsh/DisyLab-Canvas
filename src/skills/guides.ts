@@ -2,7 +2,7 @@ import type { SkillManifest } from './types'
 
 type Input = readonly [label: string, description: string, example: string]
 type Step = readonly [title: string, description: string]
-type Anchor = { title: string; prompt: string; count?: number; optionalField?: string }
+type Anchor = { title: string; prompt: string; count?: number; optionalField?: string; aspectRatio?: '1:1' | '16:9'; separateCharacters?: boolean }
 export type SkillGuide = {
   intro: string
   inputs: readonly Input[]
@@ -37,8 +37,10 @@ const filmGuides: Record<string, FilmGuide> = {
     ],
     rules: ['画面与视频提示词统一用中文。', '分镜和视频沿用角色与道具锚点。', '单段保留动作声和环境音，配乐在合成阶段统一加入。'],
     anchors: [
-      { title: '角色立绘', prompt: '单独生成皮克斯风格的角色立绘，展示正面全身、职业服装、身体特征和表情。背景干净，不混入产品组合图。' },
-      { title: '道具锚点', prompt: '生成广告产品独立锚点，只保留道具，无人。固定正面、使用状态、材质、主色与比例，背景简洁。' },
+      { title: '角色立绘', aspectRatio: '1:1', separateCharacters: true, prompt: '皮克斯 3D 卡通渲染，单个原创职业角色的半身立绘。沿用已选的职业、服装、外形与配色，明确尾巴、翅膀、角、触角是否存在，以及肩上宠物的种类、颜色和位置。表情有感染力，极简纯色背景。参考图用于锁定职业和风格，人物长相原创。' },
+      { title: '独立产品道具', aspectRatio: '1:1', prompt: '只拍产品本体，无人、无手。固定正面和摆放状态，只展示一面，背面不可见。按简报锁定材质、颜色、使用痕迹和尺寸感，使用极简纯色背景。' },
+      { title: '角色关联道具', aspectRatio: '1:1', prompt: '按角色锚点确定与职业或表演关联的道具。只画道具，禁止人物和产品组合图。固定正面、使用状态、材质、颜色和相对尺寸，背面不可见，极简纯色背景。' },
+      { title: '场景道具', aspectRatio: '16:9', prompt: '单独生成简报中有叙事作用的场景道具锚点。画出道具的展示面、固定状态、材质、主色与尺寸感。人物不入画，使用干净的极简背景。' },
     ],
     music: 'ad', musicGain: .4,
   },

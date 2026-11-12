@@ -9,6 +9,11 @@ const compiled = ts.transpileModule(source, {
 }).outputText
 const references = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 
+test('group references include nested members once in canvas order', () => {
+  const nodes = [{ id: 'image2', parentId: 'nested' }, { id: 'unrelated' }, { id: 'root' }, { id: 'nested', parentId: 'root' }, { id: 'image1', parentId: 'root' }]
+  assert.deepEqual(references.nodesWithGroupChildren(nodes, ['root', 'image2']).map(({ id }) => id), ['image2', 'root', 'nested', 'image1'])
+})
+
 test('connected text content is expanded before a downstream generation request', () => {
   const result = references.expandConnectedTextReferences('根据 @[node:script-1] 生成视频', [{
     mention: '@[node:script-1]',

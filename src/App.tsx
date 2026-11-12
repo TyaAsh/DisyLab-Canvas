@@ -16,14 +16,14 @@ import { isMuseWebBase, MUSE_WEB_BASE, MUSE_WEB_CONNECTION, MUSE_WEB_MODELS } fr
 import { isJimengCliBase, JIMENG_LOCAL_BASE, JIMENG_LOCAL_CREDENTIAL, jimengVideoRatios } from './jimengCli'
 import { createContext, forwardRef, lazy, memo, Suspense, useCallback, useContext, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { GenerationRequestError, downloadGeneratedVideoBlob, normalizeOriginalImageBlob, readImageSourceBlob, publicImageSourceUrl, hfsyVideoLimits, isHfsyNativeSeedance, seedanceVideoDefaults, getImageModelCapabilities, getGrsaiVideoCapabilities, resolveImageModelOptions, type ImageOutput, type ImageQuality } from './imageApi'
+import { GenerationRequestError, downloadGeneratedVideoBlob, resumeHfsyVideoTask, normalizeOriginalImageBlob, readImageSourceBlob, publicImageSourceUrl, publishHfsyVideoReferenceImage, hfsyVideoLimits, isHfsyNativeSeedance, seedanceVideoDefaults, getImageModelCapabilities, getGrsaiVideoCapabilities, resolveImageModelOptions, type ImageOutput, type ImageQuality } from './imageApi'
 import { IMAGE_OUTPUT_LABELS, imageOutputIntent, inferImageOutput } from './imageOutputIntent'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import gsap from 'gsap'
 import { useGSAP } from '@gsap/react'
 const LightingSpherePreview = lazy(() => import('./LightingSpherePreview'))
-const WorkflowTemplatePanel = lazy(() => import('./WorkflowTemplatePanel').then((module) => ({ default: module.WorkflowTemplatePanel })))
 import {
+  ArrowLeft,
   ArrowUp,
   ArrowUpRight,
   Aperture,
@@ -151,26 +151,25 @@ import { CompositeSkillWorkbench } from './skill-ui/CompositeSkillWorkbench'
 import { prepareImageSkill } from './skills/runner'
 import { renderSkillPrompt } from './skills/prompt'
 import { getFilmSkillShowcase, OFFICIAL_FILM_SKILLS } from './skills/manifests/official/film'
-import { filmRequestCounts, filmVideoProfile, generateFilmClips, isFilmImageModel, selectFilmResolution, type FilmReview, type FilmReviewAnswer } from './skills/filmProduction'
-import { resolveFilmDraft, skillConversationInstructions } from './skills/conversation'
+import { filmRequestCounts, filmResolutionHeight, filmVideoProfile, generateFilmClips, isFilmImageModel, selectFilmResolution, type FilmCheckpoint, type FilmMediaKey, type FilmReview, type FilmReviewAnswer } from './skills/filmProduction'
+import { assessFilmReply, requestsFilmConfirmation, resolveFilmDraft, skillConversationInstructions } from './skills/conversation'
 import { subscribeToSkillDeletion } from './skills/storage'
 import { skillKey } from './skills/types'
 import { editFilmClips, prepareFilmEditor } from './skills/filmEdit'
 import type { SkillManifest } from './skills/types'
 import { MULTI_GRID_SKILLS } from './skills/manifests/official/image'
-import { buildCompositeWorkflow, type CompositeWorkbenchConfig } from './skills/compositeBlueprints'
+import { buildCompositeWorkflow, type CompositeWorkbenchConfig, type WorkflowTemplate } from './skills/compositeBlueprints'
 import { COMIC_LAYOUTS, COMIC_STYLE_LABELS, createComicWorkflow, forkComicWorkflowAtStage, type ComicComposition, type ComicGeneratedResult, type ComicGenerationRequest, type ComicLayout, type ComicStyle, type ComicWorkflowState } from './skills/storyboard'
 import { appendOperatorRecoveryLog, listOperatorRecoveryLogs, type OperatorRecoveryLog } from './adminGate'
-import { expandConnectedTextReferences } from './nodeReferences'
+import { expandConnectedTextReferences, nodesWithGroupChildren } from './nodeReferences'
 import { extractImageUrlsFromAdminResult, fetchProviderCredits, fetchProviderModelPrices, fetchRemoteModels, fetchUsdToCnyRate, generateRemoteImages, generateRemoteText, generateRemoteVideo, isModelAutoEnabled, normalizeGenerationError, pickPreferredModelId, prepareReferenceImageForRequest, resolveProviderLabel, shouldAppendReferenceGuide, validateApiCredentials, type CurrencyRate, type GenerationAdminLog, type GenerationErrorCategory, type ProviderCredits, type ProviderModelPrice } from './imageApi'
 import { AgentPanel } from './AgentPanel'
 import { useProjectDialog } from './ProjectDialog'
 import type { PromptLibraryCase } from './PromptLibraryPanel'
-import type { WorkflowTemplate } from './WorkflowTemplatePanel'
 import { agentReplyAllowsProposals, buildAgentConversationContext, compactReferenceName, getRequestedAgentPlanCount, inferAgentInteractionMode, messageExpectsImagePlans, messageExpectsVideoPlans, messageRequestsDirectImagePlan, normalizeAgentMessageContent, parseAgentReply, requestsAgentCanvasTextEdits, type AgentCanvasContextSnapshot, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentRun, type AgentTextPlan, type AgentVideoPlan } from './agent'
 import { applyAgentCanvasEdits, MAX_CANVAS_TEXT_EDITS, prepareAgentCanvasEdits, resolveAgentTextEditTargets, revertAgentCanvasEdits, type AgentCanvasEditDraft } from './agentCanvasEdits'
 import { activeAgentTeamRoles, loadAgentTaskHistory, normalizeAgentProjectSettings, projectMemoryPrompt, runAgentTeam, saveAgentTaskHistory, type AgentProjectSettings, type AgentTask } from './agentProject'
-import { listProjectAgentSessions, updateProjectAgentSettings, type AgentSessionRecord } from './localDb'
+import { listProjectAgentSessions, loadFilmCheckpoint, saveFilmCheckpoint, updateProjectAgentSettings, type AgentSessionRecord } from './localDb'
 
 const PromptLibraryPanel = lazy(() => import('./PromptLibraryPanel').then((module) => ({ default: module.PromptLibraryPanel })))
 
@@ -2170,6 +2169,8 @@ function buildCanvasSignature(
       id: node.id,
       position: node.position,
       style: node.style,
+      width: node.width,
+      height: node.height,
       measured: node.measured,
       data: {
         ...node.data,
@@ -2392,6 +2393,9 @@ const NodeCard = memo(function NodeCard({
     && !data.imageUrl
     && !data.imageVariants?.some((variant) => Boolean(variant.url))
   const [inlineEditing, setInlineEditing] = useState(false)
+  const [mediaResizing, setMediaResizing] = useState(false)
+  const startMediaResize = useCallback(() => setMediaResizing(true), [])
+  const endMediaResize = useCallback(() => setMediaResizing(false), [])
   const [inlineDraft, setInlineDraft] = useState(data.body)
   const inlineTextareaRef = useRef<HTMLTextAreaElement>(null)
   const inlineComposingRef = useRef(false)
@@ -2571,6 +2575,20 @@ const NodeCard = memo(function NodeCard({
   }, [data.title, data.fileName, data.kind, titleEditing])
 
   if (data.kind === 'group') {
+    const groupReferenceHandle = (side: 'left' | 'right') => (
+      <Handle
+        id={`group-source-${side}`}
+        type="source"
+        position={side === 'left' ? Position.Left : Position.Right}
+        className={`handle handle-source node-extension group-reference-handle nodrag ${side === 'left' ? 'group-reference-handle-left' : ''}`}
+        title="拖到节点，引用组内素材"
+        aria-label="引用组内素材"
+      >
+        <span className={`extension-button ${side === 'left' ? 'extension-button-left' : ''}`} aria-hidden="true">
+          <Plus size={18} strokeWidth={1.8} />
+        </span>
+      </Handle>
+    )
     if (data.groupCollapsed) {
       const previews = data.groupPreviewUrls ?? []
       const previewMedia = data.groupPreviewMedia?.length
@@ -2592,9 +2610,9 @@ const NodeCard = memo(function NodeCard({
           <Handle id="group-target-top" type="target" position={Position.Top} className="collapsed-group-handle" isConnectable={false} />
           <Handle id="group-target-right" type="target" position={Position.Right} className="collapsed-group-handle" isConnectable={false} />
           <Handle id="group-target-bottom" type="target" position={Position.Bottom} className="collapsed-group-handle" isConnectable={false} />
-          <Handle id="group-source-left" type="source" position={Position.Left} className="collapsed-group-handle" isConnectable={false} />
+          {groupReferenceHandle('left')}
           <Handle id="group-source-top" type="source" position={Position.Top} className="collapsed-group-handle" isConnectable={false} />
-          <Handle id="group-source-right" type="source" position={Position.Right} className="collapsed-group-handle" isConnectable={false} />
+          {groupReferenceHandle('right')}
           <Handle id="group-source-bottom" type="source" position={Position.Bottom} className="collapsed-group-handle" isConnectable={false} />
           <div className={`collapsed-group-preview ${previewMedia.length ? '' : 'is-empty'}`}>
             {previewMedia.slice(0, 3).map((preview, index) => preview.kind === 'video'
@@ -2637,6 +2655,8 @@ const NodeCard = memo(function NodeCard({
           className="group-node-resize-control"
         ><span className="resize-corner-glyph" /></NodeResizeControl>}
         <span><GroupTypeIcon icon={data.groupIcon} size={13} />{nodeTitle}</span>
+        {groupReferenceHandle('left')}
+        {groupReferenceHandle('right')}
       </div>
     )
   }
@@ -2777,23 +2797,27 @@ const NodeCard = memo(function NodeCard({
     )
   }
 
+  const isMediaNode = data.kind === 'image' || data.kind === 'video'
+
   return (
     <div
-      className={`disy-node ${data.kind === 'text' ? 'resizable-text-node' : ''} ${data.kind === 'image' || data.kind === 'video' ? 'image-generation-node' : ''} ${(data.kind === 'image' || data.kind === 'video') && isActivelyGenerating ? 'is-generating' : ''} ${selected ? 'is-selected' : ''}`}
+      className={`disy-node ${data.kind === 'text' ? 'resizable-text-node' : ''} ${isMediaNode ? 'image-generation-node' : ''} ${isMediaNode && isActivelyGenerating ? 'is-generating' : ''} ${mediaResizing ? 'is-resizing' : ''} ${selected ? 'is-selected' : ''}`}
       style={data.kind === 'text'
         ? { width: width || 275, height: height || 126 }
-        : data.kind === 'image' || data.kind === 'video'
+        : isMediaNode
           ? { width: '100%', height: '100%' }
           : undefined}
     >
-      {data.kind === 'text' && selected && (
+      {selected && (data.kind === 'text' || isMediaNode) && (
         <NodeResizeControl
           position="bottom-right"
-          minWidth={240}
-          minHeight={126}
-          maxWidth={920}
-          maxHeight={680}
-          className="text-node-resize-control"
+          minWidth={isMediaNode ? 180 : 240}
+          minHeight={isMediaNode ? 180 : 126}
+          maxWidth={isMediaNode ? 1600 : 920}
+          maxHeight={isMediaNode ? 1200 : 680}
+          className="node-card-resize-control"
+          onResizeStart={isMediaNode ? startMediaResize : undefined}
+          onResizeEnd={isMediaNode ? endMediaResize : undefined}
         >
           <span className="resize-corner-glyph" />
         </NodeResizeControl>
@@ -2985,7 +3009,14 @@ const NodeCard = memo(function NodeCard({
             <i style={{ width: `${imageProgress.percent}%` }} />
           </div>
         </div>
-      ) : (isActivelyGenerating || hasGenerationFailed) && (
+      ) : isActivelyGenerating ? (
+        <div className="image-generation-progress" role="progressbar" aria-label={data.kind === 'video' ? '视频进度' : '生成进度'} aria-valuenow={data.kind === 'video' ? data.videoProgress : undefined}>
+          <div className="image-generation-progress-heading"><span>{data.status || '生成中'}</span>{data.kind === 'video' && data.videoProgress !== undefined && <strong>{Math.round(data.videoProgress)}%</strong>}</div>
+          {data.kind === 'video' && data.videoProgress !== undefined
+            ? <div className="image-generation-progress-track" aria-hidden="true"><i style={{ width: `${data.videoProgress}%` }} /></div>
+            : <progress className="w-full" aria-hidden="true" />}
+        </div>
+      ) : (hasGenerationFailed || (data.kind === 'video' && data.generationError)) && (
         <div className={`node-status ${hasGenerationFailed ? 'is-failed' : ''}`} title={data.generationError || data.status}>
           <span className="status-dot" />
           {hasGenerationFailed ? `生成失败：${data.generationError || '图像服务未返回结果'}` : data.status}
@@ -3082,7 +3113,6 @@ function App() {
   const [creatingFolder, setCreatingFolder] = useState(false)
   const [assetLibraryOpen, setAssetLibraryOpen] = useState(false)
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false)
-  const [workflowTemplateOpen, setWorkflowTemplateOpen] = useState(false)
   const [skillFactoryOpen, setSkillFactoryOpen] = useState(false)
   const [skillFactoryView, setSkillFactoryView] = useState<'browse' | 'manage'>('browse')
   const [skillFactorySkillSlug, setSkillFactorySkillSlug] = useState('')
@@ -3126,8 +3156,14 @@ function App() {
   const [textSkillMenuOpen, setTextSkillMenuOpen] = useState(false)
   const [videoSkillMenuOpen, setVideoSkillMenuOpen] = useState(false)
   const [agentSkillSelections, setAgentSkillSelections] = useState<Record<string, { id: string; skill: SkillManifest }>>({})
+  const restoreFilmSkillSelection = useCallback((session?: AgentSessionRecord) => {
+    const saved = session?.filmSkillSelection
+    if (!session || !saved || typeof saved.id !== 'string') return
+    const skill = OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === saved.slug)
+    if (skill) setAgentSkillSelections((current) => ({ ...current, [session.id]: { id: saved.id, skill } }))
+  }, [])
   const [agentSkillDraft, setAgentSkillDraft] = useState<{ conversationId: string; subject: string } | null>(null)
-  const [filmRun, setFilmRun] = useState<{ conversationId: string; nodeId: string; label: string } | null>(null)
+  const [filmRun, setFilmRun] = useState<{ conversationId: string; nodeId: string; mediaNodeId?: string; label: string } | null>(null)
   const [filmReview, setFilmReview] = useState<{ id: string; conversationId: string; stage: FilmReview; answer: (value: FilmReviewAnswer) => void } | null>(null)
   const filmRunControllerRef = useRef<AbortController | null>(null)
   useEffect(() => subscribeToSkillDeletion((key) => {
@@ -3627,12 +3663,39 @@ function App() {
   const [savingApiConnection, setSavingApiConnection] = useState(false)
   const [apiConnectionError, setApiConnectionError] = useState<string | null>(null)
   const lastSavedConnectionRef = useRef<ApiConnection | null>(null)
+  const lastSavedModelPreferenceRef = useRef<ApiConnection | null>(null)
   const [apiKeyVisible, setApiKeyVisible] = useState(false)
   const [draftModels, setDraftModels] = useState<ApiModelConfig[]>([])
   const [manualModelIds, setManualModelIds] = useState<string[]>([])
   const [draftModelsCredentialKey, setDraftModelsCredentialKey] = useState('')
   const [manualModelId, setManualModelId] = useState('')
-  const [apiModelTab, setApiModelTab] = useState<ModelCapability>('text')
+  const [apiModelTab, setApiModelTab] = useState<ModelCapability | 'all'>('all')
+  const [apiModelSearch, setApiModelSearch] = useState('')
+  const [apiModelEnabledOnly, setApiModelEnabledOnly] = useState(false)
+  const [apiModelExpanded, setApiModelExpanded] = useState(false)
+  const apiModelSearchRef = useRef<HTMLInputElement>(null)
+  const apiModelListRef = useRef<HTMLDivElement>(null)
+  const matchingApiModels = useMemo(() => {
+    const tokens = apiModelSearch.normalize('NFKC').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+    return draftModels.filter((model) => {
+      if (apiModelEnabledOnly && !model.enabled) return false
+      if (!tokens.length) return true
+      const label = formatModelDisplayName(model.name, { video: model.capability === 'video' })
+      const haystack = `${model.name} ${model.id} ${label}`.normalize('NFKC').toLowerCase()
+      return tokens.every((token) => haystack.includes(token))
+    })
+  }, [apiModelEnabledOnly, apiModelSearch, draftModels])
+  const visibleApiModels = apiModelTab === 'all' ? matchingApiModels : matchingApiModels.filter(({ capability }) => capability === apiModelTab)
+  const manualModelCapability = apiModelTab === 'all' ? 'text' : apiModelTab
+  useEffect(() => {
+    setApiModelSearch('')
+    setApiModelEnabledOnly(false)
+    setApiModelExpanded(false)
+    setApiModelTab('all')
+  }, [apiOpen, editingConnectionId])
+  useEffect(() => {
+    if (apiModelListRef.current) apiModelListRef.current.scrollTop = 0
+  }, [apiModelSearch, apiModelTab, apiModelEnabledOnly])
   const [apiAlert, setApiAlert] = useState<string | null>(null)
   const [providerCreditsByConnection, setProviderCreditsByConnection] = useState<Record<string, ProviderCredits>>({})
   const [pinnedCreditConnectionId, setPinnedCreditConnectionId] = useState<string | null>(null)
@@ -3913,6 +3976,9 @@ function App() {
       return
     }
     const connection = editingConnection
+    const savedModelPreference = connection && connection === lastSavedModelPreferenceRef.current
+    lastSavedModelPreferenceRef.current = null
+    if (savedModelPreference) return
     setApiConnectionError(null)
     if (connection) {
       setApiDraft({ name: connection.name, baseUrl: connection.baseUrl, apiKey: connection.apiKey, balanceToken: connection.balanceToken ?? '', authMode: connection.authMode ?? 'auto' })
@@ -3925,6 +3991,10 @@ function App() {
       setManualModelIds([])
       setDraftModels([])
     }
+  }, [apiOpen, editingConnection, editingConnectionId, firstApiConnectionId])
+
+  useEffect(() => {
+    if (!apiOpen) return
     const focusTimer = window.setTimeout(() => firstApiInputRef.current?.focus(), 40)
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setApiOpen(false)
@@ -3936,33 +4006,33 @@ function App() {
       window.removeEventListener('keydown', onKeyDown)
       apiButtonRef.current?.focus()
     }
-  }, [apiOpen, editingConnection, editingConnectionId, firstApiConnectionId])
+  }, [apiOpen, editingConnectionId])
 
+  const { id: healthConnectionId, baseUrl: healthBaseUrl = '', apiKey: healthApiKey = '', authMode: healthAuthMode, disconnected: healthDisconnected } = editingConnection ?? {}
   useEffect(() => {
-    if (!apiOpen) return
-    const connection = editingConnection
-    if (!connection) return
-    if (connection === lastSavedConnectionRef.current) {
+    if (!apiOpen || !healthConnectionId) return
+    const lastSaved = lastSavedConnectionRef.current
+    if (lastSaved?.id === healthConnectionId && lastSaved.baseUrl === healthBaseUrl && lastSaved.apiKey === healthApiKey && lastSaved.authMode === healthAuthMode && lastSaved.disconnected === healthDisconnected) {
       // A manual save just checked these exact credentials.
       lastSavedConnectionRef.current = null
       return
     }
-    if (!connection.apiKey.trim() || !connection.baseUrl.trim()) {
-      setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'offline' }))
+    if (!healthApiKey.trim() || !healthBaseUrl.trim()) {
+      setConnectionHealthByConnection((current) => ({ ...current, [healthConnectionId]: 'offline' }))
       return
     }
-    if (connection.disconnected) return
+    if (healthDisconnected) return
     let cancelled = false
-    setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'checking' }))
-    void validateApiCredentials({ baseUrl: connection.baseUrl, apiKey: connection.apiKey, authMode: connection.authMode })
+    setConnectionHealthByConnection((current) => ({ ...current, [healthConnectionId]: 'checking' }))
+    void validateApiCredentials({ baseUrl: healthBaseUrl, apiKey: healthApiKey, authMode: healthAuthMode })
       .then(() => {
-        if (!cancelled) setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'online' }))
+        if (!cancelled) setConnectionHealthByConnection((current) => ({ ...current, [healthConnectionId]: 'online' }))
       })
       .catch(() => {
-        if (!cancelled) setConnectionHealthByConnection((current) => ({ ...current, [connection.id]: 'offline' }))
+        if (!cancelled) setConnectionHealthByConnection((current) => ({ ...current, [healthConnectionId]: 'offline' }))
       })
     return () => { cancelled = true }
-  }, [apiOpen, editingConnection])
+  }, [apiOpen, healthApiKey, healthAuthMode, healthBaseUrl, healthConnectionId, healthDisconnected])
 
   useEffect(() => {
     if (!helpOpen) return
@@ -4371,10 +4441,8 @@ function App() {
       const models = await fetchRemoteModels({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
       if (requestId !== modelFetchRequestRef.current) return
       const nextDraftModels = models.map((model) => {
-        const current = draftModels
-        const existing = current.find((item) => item.id === model.id)
-        const shouldAutoEnable = isModelAutoEnabled(model)
-        return { ...model, enabled: shouldAutoEnable || existing?.enabled === true }
+        const existing = draftModels.find((item) => item.id === model.id)
+        return { ...model, enabled: existing?.enabled ?? isModelAutoEnabled(model) }
       })
       setDraftModels(nextDraftModels)
       setDraftModelsCredentialKey(apiCredentialKey(apiDraft.baseUrl, apiDraft.apiKey, apiDraft.authMode))
@@ -4636,6 +4704,7 @@ function App() {
       setAgentConversationOptions(sessions.map((item) => ({ id: item.id, title: item.title || 'Disy 对话', updatedAt: item.updatedAt })))
       const activeSession = sessions[0]
       setAgentConversationId(activeSession?.id ?? `${canvas.id}--agent-${crypto.randomUUID()}`)
+      restoreFilmSkillSelection(activeSession)
       setAgentMessages(normalizeHistoricalAgentMessages((activeSession?.messages as AgentMessage[] | undefined) ?? []))
       const storedPlans = (activeSession?.plans as StoredAgentPlan[] | undefined) ?? []
       const interruptedPlans = storedPlans.filter(isAgentImagePlan)
@@ -4657,7 +4726,7 @@ function App() {
   }, [resetCanvasHistory, setEdges, setNodes])
 
   useEffect(() => {
-    if (!historyReadyRef.current) return
+    if (!historyReadyRef.current || nodes.some((node) => node.resizing)) return
     if (historyCaptureTimerRef.current !== null) window.clearTimeout(historyCaptureTimerRef.current)
     historyCaptureTimerRef.current = window.setTimeout(() => {
       const nextSnapshot = createCanvasHistorySnapshot(nodes, edges)
@@ -4828,6 +4897,8 @@ function App() {
     if (!activeProjectId || !activeCanvasId) return
     const now = new Date().toISOString()
     const title = messages[0]?.content.slice(0, 36) || '新的对话'
+    const attached = agentSkillSelections[agentConversationId]
+    const filmSkillSelection = attached && getFilmSkillShowcase(attached.skill) ? { id: attached.id, slug: attached.skill.slug } : undefined
     await saveAgentSession({
       id: agentConversationId,
       projectId: activeProjectId,
@@ -4838,11 +4909,12 @@ function App() {
       selectedChatModelId: agentTextModelKey,
       selectedImageModelId: agentImageModelKey,
       selectedVideoModelId: agentVideoModelKey,
+      filmSkillSelection,
       createdAt: messages[0]?.createdAt ?? now,
       updatedAt: now,
     }, graph)
     if (activeCanvasIdRef.current === activeCanvasId) setAgentConversationOptions((current) => [{ id: agentConversationId, title, updatedAt: now }, ...current.filter((item) => item.id !== agentConversationId)].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)))
-  }, [activeCanvasId, activeProjectId, agentConversationId, agentImageModelKey, agentMessages, agentPlans, agentTextModelKey, agentTextPlans, agentVideoModelKey, agentVideoPlans])
+  }, [activeCanvasId, activeProjectId, agentConversationId, agentImageModelKey, agentMessages, agentPlans, agentSkillSelections, agentTextModelKey, agentTextPlans, agentVideoModelKey, agentVideoPlans])
 
   useEffect(() => {
     if (!activeProjectId || !activeCanvasId) return
@@ -5164,15 +5236,63 @@ function App() {
     return connection && resolveProviderLabel(connection.baseUrl) === 'HFSY' ? hfsyVideoLimits(data?.videoModelId ?? '') : undefined
   }, [apiSettings.connections])
 
+  const connectGroupReferences = useCallback((group: CanvasNode, target: CanvasNode, targetHandle: string | null) => {
+    const members = nodesWithGroupChildren(nodes, [group.id])
+    if (members.some(({ id }) => id === target.id)) { setToastMessage('请选择编组之外的目标节点'); return }
+    if (!['text', 'image', 'video'].includes(target.data.kind)) { setToastMessage('请拖到文本、图像或视频节点'); return }
+    const mode = target.data.videoGenerationMethod || 'text'
+    const imageCount = ({ data }: CanvasNode) => data.kind === 'image' || data.kind === 'upload'
+      ? Number(Boolean(data.imageUrl || data.referenceImageUrl || data.imageMediaId || data.referenceImageMediaId))
+        + (data.kind === 'upload' ? data.referenceImages?.filter(({ url, mediaId }) => url || mediaId).length ?? 0 : 0) : 0
+    const hasVideo = ({ data }: CanvasNode) => data.kind === 'video' && Boolean(data.videoUrl || data.videoMediaId)
+    const usable = members.filter((node) => imageCount(node) || (target.data.kind === 'video' && mode === 'omni' && hasVideo(node)))
+    if (!usable.length) { setToastMessage('组内暂无可用于当前节点的素材。视频素材可连接全能参考节点。'); return }
+    const existing = new Set(edges.filter((edge) => edge.target === target.id).map((edge) => edge.source))
+    const sources = usable.filter((node) => !existing.has(node.id))
+    if (!sources.length) { setToastMessage('组内可用素材已经连接'); return }
+    if (sources.some((node) => connectionCreatesCycle(node.id, target.id))) { setToastMessage('组内素材与目标节点存在循环引用'); return }
+
+    const incoming = nodes.filter(({ id }) => existing.has(id))
+    const imageTotal = [...incoming, ...sources].reduce((sum, node) => sum + imageCount(node), 0)
+    if (target.data.kind === 'video') {
+      const limits = getNodeHfsyVideo(target.data)
+      const connection = apiSettings.connections.find(({ id }) => id === target.data.videoModelConnectionId)
+      const grsai = connection && getGrsaiVideoCapabilities(connection.baseUrl, target.data.videoModelId ?? '')
+      const imageLimit = mode === 'image' ? 1 : mode === 'frames' ? 2 : limits?.images ?? grsai?.images ?? (mode === 'omni' ? 9 : 4)
+      const localImages = mode === 'frames'
+        ? Number(Boolean(target.data.videoFirstFrameUrl || target.data.videoFirstFrameMediaId)) + Number(Boolean(target.data.videoLastFrameUrl || target.data.videoLastFrameMediaId))
+        : Number(Boolean(target.data.videoReferenceImageUrl || target.data.videoReferenceImageMediaId)) + (target.data.referenceImages?.length ?? 0)
+      if (imageTotal + localImages > imageLimit) { setToastMessage(`当前视频模式最多使用 ${imageLimit} 张参考图，请减少素材或切换模式`); return }
+      const videoLimit = limits?.videos ?? 3
+      if (mode === 'omni' && [...incoming, ...sources].filter(hasVideo).length + Number(Boolean(target.data.videoReferenceUrl || target.data.videoReferenceMediaId)) + (target.data.videoReferenceVideos?.length ?? 0) > videoLimit) {
+        setToastMessage(videoLimit ? `当前模型最多支持 ${videoLimit} 个参考视频` : '当前模型不支持参考视频')
+        return
+      }
+      if (mode === 'text') setNodes((current) => current.map((node) => node.id === target.id ? { ...node, data: { ...node.data, videoGenerationMethod: 'reference' } } : node))
+    } else if (target.data.kind === 'image') {
+      const connection = apiSettings.connections.find(({ id }) => id === target.data.imageModelConnectionId)
+      const caps = connection && getImageModelCapabilities(connection.baseUrl, target.data.imageModelId ?? '')
+      if (caps && 'images' in caps && imageTotal + (target.data.referenceImages?.length ?? 0) > caps.images) {
+        setToastMessage(`当前图像模型最多支持 ${caps.images} 张参考图，请减少素材或切换模型`)
+        return
+      }
+    }
+    setEdges((current) => sources.reduce((next, source) => next.some((edge) => edge.source === source.id && edge.target === target.id)
+      ? next : addEdge({ source: source.id, sourceHandle: null, target: target.id, targetHandle, type: 'luminous', data: { referenceSelected: true } }, next), current))
+    setToastMessage(`已连接 ${sources.length} 个组内素材${target.data.kind === 'video' && mode === 'text' ? '，视频已切换为图片参考' : ''}`)
+    closeAllMenus()
+  }, [apiSettings.connections, closeAllMenus, connectionCreatesCycle, edges, getNodeHfsyVideo, nodes, setEdges, setNodes])
+
   const onConnect = useCallback(
     (connection: Connection) => {
       const source = nodes.find((node) => node.id === connection.source)
       const target = nodes.find((node) => node.id === connection.target)
       if (!source || !target || source.id === target.id) return
-      if (source.data.kind === 'group' || target.data.kind === 'group') {
-        setToastMessage('文件夹只用于整理节点，不能参与连线')
+      if (target.data.kind === 'group') {
+        setToastMessage('请从编组的加号拖出，连接到目标节点')
         return
       }
+      if (source.data.kind === 'group') { connectGroupReferences(source, target, connection.targetHandle); return }
       if (connectionCreatesCycle(source.id, target.id)) {
         setToastMessage('该连接会形成循环引用')
         return
@@ -5206,7 +5326,7 @@ function App() {
       )
       closeAllMenus()
     },
-    [closeAllMenus, connectionCreatesCycle, edges, getNodeHfsyVideo, nodes, setEdges],
+    [closeAllMenus, connectGroupReferences, connectionCreatesCycle, edges, getNodeHfsyVideo, nodes, setEdges],
   )
 
   const onConnectEnd: OnConnectEnd = useCallback(
@@ -5220,55 +5340,17 @@ function App() {
       const targetNodeId = targetElement?.dataset.id
 
       if (targetNodeId && targetNodeId !== connectionState.fromNode.id) {
-        const sourceNodeId = connectionState.fromNode.id
-        const sourceNode = nodes.find((node) => node.id === sourceNodeId)
-        const targetNode = nodes.find((node) => node.id === targetNodeId)
-        if (sourceNode?.data.kind === 'group' || targetNode?.data.kind === 'group') {
-          setToastMessage('文件夹只用于整理节点，不能参与连线')
-          return
-        }
-        if (connectionCreatesCycle(sourceNodeId, targetNodeId)) {
-          setToastMessage('该连接会形成循环引用')
-          return
-        }
-        if (targetNode?.data.kind === 'video' && (targetNode.data.videoGenerationMethod || 'text') === 'omni') {
-          const limits = getNodeHfsyVideo(targetNode.data)
-          const imageLimit = limits?.images ?? 9
-          const videoLimit = limits?.videos ?? 3
-          const incomingNodes = edges.filter((edge) => edge.target === targetNode.id).flatMap((edge) => nodes.filter((node) => node.id === edge.source))
-          if (sourceNode?.data.kind === 'video') {
-            const videoCount = incomingNodes.filter((node) => node.data.kind === 'video').length
-              + (targetNode.data.videoReferenceUrl ? 1 : 0)
-              + (targetNode.data.videoReferenceVideos?.length ?? 0)
-            if (videoCount >= videoLimit) { setToastMessage(videoLimit ? `当前模型最多支持 ${videoLimit} 个参考视频` : '当前模型不支持参考视频'); return }
-          }
-          if (sourceNode?.data.kind === 'image' || sourceNode?.data.kind === 'upload') {
-            const imageCount = incomingNodes.filter((node) => node.data.kind === 'image' || node.data.kind === 'upload').length
-              + (targetNode.data.videoReferenceImageUrl ? 1 : 0)
-              + (targetNode.data.referenceImages?.length ?? 0)
-            if (imageCount >= imageLimit) { setToastMessage(`当前模型最多支持 ${imageLimit} 张参考图`); return }
-          }
-        }
-        setEdges((current) =>
-          current.some((edge) => edge.source === sourceNodeId && edge.target === targetNodeId)
-            ? current
-            :
-          addEdge(
-            {
-              id: `${sourceNodeId}-${targetNodeId}-${Date.now()}`,
-              source: sourceNodeId,
-              target: targetNodeId,
-              type: 'luminous',
-              data: { referenceSelected: true },
-            },
-            current,
-          ),
-        )
-        closeAllMenus()
+        const from = connectionState.fromNode.id
+        const incoming = connectionState.fromHandle.type === 'target'
+        onConnect({ source: incoming ? targetNodeId : from, target: incoming ? from : targetNodeId, sourceHandle: null, targetHandle: null })
         return
       }
 
       if (connectionState.toNode) return
+      if (nodes.some((node) => node.id === connectionState.fromNode?.id && node.data.kind === 'group')) {
+        setToastMessage('请拖到画布上的目标节点')
+        return
+      }
       const flowPosition = screenToFlowPosition({ x: point.clientX, y: point.clientY })
 
       setNodeMenu({
@@ -5281,7 +5363,7 @@ function App() {
       })
       closeContextMenu()
     },
-    [closeAllMenus, closeContextMenu, connectionCreatesCycle, edges, getNodeHfsyVideo, nodes, screenToFlowPosition, setEdges],
+    [closeContextMenu, nodes, onConnect, screenToFlowPosition],
   )
 
   const createNode = (kind: CreatableNodeKind, positionOverride?: { x: number; y: number }) => {
@@ -5625,8 +5707,8 @@ function App() {
     return getGrsaiVideoCapabilities(connection?.baseUrl ?? '', data?.videoModelId ?? '')
   }, [apiSettings.connections])
 
-  const uploadVideoReferenceImage = useCallback((nodeId: string, file: File, slot: 'reference' | 'first' | 'last' = 'reference') => {
-    if (!file.type.startsWith('image/')) { setToastMessage('请选择图片文件'); return }
+  const uploadVideoReferenceImage = useCallback((nodeId: string, input: File | string, slot: 'reference' | 'first' | 'last' = 'reference') => {
+    if (typeof input !== 'string' && !input.type.startsWith('image/')) { setToastMessage('请选择图片文件'); return false }
     if (slot === 'reference') {
       const target = nodes.find((item) => item.id === nodeId)
       const mode = target?.data.videoGenerationMethod || 'text'
@@ -5637,7 +5719,7 @@ function App() {
         }, 0)
         const localCount = (target?.data.referenceImages?.length ?? 0) + (target?.data.videoReferenceImageUrl ? 1 : 0)
         const limit = getNodeHfsyVideo(target?.data)?.images ?? 9
-        if (connectedCount + localCount >= limit) { setToastMessage(`当前模型最多支持 ${limit} 张参考图`); return }
+        if (connectedCount + localCount >= limit) { setToastMessage(`当前模型最多支持 ${limit} 张参考图`); return false }
       }
       if (mode === 'reference') {
         const connectedCount = edges.filter((edge) => edge.target === nodeId).reduce((count, edge) => {
@@ -5646,45 +5728,51 @@ function App() {
         }, 0)
         const localCount = target?.data.referenceImages?.length ?? 0
         const limit = getNodeGrsaiVideo(target?.data)?.images ?? getNodeHfsyVideo(target?.data)?.images ?? 4
-        if (connectedCount + localCount >= limit) { setToastMessage(`图片参考模式最多支持 ${limit} 张图片`); return }
+        if (connectedCount + localCount >= limit) { setToastMessage(`图片参考模式最多支持 ${limit} 张图片`); return false }
       }
     }
     const connectedReferenceIds = edges
       .filter((edge) => edge.target === nodeId)
       .map((edge) => `connection-${edge.source}`)
+    const attachImage = (url: string, name: string, mediaId?: string) => {
+      setNodes((current) => current.map((node) => {
+        if (node.id !== nodeId) return node
+        const knownOrder = Array.from(new Set([
+          ...(node.data.videoReferenceOrder ?? []),
+          ...connectedReferenceIds,
+          ...(node.data.videoFirstFrameUrl ? ['video-first-frame'] : []),
+          ...(node.data.videoLastFrameUrl ? ['video-last-frame'] : []),
+          ...(node.data.videoReferenceImageUrl ? ['video-reference-image'] : []),
+          ...(node.data.referenceImages ?? []).map((reference) => reference.id),
+        ]))
+        const moveTo = (id: string, index: number) => {
+          const next = knownOrder.filter((item) => item !== id)
+          next.splice(Math.min(index, next.length), 0, id)
+          return next
+        }
+        if (slot === 'first') return { ...node, data: { ...node.data, videoFirstFrameUrl: url, videoFirstFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-first-frame', 0) } }
+        if (slot === 'last') return { ...node, data: { ...node.data, videoLastFrameUrl: url, videoLastFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-last-frame', 1) } }
+        const mode = node.data.videoGenerationMethod
+        if (mode === 'omni' || mode === 'reference' || (mode === 'image' && mediaId && node.data.videoReferenceImageUrl)) {
+          const reference = { id: `video-reference-image-${crypto.randomUUID()}`, name, url, mediaId }
+          return { ...node, data: { ...node.data, referenceImages: [...(node.data.referenceImages ?? []), reference] } }
+        }
+        const referenceName = typeof input === 'string' ? node.data.videoReferenceImageName || name : name
+        return { ...node, data: { ...node.data, videoReferenceImageUrl: url, videoReferenceImageName: referenceName, videoReferenceImageMediaId: mediaId, videoReferenceOrder: moveTo('video-reference-image', 0) } }
+      }))
+    }
+    if (typeof input === 'string') {
+      attachImage(input, new URL(input).hostname)
+      return true
+    }
     void (async () => {
       const mediaId = `image-${crypto.randomUUID()}`
-      await saveHistoryMedia({ id: mediaId, blob: file, fileName: file.name, createdAt: new Date().toISOString() })
-      const localUrl = URL.createObjectURL(file)
-      historyMediaObjectUrlsRef.current.set(mediaId, localUrl)
-      setNodes((current) => current.map((node) => {
-      if (node.id !== nodeId) return node
-      const knownOrder = Array.from(new Set([
-        ...(node.data.videoReferenceOrder ?? []),
-        ...connectedReferenceIds,
-        ...(node.data.videoFirstFrameUrl ? ['video-first-frame'] : []),
-        ...(node.data.videoLastFrameUrl ? ['video-last-frame'] : []),
-        ...(node.data.videoReferenceImageUrl ? ['video-reference-image'] : []),
-        ...(node.data.referenceImages ?? []).map((reference) => reference.id),
-      ]))
-      const moveTo = (id: string, index: number) => {
-        const next = knownOrder.filter((item) => item !== id)
-        next.splice(Math.min(index, next.length), 0, id)
-        return next
-      }
-      if (slot === 'first') return { ...node, data: { ...node.data, videoFirstFrameUrl: localUrl, videoFirstFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-first-frame', 0) } }
-      if (slot === 'last') return { ...node, data: { ...node.data, videoLastFrameUrl: localUrl, videoLastFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-last-frame', 1) } }
-      if (node.data.videoGenerationMethod === 'omni' || node.data.videoGenerationMethod === 'reference') {
-        const reference = { id: `video-reference-image-${crypto.randomUUID()}`, name: file.name, url: localUrl, mediaId }
-        return { ...node, data: { ...node.data, referenceImages: [...(node.data.referenceImages ?? []), reference] } }
-      }
-      if (node.data.videoGenerationMethod === 'image' && node.data.videoReferenceImageUrl) {
-        const reference = { id: `video-reference-image-${crypto.randomUUID()}`, name: file.name, url: localUrl, mediaId }
-        return { ...node, data: { ...node.data, referenceImages: [...(node.data.referenceImages ?? []), reference] } }
-      }
-      return { ...node, data: { ...node.data, videoReferenceImageUrl: localUrl, videoReferenceImageName: file.name, videoReferenceImageMediaId: mediaId, videoReferenceOrder: moveTo('video-reference-image', 0) } }
-      }))
+      await saveHistoryMedia({ id: mediaId, blob: input, fileName: input.name, createdAt: new Date().toISOString() })
+      const url = URL.createObjectURL(input)
+      historyMediaObjectUrlsRef.current.set(mediaId, url)
+      attachImage(url, input.name, mediaId)
     })().catch(() => setToastMessage('图片保存失败，请重新选择'))
+    return true
   }, [edges, getNodeGrsaiVideo, getNodeHfsyVideo, nodes, setNodes])
 
   const uploadVideoReference = useCallback((nodeId: string, file: File) => {
@@ -6343,34 +6431,85 @@ function App() {
     }
   }
 
-  const recoverVideoNodeArchive = async (nodeId: string) => {
+  const recoverVideoNodeArchive = async (nodeId: string, input = '', shotNumber = 1) => {
     const node = nodes.find((item) => item.id === nodeId && item.data.kind === 'video')
-    const sourceUrl = node?.data.videoUrl
-    if (!node || !sourceUrl) {
-      setToastMessage('没有可恢复的视频源地址')
+    if (!node) return
+    const filmId = nodeId.startsWith('film-') && nodeId.endsWith('-video') ? nodeId.slice(0, -'-video'.length) : undefined
+    if (filmId && (filmRunControllerRef.current || !Number.isInteger(shotNumber) || shotNumber < 1)) {
+      setToastMessage('请先停止成片制作，再输入要取回的镜头编号。')
+      return
+    }
+    const filmPlan = filmId ? agentMessages.find(({ filmPlan }) => filmPlan?.nodeId === filmId)?.filmPlan : undefined
+    const filmSkill = filmPlan && OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === filmPlan.skillSlug)
+    if (filmPlan && filmSkill) {
+      const selection = getFilmPlanModels(filmPlan)
+      if (!('issue' in selection) && shotNumber > filmRequestCounts(filmSkill, Number(filmPlan.values.duration), selection.profile, filmPlan.values).videos) {
+        setToastMessage('镜头编号超出了这份成片的镜头数。')
+        return
+      }
+    }
+    const lookup = input.trim()
+    let sourceUrl = lookup ? (/^https:\/\//i.test(lookup) ? lookup : undefined) : node.data.videoUrl
+    const taskId = lookup && !sourceUrl ? lookup : node.data.videoTaskId
+    const connection = apiSettings.connections.find((item) => item.id === node.data.videoModelConnectionId)
+    const hfsyConnection = [connection, ...apiSettings.connections].find((item) => item?.apiKey && resolveProviderLabel(item.baseUrl) === 'HFSY')
+    if (!sourceUrl && (!taskId || !hfsyConnection)) {
+      setToastMessage('输入已完成视频的链接，或配置 HFSY 后输入任务 ID。')
       return
     }
     const taskKey = `video-recover:${nodeId}`
     const controller = beginGenerationTask(taskKey)
     if (!controller) return
-    updateNodeData(nodeId, { status: '正在恢复本地视频', generationError: undefined })
+    const origin = { projectId: activeProjectId, canvasId: activeCanvasId }
+    const update = (data: Partial<CanvasNode['data']>) => patchCanvasNodesAtOrigin(origin, (current) => current.map((item) => item.id === nodeId ? { ...item, data: { ...item.data, ...data } } : item))
+    updateNodeData(nodeId, { status: '正在恢复本地视频', videoProgress: undefined, generationError: undefined })
     try {
-      const connection = apiSettings.connections.find((item) => item.id === node.data.videoModelConnectionId)
-      const blob = await downloadGeneratedVideoBlob(sourceUrl, {
-        signal: controller.signal,
-        authorization: connection?.apiKey ? `Bearer ${connection.apiKey}` : undefined,
-      })
+      const checkpoint: FilmCheckpoint | undefined = filmId ? await loadFilmCheckpoint(filmId) ?? { media: [], reviews: [] } : undefined
+      const shotIndex = shotNumber - 1
+      const pendingShot = checkpoint?.videoTasks?.find((entry) => taskId && entry.taskId === taskId)
+      if (pendingShot && pendingShot.index !== shotIndex) throw new Error(`这条任务 ID 属于镜头 ${pendingShot.index + 1}。`)
+      const attempt = pendingShot?.attempt ?? 0
+      if (checkpoint?.media.some((entry) => entry.kind === 'video' && entry.index === shotIndex && (entry.attempt ?? 0) === attempt)
+        || checkpoint?.recoveredClips?.some((entry) => entry.index === shotIndex && entry.attempt === attempt)) {
+        throw new Error(`镜头 ${shotNumber} 已有可续接的成品。请从成片卡继续制作。`)
+      }
+      let blob: Blob
+      if (sourceUrl) {
+        blob = await downloadGeneratedVideoBlob(sourceUrl, { signal: controller.signal })
+      } else {
+        const result = await resumeHfsyVideoTask({ baseUrl: hfsyConnection!.baseUrl, apiKey: hfsyConnection!.apiKey, model: node.data.videoModelId ?? 'sd-2-fast-720' }, taskId!, {
+          signal: controller.signal,
+          onProgress: (percent, status) => { void update({ videoProgress: percent, status: status === 'downloading' ? '生成完成 · 正在下载' : '正在取回 HFSY 视频' }) },
+        })
+        blob = result.blob
+        sourceUrl = result.sourceUrl
+      }
       const mediaId = `video-media-${crypto.randomUUID()}`
       const createdAt = new Date().toISOString()
       const fileName = node.data.fileName || `disy-video-recovered-${Date.now()}.mp4`
       await saveHistoryMedia({ id: mediaId, blob, fileName, createdAt })
-      const variant: VideoVariant = { id: `video-variant-${crypto.randomUUID()}`, mediaId, fileName, createdAt, taskId: node.data.videoTaskId, sourceUrl }
-      updateNodeData(nodeId, {
+      const variant: VideoVariant = { id: `video-variant-${crypto.randomUUID()}`, mediaId, fileName, createdAt, taskId, sourceUrl }
+      if (filmId && checkpoint) {
+        (checkpoint.recoveredClips ??= []).push({ index: shotIndex, attempt, mediaId, sourceUrl })
+        await saveFilmCheckpoint(filmId, checkpoint)
+        const clipId = `${nodeId}-recovered-${shotNumber}-${attempt}`
+        await appendCanvasGraphAtOrigin(origin, {
+          id: clipId, type: 'disy', position: { x: node.position.x, y: node.position.y + 330 + shotIndex * 310 },
+          style: getVideoNodeSize(node.data.videoAspectRatio),
+          data: { kind: 'video', title: `镜头 ${shotNumber} · 已取回`, body: '', videoMediaId: mediaId, videoGeneratedAt: createdAt,
+            videoSource: 'generated', videoAspectRatio: node.data.videoAspectRatio, videoVariants: [variant], activeVideoVariantId: variant.id, status: '已完成', fileName },
+        }, { id: `${clipId}-${nodeId}`, source: clipId, target: nodeId, type: 'luminous', data: { referenceSelected: false } })
+        await update({ status: `已取回镜头 ${shotNumber} · 可继续制作`, videoProgress: undefined, generationError: undefined })
+        setToastMessage(`镜头 ${shotNumber} 已取回。回到成片卡，点继续制作。`)
+        return
+      }
+      await update({
         status: '已完成',
         videoProgress: 100,
         videoMediaId: mediaId,
         videoGeneratedAt: createdAt,
         videoUrl: undefined,
+        videoTaskId: taskId,
         fileName,
         videoVariants: [...(node.data.videoVariants ?? []), variant],
         activeVideoVariantId: variant.id,
@@ -6380,7 +6519,7 @@ function App() {
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       const normalized = normalizeGenerationError(error)
-      updateNodeData(nodeId, { status: '生成成功·下载待恢复', generationError: normalized.message })
+      await update({ status: '下载待恢复', videoTaskId: taskId, videoUrl: sourceUrl ?? normalized.resultUrls?.[0], generationError: normalized.message })
       setToastMessage(`恢复失败：${normalized.message}`)
     } finally {
       finishGenerationTask(taskKey)
@@ -6444,6 +6583,34 @@ function App() {
     setDraftModels(connection.models)
     setDraftModelsCredentialKey(apiCredentialKey(connection.baseUrl, connection.apiKey, connection.authMode))
     setManualModelIds([])
+  }
+
+  const toggleApiModelEnabled = (model: ApiModelConfig) => {
+    const enabled = !model.enabled
+    const currentSettings = useDisyStore.getState().apiSettings
+    const connection = currentSettings.connections.find(({ id }) => id === editingConnectionId)
+    if (connection) {
+      const savedCredentials = apiCredentialKey(connection.baseUrl, connection.apiKey, connection.authMode)
+      const draftCredentials = apiCredentialKey(apiDraft.baseUrl, apiDraft.apiKey, apiDraft.authMode)
+      const modelCredentials = manualModelIds.includes(model.id) ? draftCredentials : draftModelsCredentialKey
+      if (modelCredentials === savedCredentials) {
+        const existing = connection.models.find(({ id }) => id === model.id)
+        const models = existing
+          ? connection.models.map((item) => item.id === model.id ? { ...item, enabled } : item)
+          : [...connection.models, { ...model, enabled }]
+        const nextConnection = { ...connection, models }
+        const connections = currentSettings.connections.map((item) => item.id === connection.id ? nextConnection : item)
+        try {
+          lastSavedModelPreferenceRef.current = nextConnection
+          saveApiSettings({ connections, ...pickValidSelections(connections, currentSettings) })
+        } catch {
+          lastSavedModelPreferenceRef.current = null
+          setToastMessage('模型启用状态保存失败，请检查本地存储权限。')
+          return
+        }
+      }
+    }
+    setDraftModels((current) => current.map((item) => item.id === model.id ? { ...item, enabled } : item))
   }
 
   const removeCurrentApiConnection = async () => {
@@ -6587,15 +6754,17 @@ function App() {
   const appendCanvasGraphAtOrigin = async (
     origin: { projectId: string; canvasId: string },
     node: CanvasNode,
-    edge?: Edge,
+    links: Edge | Edge[] = [],
   ) => {
+    const edgesToAppend = Array.isArray(links) ? links : [links]
+    const appendEdges = (current: Edge[]) => [...current, ...edgesToAppend.filter((edge) => !current.some((item) => item.id === edge.id))]
     const switchBarrier = canvasSwitchBarrierRef.current
     if (switchBarrier && switchBarrier.origin.projectId === origin.projectId && switchBarrier.origin.canvasId === origin.canvasId) {
       await switchBarrier.promise
     }
     if (activeProjectIdRef.current === origin.projectId && activeCanvasIdRef.current === origin.canvasId) {
       setNodes((current) => current.some((item) => item.id === node.id) ? current : [...current, node])
-      if (edge) setEdges((current) => current.some((item) => item.id === edge.id) ? current : [...current, edge])
+      if (edgesToAppend.length) setEdges(appendEdges)
       return true
     }
     const canvas = await loadWorkspaceCanvas(origin.canvasId)
@@ -6603,11 +6772,7 @@ function App() {
     const nextNodes = (canvas.nodes as CanvasNode[]).some((item) => item.id === node.id)
       ? canvas.nodes as CanvasNode[]
       : [...canvas.nodes as CanvasNode[], node]
-    const nextEdges = edge
-      ? ((canvas.edges as Edge[]).some((item) => item.id === edge.id)
-        ? canvas.edges as Edge[]
-        : [...canvas.edges as Edge[], edge])
-      : canvas.edges as Edge[]
+    const nextEdges = appendEdges(canvas.edges as Edge[])
     const updatedAt = new Date().toISOString()
     await saveWorkspaceCanvas({ ...canvas, nodes: nextNodes, edges: nextEdges, updatedAt })
     setWorkspaceCanvases((current) => current.map((item) => item.id === origin.canvasId && item.projectId === origin.projectId
@@ -6693,6 +6858,7 @@ function App() {
     userMessage: AgentMessage,
     assistantMessage: AgentMessage,
     createdPlans: StoredAgentPlan[],
+    replacedFailureId?: string,
   ) => {
     const switchingAway = canvasSwitchBarrierRef.current?.origin.projectId === origin.projectId
       && canvasSwitchBarrierRef.current?.origin.canvasId === origin.canvasId
@@ -6716,7 +6882,7 @@ function App() {
     const session = sessions.find((item) => item.id === origin.sessionId)
     const now = new Date().toISOString()
     const storedMessages = normalizeHistoricalAgentMessages((session?.messages as AgentMessage[] | undefined) ?? [])
-    const messages = [...storedMessages]
+    const messages = storedMessages.filter((message) => message.id !== replacedFailureId)
     if (!messages.some((message) => message.id === userMessage.id)) messages.push(userMessage)
     if (!messages.some((message) => message.id === assistantMessage.id)) messages.push(assistantMessage)
     const storedPlans = (session?.plans as StoredAgentPlan[] | undefined) ?? []
@@ -6834,6 +7000,7 @@ function App() {
     const session = sessions.find(({ id }) => id === preferredConversationId) ?? sessions[0]
     setAgentConversationOptions(sessions.map((item) => ({ id: item.id, title: item.title || 'Disy 对话', updatedAt: item.updatedAt })))
     setAgentConversationId(session?.id ?? `${canvas.id}--agent-${crypto.randomUUID()}`)
+    restoreFilmSkillSelection(session)
     setAgentMessages(normalizeHistoricalAgentMessages((session?.messages as AgentMessage[] | undefined) ?? []))
     const storedPlans = (session?.plans as StoredAgentPlan[] | undefined) ?? []
     const interruptedPlans = storedPlans.filter(isAgentImagePlan)
@@ -6907,6 +7074,7 @@ function App() {
     const session = sessions.find((item) => item.id === id)
     if (!session) return
     setAgentConversationId(session.id)
+    restoreFilmSkillSelection(session)
     setAgentMessages(normalizeHistoricalAgentMessages((session.messages as AgentMessage[] | undefined) ?? []))
     const storedPlans = (session.plans as StoredAgentPlan[] | undefined) ?? []
     const plans = storedPlans.filter(isAgentImagePlan)
@@ -6938,6 +7106,7 @@ function App() {
     const next = sessions[0]
     if (next) {
       setAgentConversationId(next.id)
+      restoreFilmSkillSelection(next)
       setAgentMessages(normalizeHistoricalAgentMessages((next.messages as AgentMessage[] | undefined) ?? []))
       const storedPlans = (next.plans as StoredAgentPlan[] | undefined) ?? []
       setAgentPlans(storedPlans.filter(isAgentImagePlan).map((plan) => plan.status === 'running' ? { ...plan, status: 'failed', error: '上次生成已中断，请在对应图像节点中手动重试。' } : plan))
@@ -7662,8 +7831,15 @@ function App() {
       ? { ...node, style: { ...node.style, ...getVideoNodeSize('16:9') }, data: { ...node.data, videoAspectRatio: '16:9' as VideoAspectRatio, ...(node.data.title === '视频生成' ? { title: '视频' } : {}) } }
       : node))
   }, [nodes, setNodes])
-  const activeGeneratingNodeIds = useMemo(() => new Set(Array.from(activeGenerationTaskKeys)
-    .flatMap((taskKey) => taskKey.startsWith('image:') ? [taskKey.slice('image:'.length)] : nodes.some((node) => node.id === taskKey && node.data.kind === 'video') ? [taskKey] : [])), [activeGenerationTaskKeys, nodes])
+  const activeGeneratingNodeIds = useMemo(() => {
+    const active = new Set(Array.from(activeGenerationTaskKeys)
+      .flatMap((taskKey) => {
+        const prefix = ['image:', 'text:', 'video-recover:'].find((value) => taskKey.startsWith(value))
+        return prefix ? [taskKey.slice(prefix.length)] : nodes.some((node) => node.id === taskKey && node.data.kind === 'video') ? [taskKey] : []
+      }))
+    if (filmRun?.mediaNodeId) active.add(filmRun.mediaNodeId)
+    return active
+  }, [activeGenerationTaskKeys, filmRun?.mediaNodeId, nodes])
   const activeImageGenerationRunning = Boolean(activeGenerationNode && activeGeneratingNodeIds.has(activeGenerationNode.id))
   const activeVideoGenerationRunning = Boolean(activeVideoNode && activeGeneratingNodeIds.has(activeVideoNode.id))
   const activeTextGenerationRunning = Boolean(activeTextNode && activeGenerationTaskKeys.has(`text:${activeTextNode.id}`))
@@ -8155,49 +8331,143 @@ function App() {
     openSkillConversation(skill, welcomeSkillDraft)
     setWelcomeSkillDraft('')
   }
-  const getFilmPlanModels = (values: Record<string, string | number | boolean>) => {
-    const imageChoices = enabledImageModels.filter(({ model, connection }) => connection.apiKey && isFilmImageModel(model.id))
-    const image = imageChoices.find(({ connection, model }) => `${connection.id}::${model.id}` === agentImageModelKey) ?? imageChoices[0]
+  const getFilmPlanModels = (plan: NonNullable<AgentMessage['filmPlan']>, values = plan.values) => {
+    const modelKey = ({ connection, model }: (typeof enabledImageModels)[number]) => `${connection.id}::${model.id}`
+    const referenceMinimum = values.character === '多角色' ? Number(values.characterCount ?? 2) + 1 : 2
+    const imageChoices = enabledImageModels.flatMap((choice) => {
+      const { connection, model } = choice
+      const capability = getImageModelCapabilities(connection.baseUrl, model.id)
+      const referenceLimit = capability && 'images' in capability ? capability.images : 8
+      if (!connection.apiKey || (!capability && !isFilmImageModel(model.id)) || referenceLimit < referenceMinimum) return []
+      if (capability && !['1:1', '16:9', String(values.ratio)].every((ratio) => capability.ratios.includes(ratio))) return []
+      return [{ ...choice, referenceLimit, resolution: capability?.resolutions[0] ?? '1K' as ImageResolution }]
+    })
     const videoChoices = enabledVideoModels.flatMap((choice) => {
       const profile = filmVideoProfile(choice.connection.baseUrl, choice.model.id)
       return choice.connection.apiKey && profile ? [{ ...choice, profile }] : []
     })
-    if (!image || !videoChoices.length) return { issue: '先在 API 设置中连接成片需要的图像和视频模型。', settings: true } as const
     const compatible = videoChoices.filter(({ profile }) => profile.ratios.includes(String(values.ratio))
-      && (!values.resolution || profile.resolutions.some((resolution) => resolution === values.resolution)))
-    const video = compatible.find(({ connection, model }) => `${connection.id}::${model.id}` === agentVideoModelKey) ?? compatible[0]
-    if (!video) return { issue: '当前视频模型不支持这个画幅或清晰度。可以在聊天中换一个。', settings: false } as const
-    const profile = selectFilmResolution(video.profile, String(values.resolution ?? ''), video.model.id)
-    return { image, video, profile } as const
+      && (profile.maxImages ?? 8) >= referenceMinimum + (plan.skillSlug === 'cartoon-ad' ? 1 : 0))
+    const requestedResolution = String(values.resolution ?? (plan.skillSlug === 'cartoon-ad' ? '720p' : ''))
+    const image = plan.imageModelKey ? imageChoices.find((choice) => modelKey(choice) === plan.imageModelKey)
+      : imageChoices.find(({ model }) => model.name === plan.confirmed?.models.split(' + ')[0]) ?? imageChoices.find((choice) => modelKey(choice) === agentImageModelKey) ?? imageChoices.find(({ model }) => isFilmImageModel(model.id)) ?? imageChoices[0]
+    const video = plan.videoModelKey ? compatible.find((choice) => modelKey(choice) === plan.videoModelKey)
+      : compatible.find(({ model }) => model.name === plan.confirmed?.models.split(' + ').at(-1)) ?? compatible.find((choice) => modelKey(choice) === agentVideoModelKey) ?? compatible.find(({ profile }) => profile.resolutions.some((item) => item === requestedResolution)) ?? compatible[0]
+    const choices = {
+      imageModels: imageChoices.map((choice) => ({ key: modelKey(choice), name: choice.model.name, connectionName: choice.connection.name })),
+      videoModels: compatible.map((choice) => ({ key: modelKey(choice), name: choice.model.name, connectionName: `${choice.connection.name} · ${selectFilmResolution(choice.profile, requestedResolution, choice.model.id).resolution}` })),
+      imageModelKey: image && modelKey(image), videoModelKey: video && modelKey(video),
+    }
+    if (!imageChoices.length || !videoChoices.length) return { ...choices, issue: '先在 API 设置中连接支持成片参考图的图像和视频模型。', settings: true } as const
+    if (!compatible.length) return { ...choices, issue: '已连接的视频模型无法满足此方案的参考图数量或画幅。', settings: true } as const
+    if (!image || !video) return { ...choices, issue: '原来选的模型不可用，请重新选择。', settings: false } as const
+    const profile = selectFilmResolution(video.profile, requestedResolution, video.model.id)
+    return { ...choices, image, video, profile } as const
   }
   const runFilmSkill = async (messageId: string) => {
     if (filmRunControllerRef.current) return
-    const plan = agentMessages.at(-1)?.id === messageId ? agentMessages.at(-1)?.filmPlan : undefined
-    if (!plan || plan.nodeId || agentBusy) return
+    const plan = agentMessages.find(({ id }) => id === messageId)?.filmPlan
+    if (!plan || (!plan.nodeId && agentMessages.at(-1)?.id !== messageId) || agentBusy) return
+    if (plan.nodeId && generationTaskControllersRef.current.has(`video-recover:${plan.nodeId}-video`)) {
+      setToastMessage('正在取回视频镜头，完成后再继续制作。')
+      return
+    }
+    if (plan.nodeId && nodes.some(({ id, data }) => (id === `${plan.nodeId}-video` || id === plan.nodeId) && data.videoMediaId)) return
     const skill = OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === plan.skillSlug)
     const draft = skill && resolveFilmDraft(skill, plan, plan.references.length > 0)
     if (!skill || !draft) return
     const { subject, values } = draft
-    const models = getFilmPlanModels(values)
-    if (!models.image) return
+    const models = getFilmPlanModels(plan, values)
+    if ('issue' in models) { setToastMessage(models.issue); return }
     const { image, video, profile } = models
     if (generationTaskControllersRef.current.size >= MAX_CONCURRENT_GENERATION_TASKS) {
       setToastMessage('当前生成任务已满，请等一个任务结束后再制作。')
       return
     }
-    const center = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
-    const nodeId = createNode('video', { x: center.x - 150, y: center.y - 120 })
-    if (!nodeId) return
+    const existingBrief = plan.nodeId ? nodes.find(({ id }) => id === plan.nodeId) : undefined
+    const position = existingBrief?.position ?? screenToFlowPosition({ x: window.innerWidth * .16, y: window.innerHeight * .17 })
+    const columnGap = 510
+    const rowGap = 490
+    const rowByStage = { anchor: 0, storyboard: 0, keyframe: 0 }
+    const columnByStage = { anchor: 0, storyboard: 1, keyframe: 2 }
+    const startY = existingBrief?.position.y ?? nodes.reduce((y, node) => {
+      const absolute = getInternalNode(node.id)?.internals.positionAbsolute ?? node.position
+      const width = node.measured?.width ?? Number(node.style?.width ?? 384)
+      const height = node.measured?.height ?? Number(node.style?.height ?? 216)
+      return absolute.x + width > position.x && absolute.x < position.x + 4 * columnGap
+        ? Math.max(y, absolute.y + height + 80) : y
+    }, position.y)
+    const nodeId = plan.nodeId ?? `film-${crypto.randomUUID()}`
     const controller = beginGenerationTask(nodeId)
     if (!controller) return
     filmRunControllerRef.current = controller
-    setFilmRun({ conversationId: agentConversationId, nodeId, label: '正在准备成片…' })
-    setAgentMessages((current) => current.map((message) => message.id === messageId && message.filmPlan
-      ? { ...message, filmPlan: { ...message.filmPlan, nodeId } } : message))
+    setFilmRun({ conversationId: agentConversationId, nodeId, label: plan.nodeId ? '正在恢复制作进度…' : '正在准备成片…' })
+    const attachRun = (messages: AgentMessage[]) => messages.map((message) => message.id === messageId && message.filmPlan
+      ? { ...message, filmPlan: { ...message.filmPlan, nodeId, imageModelKey: models.imageModelKey, videoModelKey: models.videoModelKey, confirmed: { summary: `${values.duration} 秒 · ${values.ratio} · ${profile.resolution}`, models: `${image.model.name} + ${video.model.name}` } } } : message)
+    setAgentMessages(attachRun)
     const origin = { projectId: activeProjectId, canvasId: activeCanvasId }
-    const update = (data: Partial<CanvasNode['data']>) => patchCanvasNodesAtOrigin(origin, (current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, ...data } } : node))
-    const ratio = String(values.ratio)
+    const update = (id: string, data: Partial<CanvasNode['data']>) => patchCanvasNodesAtOrigin(origin, (current) => current.map((node) => node.id === id ? { ...node, data: { ...node.data, ...data } } : node))
+    const link = (source: string, target: string): Edge => ({ id: `${source}-${target}`, source, target, type: 'luminous', data: { referenceSelected: false } })
+    const ratio = values.ratio as VideoAspectRatio
+    const imageNodeIds = new Map<number, string>()
+    const videoNodeId = `${nodeId}-video`
+    const skillData = { activeSkillId: skillKey(skill), activeSkillName: skill.name }
+    let mediaNodeId: string | undefined
     let editor: Awaited<ReturnType<typeof prepareFilmEditor>> | undefined
+    let checkpoint: FilmCheckpoint = { media: [], reviews: [], mapStoryboardPanels: !plan.nodeId }
+    let checkpointWrite = Promise.resolve()
+    let reviewIndex = 0
+    const temporaryUrls: string[] = []
+    const saveCheckpoint = () => {
+      const snapshot = structuredClone(checkpoint)
+      const write = checkpointWrite.then(() => saveFilmCheckpoint(nodeId, snapshot))
+      checkpointWrite = write.catch(() => undefined)
+      return write
+    }
+    const savedImages = new Map<number, CanvasNode>()
+    const imagePrefix = `${nodeId}-image-`
+    for (const node of nodes) {
+      if (node.id.startsWith(imagePrefix) && node.data.kind === 'image' && node.data.imageMediaId) {
+        savedImages.set(Number(node.id.slice(imagePrefix.length)), node)
+      }
+    }
+    let legacyRecovery = false
+    const restoreMedia = async (media: FilmMediaKey, title?: string) => {
+      const sameMedia = (entry: FilmMediaKey) => entry.kind === media.kind && entry.index === media.index && (entry.attempt ?? 0) === (media.attempt ?? 0) && entry.prompt === media.prompt && entry.model === media.model
+      const saved = checkpoint.media.find(sameMedia)
+      const recovered = media.kind === 'video' ? checkpoint.recoveredClips?.find((entry) => entry.index === media.index && entry.attempt === (media.attempt ?? 0)) : undefined
+      const pending = media.kind === 'video' && checkpoint.videoTasks?.find(sameMedia)
+      if (!saved && !recovered && pending) {
+        const result = await resumeHfsyVideoTask(videoSettings, pending.taskId, {
+          signal: controller.signal,
+          onProgress: (percent, state) => { void update(videoNodeId, { videoProgress: percent, status: state === 'downloading' ? '正在下载已生成的视频' : '正在取回 HFSY 视频' }) },
+        })
+        const fileName = `${skill.slug}-clip-${media.index + 1}.mp4`
+        const archived = await archive({ ...media, fileName, blob: result.blob, sourceUrl: result.sourceUrl })
+        checkpoint.media.push({ ...media, mediaId: archived.mediaId, sourceUrl: result.sourceUrl })
+        await saveCheckpoint()
+        return { mediaId: archived.mediaId, blob: result.blob, fileName }
+      }
+      const legacyNode = legacyRecovery && media.kind === 'image' ? savedImages.get(media.index) : undefined
+      if (!saved && !legacyNode && media.kind === 'image' && checkpoint.media.some((entry) => entry.kind === 'image' && entry.index === media.index)) {
+        throw new Error('已保存图像与当前制作参数不一致，已保留素材以免重复生成。')
+      }
+      if (!saved && legacyNode && legacyNode.data.title !== title) {
+        throw new Error('这份旧任务的图像顺序与当前流程不同。已保留画布素材，避免重复生成。')
+      }
+      const mediaId = saved?.mediaId ?? recovered?.mediaId ?? legacyNode?.data.imageMediaId
+      if (!mediaId) return
+      const stored = await loadHistoryMedia(mediaId)
+      if (!stored) throw new Error(`本地找不到已生成的${title || '视频片段'}，无法安全续接。`)
+      const sourceUrl = saved?.sourceUrl ?? recovered?.sourceUrl ?? generationHistory.find((entry) => entry.mediaId === mediaId)?.sourceUrl
+      if (!saved) {
+        checkpoint.media.push({ ...media, mediaId, sourceUrl })
+        await saveCheckpoint()
+      }
+      const url = media.kind === 'image' ? sourceUrl || URL.createObjectURL(stored.blob) : undefined
+      if (url && !sourceUrl) temporaryUrls.push(url)
+      return { mediaId, blob: stored.blob, fileName: stored.fileName, url }
+    }
     let progress = -1
     let status = ''
     const setProgress = (label: string, value: number) => {
@@ -8205,21 +8475,32 @@ function App() {
       if (next === progress && status === label) return
       progress = next
       status = label
-      setFilmRun({ conversationId: agentConversationId, nodeId, label })
-      void update({ status, videoProgress: progress })
+      setFilmRun({ conversationId: agentConversationId, nodeId, mediaNodeId, label })
     }
-    const review = (stage: FilmReview) => new Promise<FilmReviewAnswer>((resolve, reject) => {
+    const review = async (stage: FilmReview, nextImageIndex: number): Promise<FilmReviewAnswer> => {
       controller.signal.throwIfAborted()
-      const id = crypto.randomUUID()
-      const clear = () => setFilmReview((current) => current?.id === id ? null : current)
-      const abort = () => { clear(); reject(controller.signal.reason) }
-      controller.signal.addEventListener('abort', abort, { once: true })
-      setFilmReview({ id, conversationId: agentConversationId, stage, answer: (value) => {
-        controller.signal.removeEventListener('abort', abort)
-        clear()
-        resolve(value)
-      } })
-    })
+      const index = reviewIndex++
+      const saved = checkpoint.reviews[index]
+      if (saved?.title === stage.title) return saved.answer
+      if (saved) throw new Error('这份任务的审核步骤与保存记录不同，已保留画布素材。')
+      const nextImage = legacyRecovery ? savedImages.get(nextImageIndex) : undefined
+      const passedLegacyReview = nextImage && !stage.chooseAsset && !stage.assets?.some(({ label }) => label === nextImage.data.title)
+      const answer = passedLegacyReview ? { action: 'continue', notes: '' } as const : await new Promise<FilmReviewAnswer>((resolve, reject) => {
+        const id = crypto.randomUUID()
+        const clear = () => setFilmReview((current) => current?.id === id ? null : current)
+        const abort = () => { clear(); reject(controller.signal.reason) }
+        controller.signal.addEventListener('abort', abort, { once: true })
+        setFilmReview({ id, conversationId: agentConversationId, stage, answer: (value) => {
+          controller.signal.removeEventListener('abort', abort)
+          clear()
+          resolve(value)
+        } })
+      })
+      checkpoint.reviews[index] = { title: stage.title, answer }
+      await saveCheckpoint()
+      controller.signal.throwIfAborted()
+      return answer
+    }
     const archive = async (media: { blob: Blob; kind: 'image' | 'video'; prompt: string; model: string; fileName: string; sourceUrl?: string }) => {
       const createdAt = new Date().toISOString()
       const mediaId = `film-${media.kind}-${crypto.randomUUID()}`
@@ -8227,9 +8508,23 @@ function App() {
       setGenerationHistory((current) => [...current, { id: `history-${mediaId}`, createdAt, prompt: media.prompt, model: media.model, imageUrl: '', fileName: media.fileName, projectId: origin.projectId, mediaId, kind: media.kind, sourceUrl: media.sourceUrl }])
       return { mediaId, createdAt }
     }
+    const videoSettings = { baseUrl: video.connection.baseUrl, apiKey: video.connection.apiKey, authMode: video.connection.authMode, model: video.model.id }
+    const reportImageProgress = new Map<number, ReturnType<typeof startImageGenerationSlot>>()
     try {
+      if (!plan.nodeId) {
+        await saveCheckpoint()
+        await persistCurrentAgentConversation(attachRun(agentMessages))
+      }
+      const storedCheckpoint = plan.nodeId ? await loadFilmCheckpoint(nodeId) : undefined
+      if (storedCheckpoint) checkpoint = storedCheckpoint
+      if (plan.nodeId && !storedCheckpoint && !savedImages.size) throw new Error('没有找到这份旧任务的已保存画布素材。请先在原画布打开这份任务。')
+      legacyRecovery = Boolean(plan.nodeId && savedImages.size && (!storedCheckpoint || storedCheckpoint.media.length < savedImages.size))
+      await appendCanvasGraphAtOrigin(origin, {
+        id: nodeId, type: 'disy', position: { x: position.x, y: startY }, style: { width: 420, height: 160 },
+        data: { kind: 'text', title: `${skill.name} · 成片简报`, body: subject, ...skillData },
+      })
+      // Prepare the local editor before any paid requests.
       editor = await prepareFilmEditor()
-      await update({ title: skill.name, body: subject, activeSkillId: `${skill.id}@${skill.version}`, activeSkillName: skill.name, status: '准备制作成片', videoProgress: 0, generationError: undefined })
       const references = plan.references
       const referenceUrls = await Promise.all(references.slice(0, 3).map(async (reference) => {
         const archived = reference.mediaId ? await loadHistoryMedia(reference.mediaId) : undefined
@@ -8238,8 +8533,54 @@ function App() {
       const clips = await generateFilmClips({
         skill, subject, values, ratio, duration: Number(values.duration), profile, signal: controller.signal,
         image: { baseUrl: image.connection.baseUrl, apiKey: image.connection.apiKey, authMode: image.connection.authMode, model: image.model.id },
-        video: { baseUrl: video.connection.baseUrl, apiKey: video.connection.apiKey, authMode: video.connection.authMode, model: video.model.id },
-        references: referenceUrls.filter(Boolean), onProgress: setProgress, review,
+        imageResolution: image.resolution, imageReferenceLimit: image.referenceLimit,
+        video: videoSettings,
+        references: referenceUrls.filter(Boolean), onProgress: setProgress, review, restoreMedia, mapStoryboardPanels: checkpoint.mapStoryboardPanels,
+        onImageStart: async ({ index, stage, title, prompt, aspectRatio }, restored) => {
+          const imageNodeId = `${nodeId}-image-${index}`
+          const imageAspectRatio = aspectRatio as ImageAspectRatio
+          const row = rowByStage[stage]++
+          const mediaData = restored ? { status: '已完成', imageMediaId: restored.mediaId, imageSource: 'generated' as const, fileName: restored.fileName }
+            : { status: '生成中', generationError: undefined }
+          await appendCanvasGraphAtOrigin(origin, {
+            id: imageNodeId, type: 'disy', style: getImageGenerationNodeSize(imageAspectRatio),
+            position: { x: position.x + columnByStage[stage] * columnGap, y: startY + 220 + row * rowGap },
+            data: {
+              kind: 'image', title, body: prompt, imageAspectRatio, imageResolution: image.resolution, ...mediaData,
+              imageModelId: image.model.id, imageModelName: image.model.name, imageModelConnectionId: image.connection.id,
+            },
+          }, link(nodeId, imageNodeId))
+          if (plan.nodeId) await update(imageNodeId, mediaData)
+          imageNodeIds.set(index, imageNodeId)
+          if (!restored) reportImageProgress.set(index, startImageGenerationSlot(imageNodeId, 0, 1))
+          mediaNodeId = restored ? undefined : imageNodeId
+          setFilmRun({ conversationId: agentConversationId, nodeId, mediaNodeId, label: restored ? `已恢复${title}` : `生成${title}` })
+        },
+        onImageProgress: (index, percent, state) => reportImageProgress.get(index)?.(percent, state),
+        onVideoStart: async (firstFrameIndices) => {
+          const firstFrameLinks = firstFrameIndices.flatMap((index) => {
+            const imageId = imageNodeIds.get(index)
+            return imageId ? [link(imageId, videoNodeId)] : []
+          })
+          await appendCanvasGraphAtOrigin(origin, {
+            id: videoNodeId, type: 'disy', style: getVideoNodeSize(ratio),
+            position: { x: position.x + 3 * columnGap, y: startY + 220 },
+            data: {
+              kind: 'video', title: `${skill.name} · 成片`, body: subject, status: '生成视频镜头', ...skillData,
+              videoGenerationMethod: 'reference', videoAspectRatio: ratio, videoResolution: profile.resolution, videoDuration: Number(values.duration),
+              videoModelId: video.model.id, videoModelName: video.model.name, videoModelConnectionId: video.connection.id,
+            },
+          }, firstFrameLinks)
+          if (plan.nodeId) await update(videoNodeId, { status: '生成视频镜头', generationError: undefined })
+          mediaNodeId = videoNodeId
+          setFilmRun({ conversationId: agentConversationId, nodeId, mediaNodeId, label: '生成视频镜头' })
+        },
+        onVideoProgress: (percent, label) => { void update(videoNodeId, { videoProgress: percent, status: label }) },
+        onVideoTask: resolveProviderLabel(videoSettings.baseUrl) === 'HFSY' ? async (media, taskId) => {
+          (checkpoint.videoTasks ??= []).push({ ...media, taskId })
+          await saveCheckpoint()
+          await update(videoNodeId, { videoTaskId: taskId })
+        } : undefined,
         onLog: (log, prompt) => {
           const selection = log.kind === 'video' ? video : image
           captureGenerationAdminLog(log, { prompt, modelName: selection.model.name, connectionName: selection.connection.name, projectId: origin.projectId })
@@ -8247,16 +8588,35 @@ function App() {
         onMedia: async (media) => {
           const extension = media.kind === 'video' ? (media.blob.type.includes('webm') ? 'webm' : 'mp4')
             : media.blob.type.includes('jpeg') ? 'jpg' : media.blob.type.includes('webp') ? 'webp' : 'png'
-          await archive({ ...media, fileName: `${skill.slug}-${media.kind === 'image' ? 'frame' : 'clip'}-${media.index + 1}.${extension}` })
+          const fileName = `${skill.slug}-${media.kind === 'image' ? 'frame' : 'clip'}-${media.index + 1}.${extension}`
+          const archived = await archive({ ...media, fileName })
+          const { kind, index, attempt, prompt, model, sourceUrl } = media
+          checkpoint.media.push({ kind, index, attempt, prompt, model, sourceUrl, mediaId: archived.mediaId })
+          await saveCheckpoint()
+          if (media.kind === 'image') {
+            const imageNodeId = imageNodeIds.get(media.index)
+            if (imageNodeId) await update(imageNodeId, { status: '已完成', imageMediaId: archived.mediaId, imageSource: 'generated', fileName })
+            mediaNodeId = undefined
+            setFilmRun({ conversationId: agentConversationId, nodeId, label: '图片已放到画布' })
+          }
         },
       })
       setProgress('正在合并分镜', 86)
-      const result = await editFilmClips(clips, ratio, editor, controller.signal, (percent) => setProgress('正在合并分镜', 86 + percent * .13))
+      await update(videoNodeId, { status: '正在合并分镜', videoProgress: 0 })
+      let lastEditPercent = -1
+      const result = await editFilmClips(clips, ratio, filmResolutionHeight(profile.resolution), editor, controller.signal, (percent) => {
+        setProgress('正在合并分镜', 86 + percent * .13)
+        const rounded = Math.min(99, Math.round(percent))
+        if (rounded !== lastEditPercent) {
+          lastEditPercent = rounded
+          void update(videoNodeId, { videoProgress: rounded })
+        }
+      })
       controller.signal.throwIfAborted()
       const fileName = `${skill.slug}-${Date.now()}.${result.blob.type.includes('mp4') ? 'mp4' : 'webm'}`
       const archived = await archive({ blob: result.blob, kind: 'video', prompt: subject, model: `${image.model.name} + ${video.model.name}`, fileName })
       const variantId = `film-variant-${crypto.randomUUID()}`
-      await update({
+      await update(videoNodeId, {
         status: '已完成', videoProgress: 100, generationError: undefined, fileName,
         videoMediaId: archived.mediaId, videoUrl: undefined, videoSource: 'generated', videoGeneratedAt: archived.createdAt,
         videoVariants: [{ id: variantId, ...archived, fileName }], activeVideoVariantId: variantId,
@@ -8264,14 +8624,20 @@ function App() {
       setToastMessage(`成片已保存到画布 · ${result.duration.toFixed(1)} 秒`)
     } catch (error) {
       const cancelled = controller.signal.aborted
-      const message = cancelled ? '已停止制作，已经生成的镜头可在历史中查看。' : normalizeGenerationError(error).message
-      await update({ status: cancelled ? '已停止' : '生成失败', generationError: cancelled ? undefined : message })
+      const message = cancelled ? '已停止制作。可以从确认卡继续，已保存的素材会沿用。' : normalizeGenerationError(error).message
+      if (mediaNodeId) await update(mediaNodeId, { status: cancelled ? '已停止' : '生成失败', generationError: cancelled ? undefined : message })
       setToastMessage(message)
     } finally {
+      temporaryUrls.forEach((url) => URL.revokeObjectURL(url))
       if (editor) void editor.audio.close().catch(() => undefined)
       filmRunControllerRef.current = null
       setFilmRun(null)
       setFilmReview(null)
+      setImageGenerationProgress((current) => {
+        const next = new Map(current)
+        imageNodeIds.forEach((id) => next.delete(id))
+        return next
+      })
       finishGenerationTask(nodeId)
     }
   }
@@ -9453,15 +9819,24 @@ function App() {
   const hasCatalogImageModels = apiSettings.connections.filter(isConnectionUsable).some((connection) => connection.models.some((model) => model.capability === 'image'))
 
   const cancelVideoGeneration = useCallback((nodeId: string) => {
-    const controller = generationTaskControllersRef.current.get(nodeId)
+    if (filmRun?.mediaNodeId === nodeId) {
+      filmRunControllerRef.current?.abort()
+      return
+    }
+    const controller = generationTaskControllersRef.current.get(nodeId) ?? generationTaskControllersRef.current.get(`video-recover:${nodeId}`)
     if (!controller) return
     generationTaskStopReasonRef.current.set(nodeId, 'stopped')
     controller.abort()
-  }, [])
+  }, [filmRun?.mediaNodeId])
 
   const generateVideoNode = useCallback(async (nodeId: string) => {
     const node = nodes.find((item) => item.id === nodeId && item.data.kind === 'video')
     if (!node) return
+    if (OFFICIAL_FILM_SKILLS.some((skill) => node.data.activeSkillId?.split('@')[0] === skill.id)) {
+      setAgentOpen(true)
+      setToastMessage('成片 Skill 从对话里的成片方案开始，确认关键帧后才会生成视频。')
+      return
+    }
     const selected = enabledVideoModels.find(({ connection, model }) => connection.id === node.data.videoModelConnectionId && model.id === node.data.videoModelId)
       ?? enabledVideoModels[0]
     if (!selected) {
@@ -9501,22 +9876,14 @@ function App() {
       const preferred: Array<string | undefined> = []
       const fallback: Array<string | undefined> = [entry.url]
       for (const item of nodes) {
-        const ownsMedia = Boolean(entry.mediaId && (
-          item.data.imageMediaId === entry.mediaId
-          || item.data.referenceImageMediaId === entry.mediaId
-          || item.data.videoReferenceImageMediaId === entry.mediaId
-          || item.data.videoFirstFrameMediaId === entry.mediaId
-          || item.data.videoLastFrameMediaId === entry.mediaId
-        ))
-        if (ownsMedia || item.data.imageUrl === entry.url || item.data.referenceImageUrl === entry.url) {
-          fallback.push(item.data.imageUrl, item.data.referenceImageUrl)
-        }
+        if ((entry.mediaId && item.data.imageMediaId === entry.mediaId) || (entry.url && item.data.imageUrl === entry.url)) fallback.push(item.data.imageUrl)
+        if ((entry.mediaId && item.data.referenceImageMediaId === entry.mediaId) || (entry.url && item.data.referenceImageUrl === entry.url)) fallback.push(item.data.referenceImageUrl)
         for (const variant of item.data.imageVariants ?? []) {
-          if ((entry.mediaId && variant.mediaId === entry.mediaId) || variant.url === entry.url) { preferred.push(variant.sourceUrl); fallback.push(variant.url) }
+          if ((entry.mediaId && variant.mediaId === entry.mediaId) || (entry.url && variant.url === entry.url)) { preferred.push(variant.sourceUrl); fallback.push(variant.url) }
         }
       }
       for (const record of generationHistory) {
-        if ((entry.mediaId && record.mediaId === entry.mediaId) || record.imageUrl === entry.url) { preferred.push(record.sourceUrl); fallback.push(record.imageUrl) }
+        if ((entry.mediaId && record.mediaId === entry.mediaId) || (entry.url && record.imageUrl === entry.url)) { preferred.push(record.sourceUrl); fallback.push(record.imageUrl) }
       }
       return [...preferred, ...fallback].map((source) => publicImageSourceUrl(source)).find((source): source is string => Boolean(source))
     }
@@ -9624,7 +9991,10 @@ function App() {
         if (requiresPublicImages) {
           const publicUrl = publicImageEntrySource(entry)
           if (publicUrl) return publicUrl
-          throw new GenerationRequestError('platform', 'HFSY 参考图片没有公网源地址', `参考图“${entry.id}”仅保存在本机。请使用带公网 sourceUrl 的生成图片，或先把本地图片上传到可公开访问的 HTTPS 地址。视频生成尚未提交。`)
+          const media = entry.mediaId ? await loadHistoryMedia(entry.mediaId) : undefined
+          const source = media?.blob || entry.url
+          if (!source) throw new GenerationRequestError('platform', '参考图已丢失', '请重新添加参考图。视频生成尚未提交。')
+          return publishHfsyVideoReferenceImage(selected.connection, source, controller.signal)
         }
         if (!entry.mediaId) return entry.url!
         const media = await loadHistoryMedia(entry.mediaId)
@@ -10821,7 +11191,8 @@ function App() {
     })
   }
 
-  const sendAgentMessage = async (content: string, invocationText = content, messageReferences = agentReferences, videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni', useSkill = false, useTeam = false) => {
+  const sendAgentMessage = async (content: string, invocationText = content, messageReferences = agentReferences, videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni', useSkill = false, useTeam = false, retryTurn?: { user: AgentMessage; failureId: string }) => {
+    const history = retryTurn ? agentMessages.slice(0, -2) : agentMessages
     const skillSelection = useSkill ? agentSkillSelections[agentConversationId] : undefined
     const skill = skillSelection?.skill
     const film = skill && getFilmSkillShowcase(skill)
@@ -10845,7 +11216,7 @@ function App() {
     setAgentOpen(true)
     setAgentCanvasPicking(false)
     const earlierSkillReferences = skillSelection && !messageReferences.length
-      ? agentMessages.slice().reverse().find((message) => message.skillUseId === skillSelection.id && message.references?.length)?.references
+      ? history.slice().reverse().find((message) => message.skillUseId === skillSelection.id && message.references?.length)?.references
       : undefined
     const resolvedContext = resolveAgentContextReferences(content, earlierSkillReferences ?? messageReferences)
     messageReferences = resolvedContext.imageReferences
@@ -10872,7 +11243,7 @@ function App() {
     }
     const directImagePlanRequested = messageRequestsDirectImagePlan(invocationText)
     const hasImageConversationContext = sentReferences.length > 0
-      || agentMessages.slice(-6).some((message) => Boolean(message.references?.length))
+      || history.slice(-6).some((message) => Boolean(message.references?.length))
       || agentPlans.some((plan) => plan.status === 'proposed' || plan.status === 'ready')
     const requestedPlanCount = explicitPlanCount ?? (directImagePlanRequested ? 1 : 3)
     const expectsVideoPlans = !film && messageExpectsVideoPlans(invocationText)
@@ -10883,12 +11254,15 @@ function App() {
     const availableStyleKeywords = stylePresets
       .filter((preset) => preset.enabled && preset.references.length && preset.keyword.trim())
       .map((preset) => `${preset.name}：“${preset.keyword.trim()}”`)
-    const userMessage: AgentMessage = { id: `agent-message-${crypto.randomUUID()}`, role: 'user', content, createdAt: new Date().toISOString(), references: sentReferences, skillUseId: skillSelection?.id }
-    const nextMessages = [...agentMessages, userMessage]
+    const userMessage: AgentMessage = retryTurn?.user ?? { id: `agent-message-${crypto.randomUUID()}`, role: 'user', content, createdAt: new Date().toISOString(), references: sentReferences, skillUseId: skillSelection?.id }
+    const nextMessages = [...history, userMessage]
     const origin = { projectId: activeProjectId, canvasId: activeCanvasId, sessionId: agentConversationId }
-    const localDecision = inferAgentInteractionMode(invocationText)
+    const requestedFilmCard = Boolean(film && requestsFilmConfirmation(invocationText))
+    const localDecision = requestedFilmCard
+      ? { mode: 'plan', confidence: 1, needsApproval: true, reason: '用户要求查看成片确认卡' } as const
+      : inferAgentInteractionMode(invocationText)
     const selectedIds = new Set(selectedNodeIds)
-    const pickingEditTarget = agentMessages.at(-1)?.canvasEditTargetQuestion && invocationText.startsWith('要修改哪个文本节点？\n')
+    const pickingEditTarget = history.at(-1)?.canvasEditTargetQuestion && invocationText.startsWith('要修改哪个文本节点？\n')
     const explicitTextTargets = /《[^》]+》|@\[node:/.test(invocationText) ? resolveAgentTextEditTargets(nodes, [], invocationText) : []
     const wantsTextEdit = !skill && localDecision.mode !== 'plan' && localDecision.mode !== 'inspect'
       && (pickingEditTarget || requestsAgentCanvasTextEdits(invocationText, explicitTextTargets.length > 0 || nodes.some((node) => node.data.kind === 'text' && selectedIds.has(node.id))))
@@ -10899,7 +11273,7 @@ function App() {
       await commitAgentTurnAtOrigin(origin, userMessage, {
         id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', createdAt: new Date().toISOString(), content: reply,
         ...(questions ? { questions, canvasEditTargetQuestion: true } : {}),
-      }, [])
+      }, [], retryTurn?.failureId)
     }
     if (wantsTextEdit && !editTargets.length) {
       if (pickingEditTarget && invocationText.split('\n')[1] === '先跳过') {
@@ -11018,44 +11392,54 @@ function App() {
       const assess = (response: typeof parsed) => {
         const canPropose = agentReplyAllowsProposals(localDecision, response)
         const textEdits = canPropose && wantsTextEdit ? prepareAgentCanvasEdits(editTargets, response.textEdits ?? []) : []
-        const imagePlans = canPropose && !wantsTextEdit ? response.imagePlans ?? [] : []
+        const imagePlans = canPropose && !wantsTextEdit && !film ? response.imagePlans ?? [] : []
         const videoPlans = canPropose && !wantsTextEdit && !film ? response.videoPlans ?? [] : []
-        const needsRepair = canPropose && !(film && response.filmDraft) && (wantsTextEdit ? !textEdits.length :
-          (!film && expectsImagePlans && (!imagePlans.length || explicitPlanCount !== null && imagePlans.length < explicitPlanCount))
+        const filmReply = film && skill ? assessFilmReply(skill, response, localDecision, requestedFilmCard, imageReferences.length > 0) : null
+        const needsRepair = canPropose && !film && (wantsTextEdit ? !textEdits.length :
+          (expectsImagePlans && (!imagePlans.length || explicitPlanCount !== null && imagePlans.length < explicitPlanCount))
           || (expectsVideoPlans && (!videoPlans.length || explicitPlanCount !== null && videoPlans.length < explicitPlanCount)))
-        return { canPropose, textEdits, imagePlans, videoPlans, needsRepair, score: textEdits.length + imagePlans.length + videoPlans.length }
+        return { canPropose, textEdits, imagePlans, videoPlans, filmReply, needsRepair, score: textEdits.length + imagePlans.length + videoPlans.length }
       }
       let assessed = assess(parsed)
-      if (assessed.needsRepair) {
+      const repairFilm = assessed.filmReply?.needsRepair
+      if (assessed.needsRepair || repairFilm) {
         // At most one format repair. Keep a usable first reply if the provider
         // declines or times out on the follow-up.
         try {
-          const repaired = parseAgentReply(await requestText(`${taskInstruction}\n\n上一条回复缺少可用的结构化方案。请检查 JSON 字段与要求后重新返回；如果信息不足，返回 questions，不要编造。`, 45_000, teamEnabled ? teamModels.get(teamRoles.at(-1)!.id) : selection))
+          const invalidFields = assessed.filmReply?.check?.issue?.fields ?? []
+          const repairInstruction = repairFilm
+            ? `${invalidFields.length ? `上一份 filmDraft 的这些字段缺失或格式不符：${invalidFields.map(({ name, label }) => `${name}（${label}）`).join('、')}。` : '上一条回复没有返回界面创建确认卡所需的 filmDraft。'}现在根据已确认的对话生成供审阅的 filmDraft，保留已定的产品外观、故事和镜头。它只会创建确认卡。确实缺少必要信息时才返回具体的 questions，不要编造。上一条回复：${JSON.stringify({ reply: parsed.reply, filmDraft: parsed.filmDraft })}`
+            : '上一条回复缺少可用的结构化方案。请检查 JSON 字段与要求后重新返回；如果信息不足，返回 questions，不要编造。'
+          const repaired = parseAgentReply(await requestText(`${taskInstruction}\n\n${repairInstruction}`, 45_000, teamEnabled ? teamModels.get(teamRoles.at(-1)!.id) : selection))
           const next = assess(repaired)
-          if (!next.needsRepair || next.score > assessed.score) { parsed = repaired; assessed = next }
+          const usableRepair = repairFilm
+            ? next.filmReply?.check || repaired.questions?.length
+            : !next.needsRepair || next.score > assessed.score
+          if (usableRepair) { parsed = repaired; assessed = next }
         } catch { /* keep the first reply */ }
         if (controller.signal.aborted) return
       }
       let parsedPlans = assessed.imagePlans
       let parsedVideoPlans = assessed.videoPlans
-      const filmDraft = film && skill && parsed.filmDraft && assessed.canPropose
-        ? resolveFilmDraft(skill, parsed.filmDraft, imageReferences.length > 0) : null
+      const filmDraft = assessed.filmReply?.check?.draft
+      const filmIssue = assessed.filmReply?.check?.issue
+      const questions = filmIssue ? filmIssue.questions : parsed.questions
+      const filmReplyNotice = filmIssue?.message ?? (assessed.filmReply && !filmDraft && (assessed.filmReply.missingCard || assessed.filmReply.claimsCard)
+        ? (questions?.length ? '先确认下面的信息，再整理成片确认卡。' : '这次对话模型未能整理出可用的成片确认稿。已保留本轮对话，可以重试整理确认稿。') : undefined)
       const fallbackNotice = assessed.needsRepair && (wantsTextEdit
         ? '这次没有得到可应用的修改方案，画布未变更。可以缩小修改范围，或换一个对话模型再试。'
         : assessed.score ? '本次仅保留模型返回的可用方案。' : '模型没有返回可执行的方案。这次只保留文字回复，你可以补充要求或换一个对话模型。')
       const assistantMessage: AgentMessage = {
         id: `agent-message-${crypto.randomUUID()}`,
         role: 'assistant',
-        content: film && parsed.filmDraft && !filmDraft && assessed.canPropose
-          ? (skill?.slug === 'toy-animation' && !imageReferences.length ? '先发一张手办照片吧，我会按原来的造型做。' : '这份方案还没准备好制作。你可以告诉我想保留哪些内容，我再整理一版。')
-          : [parsed.reply, fallbackNotice].filter(Boolean).join('\n\n') || '我已经整理好了。',
+        content: filmReplyNotice ?? ([parsed.reply, fallbackNotice].filter(Boolean).join('\n\n') || '我已经整理好了。'),
         createdAt: new Date().toISOString(),
         decision: parsed.decision ?? localDecision,
-        ...(parsed.questions?.length ? { skillUseId: skillSelection?.id, questions: parsed.questions } : {}),
+        ...(questions?.length ? { skillUseId: skillSelection?.id, questions } : {}),
         ...(assessed.textEdits.length ? { canvasEditDraft: { projectId: origin.projectId, canvasId: origin.canvasId, status: 'pending', edits: assessed.textEdits } } : {}),
         ...(film && filmDraft ? { filmPlan: { skillSlug: film.slug, ...filmDraft, references: imageReferences } } : {}),
       }
-      if (!assessed.canPropose || wantsTextEdit || (film && parsed.filmDraft)) {
+      if (!assessed.canPropose || wantsTextEdit || film) {
         parsedPlans = []
         parsedVideoPlans = []
         parsed.textNode = undefined
@@ -11139,8 +11523,8 @@ function App() {
       if (createdPlans.length || assistantMessage.filmPlan || assistantMessage.canvasEditDraft) {
         assistantMessage.decision = { ...(assistantMessage.decision ?? localDecision), needsApproval: true }
       }
-      await commitAgentTurnAtOrigin(origin, userMessage, assistantMessage, createdPlans)
-      updateAgentRun(runId, { status: 'completed', stage: parsed.questions?.length ? '已发出澄清问题' : createdPlans.length || assistantMessage.filmPlan || assistantMessage.canvasEditDraft ? '方案已准备，等待确认' : '已回复', mode: parsed.decision?.mode ?? localDecision.mode })
+      await commitAgentTurnAtOrigin(origin, userMessage, assistantMessage, createdPlans, retryTurn?.failureId)
+      updateAgentRun(runId, { status: 'completed', stage: questions?.length ? '已发出澄清问题' : createdPlans.length || assistantMessage.filmPlan || assistantMessage.canvasEditDraft ? '方案已准备，等待确认' : '已回复', mode: parsed.decision?.mode ?? localDecision.mode })
       if (activeProjectIdRef.current === origin.projectId && activeCanvasIdRef.current === origin.canvasId && agentConversationIdRef.current === origin.sessionId) {
         setAgentReferences([])
       } else {
@@ -11151,8 +11535,11 @@ function App() {
         updateAgentRun(runId, { status: 'cancelled' })
         return
       }
-      const failureMessage: AgentMessage = { id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', content: `这次没有成功：${error instanceof Error ? error.message : '对话请求失败'}`, createdAt: new Date().toISOString() }
-      await commitAgentTurnAtOrigin(origin, userMessage, failureMessage, [])
+      const failureMessage: AgentMessage = {
+        id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', content: `这次没有成功：${error instanceof Error ? error.message : '对话请求失败'}`, createdAt: new Date().toISOString(),
+        retry: { userMessageId: userMessage.id, invocationText, videoGenerationMode, useTeam },
+      }
+      await commitAgentTurnAtOrigin(origin, userMessage, failureMessage, [], retryTurn?.failureId)
       updateAgentRun(runId, { status: 'failed' })
     } finally {
       if (agentRequestRef.current === controller) {
@@ -11160,6 +11547,32 @@ function App() {
       }
       if (agentRunsRef.current.get(runId)?.status === 'running') updateAgentRun(runId, { status: controller.signal.aborted ? 'cancelled' : 'completed' })
     }
+  }
+
+  const retryAgentMessage = (failureId: string) => {
+    const failure = agentMessages.at(-1)
+    const user = agentMessages.at(-2)
+    if (agentBusy || agentRequestRef.current || failure?.id !== failureId || user?.role !== 'user') return
+    const retry = failure.retry
+    if (retry ? retry.userMessageId !== user.id : !failure.content.startsWith('这次没有成功：')) return
+    if (user.skillUseId && agentSkillSelections[agentConversationId]?.id !== user.skillUseId) {
+      setToastMessage('这条消息使用的 Skill 已移除，请重新选择 Skill 后发送')
+      return
+    }
+    void sendAgentMessage(user.content, retry?.invocationText ?? user.content, user.references ?? [], retry?.videoGenerationMode, Boolean(user.skillUseId), retry?.useTeam, { user, failureId })
+  }
+
+  const optimizeAgentPrompt = async (prompt: string) => {
+    const selection = enabledTextModels.find(({ connection, model }) => `${connection.id}::${model.id}` === agentTextModelKey)
+    if (!selection) throw new Error('请先选择对话模型')
+    const { connection, model } = selection
+    const result = await generateRemoteText(
+      { baseUrl: connection.baseUrl, apiKey: connection.apiKey, authMode: connection.authMode, model: model.id },
+      `请把下面的关键词或草稿整理成可直接使用的创作提示词。保持原文语言、意图、关键词和明确约束，整理主体、动作、场景和风格等已有信息，避免擅自添加设定。原样保留所有形如 [[REF_1]] 的素材占位符及其对应位置。只输出优化后的提示词，不要用 Markdown 代码块。\n\n原稿：\n${prompt}`,
+    )
+    const optimized = result.replace(/^```[^\n]*\n?|```$/g, '').trim()
+    if (!optimized) throw new Error('模型未返回提示词')
+    return optimized
   }
 
   const openTransferDialog = (scope: TransferScope) => {
@@ -12345,20 +12758,7 @@ function App() {
     setToastMessage(collapsed ? '编组已折叠，双击卡片可展开' : '编组已展开')
   }, [setNodes, updateNodeInternals])
 
-  const getSelectedNodesWithGroupChildren = () => {
-    const includedIds = new Set(selectedNodeIds)
-    let changed = true
-    while (changed) {
-      changed = false
-      nodes.forEach((node) => {
-        if (node.parentId && includedIds.has(node.parentId) && !includedIds.has(node.id)) {
-          includedIds.add(node.id)
-          changed = true
-        }
-      })
-    }
-    return nodes.filter((node) => includedIds.has(node.id))
-  }
+  const getSelectedNodesWithGroupChildren = () => nodesWithGroupChildren(nodes, selectedNodeIds)
 
   const canvasLayers = useMemo<CanvasLayer[]>(() => layersOpen ? nodes.map((node) => ({
     id: node.id,
@@ -12930,7 +13330,6 @@ function App() {
     setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...restoredNodes])
     setEdges((current) => [...current.map((item) => ({ ...item, selected: false })), ...restoredEdges])
     setSelectedNodeIds(restoredRunnableIds)
-    setWorkflowTemplateOpen(false)
     if (!placementWasAdjusted) {
       setToastMessage(`已添加工作流：${template.title}`)
       window.requestAnimationFrame(() => fitCanvas({ nodes: restoredNodes.map((node) => ({ id: node.id })), padding: .18, duration: 520 }))
@@ -14104,6 +14503,54 @@ function App() {
                    {activeVideoNode.data.videoGenerationMethod === 'reference' && <button type="button" className="add-image-reference-button" title="添加参考图" aria-label="添加参考图" onClick={() => document.getElementById(`video-reference-image-${activeVideoNode.id}`)?.click()}><ImageUp size={15} /></button>}
                   {activeVideoNode.data.videoGenerationMethod !== 'text' && <><input id={`video-reference-image-${activeVideoNode.id}`} type="file" hidden accept="image/*" multiple={activeVideoNode.data.videoGenerationMethod === 'image'} onChange={(event) => { const files = Array.from(event.target.files ?? []); files.forEach((file) => uploadVideoReferenceImage(activeVideoNode.id, file, activeVideoNode.data.videoGenerationMethod === 'frames' ? 'first' : 'reference')); if (files.length > 1 && activeVideoNode.data.videoGenerationMethod === 'image') setToastMessage('图生视频只使用排序第一张图片作为首帧，其余图片可拖拽调整'); event.target.value = '' }} /><input id={`video-reference-last-${activeVideoNode.id}`} type="file" hidden accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadVideoReferenceImage(activeVideoNode.id, file, 'last'); event.target.value = '' }} /></>}
                 </div>
+                {activeHfsyVideo && activeVideoNode.data.videoGenerationMethod && activeVideoNode.data.videoGenerationMethod !== 'text' && (
+                  <details key={activeVideoNode.id} className="mx-3 my-1 text-xs">
+                    <summary>添加图片链接</summary>
+                    <form className="mt-2 flex flex-wrap items-center gap-2" onSubmit={(event) => {
+                      event.preventDefault()
+                      const form = event.currentTarget
+                      const input = form.elements.namedItem('imageUrl') as HTMLInputElement
+                      const url = publicImageSourceUrl(input.value.trim())
+                      if (!url?.startsWith('https://')) {
+                        input.setCustomValidity('请输入能直接打开原图的公网 HTTPS 链接')
+                        input.reportValidity()
+                        return
+                      }
+                      const frame = new FormData(form).get('frame')
+                      const slot = frame === 'first' || frame === 'last' ? frame : 'reference'
+                      if (uploadVideoReferenceImage(activeVideoNode.id, url, slot)) {
+                        form.reset()
+                        const details = form.closest('details')
+                        if (details) details.open = false
+                      }
+                    }}>
+                      {activeVideoNode.data.videoGenerationMethod === 'frames' && (
+                        <select name="frame" aria-label="图片用作首帧或尾帧" className="rounded border border-[color:var(--line)] bg-[color:var(--surface-strong)] px-1 py-1">
+                          <option value="first">首帧</option>
+                          <option value="last">尾帧</option>
+                        </select>
+                      )}
+                      <label className="flex min-w-0 flex-1 items-center gap-2">
+                        图片直链
+                        <input type="url" name="imageUrl" required className="min-w-0 flex-1 rounded border border-[color:var(--line)] bg-transparent px-2 py-1" placeholder="https://…" onChange={(event) => event.currentTarget.setCustomValidity('')} />
+                      </label>
+                      <button type="submit" className="agent-plan-cancel">{activeVideoNode.data.videoGenerationMethod === 'image' ? '用作首帧' : '使用链接'}</button>
+                    </form>
+                  </details>
+                )}
+                {!activeVideoNode.data.videoMediaId && !activeVideoGenerationRunning && <details className="mx-3 my-1 text-xs">
+                  <summary>取回已生成的视频</summary>
+                  <form className="mt-2 flex gap-2" onSubmit={(event) => {
+                    event.preventDefault()
+                    const source = String(new FormData(event.currentTarget).get('source') ?? '')
+                    const shot = Number(new FormData(event.currentTarget).get('shot') ?? 1)
+                    void recoverVideoNodeArchive(activeVideoNode.id, source, shot)
+                  }}>
+                    {activeVideoNode.id.startsWith('film-') && activeVideoNode.id.endsWith('-video') && <label className="flex items-center gap-1">镜头<input name="shot" type="number" min={1} max={60} defaultValue={1} className="w-12 rounded border border-[color:var(--line)] bg-transparent px-1" /></label>}
+                    <input key={activeVideoNode.id} name="source" className="min-w-0 flex-1 rounded border border-[color:var(--line)] bg-transparent px-2 py-1" aria-label="HFSY 任务 ID 或视频结果链接" placeholder="HFSY 任务 ID 或视频结果链接" defaultValue={activeVideoNode.data.videoTaskId ?? ''} />
+                    <button type="submit" className="agent-plan-cancel">取回视频</button>
+                  </form>
+                </details>}
                 <div className="image-prompt-field video-prompt-field">
                   <AtomicPromptEditor
                     key={activeVideoNode.id}
@@ -14439,7 +14886,7 @@ function App() {
                     duration: normalizedDuration(plan.duration),
                   }))
                 }}
-                onSend={(message) => void sendAgentMessage(message, message)}
+                onSend={(message) => void sendAgentMessage(message, message, agentReferences, undefined, true)}
                 activeSkill={agentSkillSelections[agentConversationId]?.skill ?? null}
                 onUseSkill={openSkillConversation}
                 onCreateSkill={(draft) => {
@@ -15215,13 +15662,18 @@ function App() {
                 onStopFilm={() => filmRunControllerRef.current?.abort()}
                 getFilmPlanInfo={(plan) => {
                   const skill = OFFICIAL_FILM_SKILLS.find(({ slug }) => slug === plan.skillSlug)
-                  if (!skill) return { issue: '该成片技能已不可用。' }
-                  const models = getFilmPlanModels(plan.values)
-                  if (!models.image) return { issue: models.issue, settings: models.settings }
+                  if (!skill) return { issue: '该成片技能已不可用。', imageModels: [], videoModels: [] }
+                  const models = getFilmPlanModels(plan)
+                  const { imageModels, videoModels, imageModelKey, videoModelKey } = models
+                  const choices = { imageModels, videoModels, imageModelKey, videoModelKey }
+                  if ('issue' in models) return { ...choices, issue: models.issue, settings: models.settings }
                   const { images, videos } = filmRequestCounts(skill, Number(plan.values.duration), models.profile, plan.values)
-                  return { summary: `${plan.values.duration} 秒 · ${plan.values.ratio} · ${models.profile.resolution}`, models: `${models.image.model.name} + ${models.video.model.name}`, cost: `预计生成 ${images} 张图、${videos} 段视频，按模型计费。` }
+                  return { ...choices, summary: `${plan.values.duration} 秒 · ${plan.values.ratio} · ${models.profile.resolution}`, cost: `预计生成 ${images} 张图、${videos} 段视频，按模型计费。${skill.slug === 'cartoon-ad' ? '每张分镜有 9 格，每段视频配 1 张首帧。' : ''}` }
                 }}
+                onFilmModelChange={(id, kind, key) => setAgentMessages((current) => current.map((message) => message.id === id && message.filmPlan && !message.filmPlan.nodeId
+                  ? { ...message, filmPlan: { ...message.filmPlan, [kind === 'image' ? 'imageModelKey' : 'videoModelKey']: key } } : message))}
                 onConfirmFilm={(id) => void runFilmSkill(id)}
+                canResumeFilm={(nodeId) => !nodes.some(({ id, data }) => (id === `${nodeId}-video` || id === nodeId) && data.videoMediaId)}
                 onOpenSkillFactory={(view, skillSlug) => { setSkillFactoryView(view); setSkillFactorySkillSlug(skillSlug ?? ''); setSkillFactoryOpen(true) }}
                 getSkillCanvasContext={edges.length || nodes.some(({ data }) => data.kind !== 'group' && (data.body?.trim() || data.promptText?.trim() || data.imageUrl || data.videoUrl)) ? getSkillCanvasContext : undefined}
                 onSkillAuthorReply={(prompt, signal) => {
@@ -15342,6 +15794,8 @@ function App() {
                   setToastMessage(agentCanvasPicking ? '已结束画布选择' : videoGenerationMode === 'omni' ? '请在画布上点击图片或视频' : '请在画布上点击图片')
                 }}
                 onSend={(message, invocationText, references, mode, team) => void sendAgentMessage(message, invocationText, references, mode, true, team)}
+                onRetry={retryAgentMessage}
+                onOptimizePrompt={optimizeAgentPrompt}
                 onPlanChange={(id, patch) => setAgentPlans((current) => current.map((plan) => plan.id === id && plan.status === 'ready' ? { ...reconcileAgentImagePlanSpecs(plan), ...patch, hasDraftImageSpecs: true } : plan))}
                 onSelectPlanOptions={selectAgentPlanOptions}
                 onConfirmPlan={(id) => void confirmAgentPlan(id)}
@@ -16326,8 +16780,8 @@ function App() {
                         className="editor-generate-button image-generate-button"
                         aria-label={activeImageGenerationRunning ? '暂停或停止生成任务' : '生成图像'}
                         disabled={!activeImageGenerationRunning && Boolean(activeNodeImageModel) && activeImageOutputIntent.blocked}
-                        title={activeImageGenerationRunning ? '暂停或停止' : '生成图像'}
-                        onClick={() => activeImageGenerationRunning
+                        title={filmRun?.mediaNodeId === activeGenerationNode.id ? '停止成片制作' : activeImageGenerationRunning ? '暂停或停止' : '生成图像'}
+                        onClick={() => filmRun?.mediaNodeId === activeGenerationNode.id ? filmRunControllerRef.current?.abort() : activeImageGenerationRunning
                           ? setGenerationControlMenuNodeId((current) => current === activeGenerationNode.id ? null : activeGenerationNode.id)
                           : void generateFromActiveImageNode()}
                       >
@@ -16951,13 +17405,6 @@ function App() {
           textModels={enabledTextModels.map(({ connection, model }) => ({ key: `${connection.id}::${model.id}`, name: formatModelDisplayName(model.name), connectionName: connection.name }))}
           defaultTextModelKey={selectedTextModel ? `${selectedTextModel.connection.id}::${selectedTextModel.model.id}` : undefined}
           onReversePrompts={reverseInspirationPrompts}
-        /></Suspense>}
-      </AnimatePresence>
-      <AnimatePresence>
-        {workflowTemplateOpen && <Suspense fallback={<div className="workflow-library-backdrop"><div className="prompt-library-state"><span className="prompt-library-spinner" /><strong>正在打开工作流…</strong></div></div>}><WorkflowTemplatePanel
-          open
-          onClose={() => setWorkflowTemplateOpen(false)}
-          onApply={applyWorkflowTemplate}
         /></Suspense>}
       </AnimatePresence>
       <AnimatePresence>
@@ -17825,9 +18272,14 @@ function App() {
                 </aside>
 
                 <section className="api-connection-pane">
-                  <div className="api-connection-detail" key={choosingApiProvider ? 'provider-list' : editingConnectionId}>
+                  <div className={`api-connection-detail${apiModelExpanded ? ' is-model-focused' : ''}`} key={choosingApiProvider ? 'provider-list' : editingConnectionId}>
+                  <div hidden={apiModelExpanded}>
                   <div className="api-detail-title">
                     <div className="api-detail-heading"><strong>{choosingApiProvider ? '新建连接' : apiDraft.name || 'API 连接'}</strong><span>{choosingApiProvider ? '选择厂商，连接你自己的模型' : apiAccountOnly ? `使用 ${accountName} 账号启用模型` : '编辑连接与启用模型'}</span></div>
+                    {!choosingApiProvider && (!apiAccountOnly || accountAuthorized) && draftModels.length > 0 && <button type="button" className="api-link-action" onClick={() => {
+                      setApiModelExpanded(true)
+                      window.requestAnimationFrame(() => apiModelSearchRef.current?.focus())
+                    }}><Search size={14} />浏览模型</button>}
                     {editingConnectionId === 'new' && !choosingApiProvider && <button type="button" className="api-link-action" disabled={apiConnectionBusy} onClick={() => setApiProviderPickerOpen(true)}>更换厂商</button>}
                     {editingConnectionId !== 'new' && (
                       <div className="api-detail-actions">
@@ -17936,39 +18388,48 @@ function App() {
                   </section>
                   </>}
 
-                  {!choosingApiProvider && (!apiAccountOnly || accountAuthorized) && <div className="api-model-catalog">
-                    <div className="api-model-tabs">
-                      {MODEL_CAPABILITIES.map((capability) => (
-                        <button type="button" key={capability} className={apiModelTab === capability ? 'is-active' : ''} onClick={() => setApiModelTab(capability)}>
-                          {MODEL_CAPABILITY_LABELS[capability]}
-                          <span>{draftModels.filter((model) => model.capability === capability).length}</span>
+                  </div>
+                  {!choosingApiProvider && (!apiAccountOnly || accountAuthorized) && <section className="api-model-catalog" aria-label="模型目录">
+                    <header className="api-catalog-header">
+                      <div><strong>模型目录</strong><small>{apiDraft.name || '当前连接'} · {draftModels.filter(({ enabled }) => enabled).length} 个已启用</small></div>
+                      <button type="button" className="api-link-action" onClick={() => {
+                        setApiModelExpanded(!apiModelExpanded)
+                        if (!apiModelExpanded) window.requestAnimationFrame(() => apiModelSearchRef.current?.focus())
+                      }}>{apiModelExpanded ? <ArrowLeft size={14} /> : <Maximize2 size={14} />}{apiModelExpanded ? '返回连接设置' : '展开目录'}</button>
+                    </header>
+                    <div className="api-catalog-search-row">
+                      <div className="api-catalog-search">
+                        <Search size={15} aria-hidden="true" />
+                        <input ref={apiModelSearchRef} type="search" aria-label="搜索模型名称或 ID" placeholder="搜索模型名称或 ID" value={apiModelSearch} onChange={(event) => setApiModelSearch(event.target.value)} />
+                      </div>
+                      <button type="button" className="api-link-action" aria-pressed={apiModelEnabledOnly} onClick={() => setApiModelEnabledOnly(!apiModelEnabledOnly)}>{apiModelEnabledOnly && <Check size={14} />}仅已启用</button>
+                    </div>
+                    <div className="api-model-tabs" role="group" aria-label="模型类型">
+                      {(['all', ...MODEL_CAPABILITIES] as const).map((capability) => (
+                        <button type="button" key={capability} aria-pressed={apiModelTab === capability} className={apiModelTab === capability ? 'is-active' : ''} onClick={() => setApiModelTab(capability)}>
+                          {capability === 'all' ? '全部' : MODEL_CAPABILITY_LABELS[capability]}
+                          <span>{capability === 'all' ? matchingApiModels.length : matchingApiModels.filter((model) => model.capability === capability).length}</span>
                         </button>
                       ))}
                     </div>
-                    {!apiAccountOnly && <div className="api-manual-model-add">
-                      <input value={manualModelId} disabled={apiConnectionBusy} placeholder="模型 ID（厂商无 /models 时手动添加）" onChange={(event) => setManualModelId(event.target.value)} onKeyDown={(event) => {
-                        if (event.key !== 'Enter') return
+                    {!apiAccountOnly && <details className="api-catalog-manual"><summary>手动添加模型</summary><form className="api-manual-model-add" onSubmit={(event) => {
                         event.preventDefault()
                         const id = manualModelId.trim()
-                        if (!id) return
-                        setDraftModels((current) => current.some((model) => model.id === id) ? current : [...current, { id, name: id, capability: apiModelTab, enabled: true }])
+                        if (!id || apiConnectionBusy) return
+                        setDraftModels((current) => current.some((model) => model.id === id) ? current : [...current, { id, name: id, capability: manualModelCapability, enabled: true }])
                         setManualModelIds((current) => current.includes(id) ? current : [...current, id])
                         setManualModelId('')
-                      }} />
-                      <button type="button" disabled={apiConnectionBusy} onClick={() => {
-                        const id = manualModelId.trim()
-                        if (!id) return
-                        setDraftModels((current) => current.some((model) => model.id === id) ? current : [...current, { id, name: id, capability: apiModelTab, enabled: true }])
-                        setManualModelIds((current) => current.includes(id) ? current : [...current, id])
-                        setManualModelId('')
-                      }}><Plus size={13} />添加{MODEL_CAPABILITY_LABELS[apiModelTab]}模型</button>
-                    </div>}
-                    <div className="api-model-list">
-                      {draftModels.filter((model) => model.capability === apiModelTab).map((model) => (
+                        setApiModelSearch(id)
+                      }}>
+                      <input value={manualModelId} disabled={apiConnectionBusy} aria-label="要添加的模型 ID" placeholder="输入模型 ID" onChange={(event) => setManualModelId(event.target.value)} />
+                      <button type="submit" disabled={apiConnectionBusy}><Plus size={13} />添加{MODEL_CAPABILITY_LABELS[manualModelCapability]}模型</button>
+                    </form></details>}
+                    <div className="api-model-list" ref={apiModelListRef}>
+                      {visibleApiModels.map((model) => (
                         <div key={model.id} className={`api-model-row ${model.enabled ? 'is-enabled' : ''}`}>
-                          <button type="button" className="api-model-main" disabled={apiConnectionBusy} onClick={() => setDraftModels((current) => current.map((item) => item.id === model.id ? { ...item, enabled: !item.enabled } : item))}>
+                          <button type="button" className="api-model-main" aria-pressed={model.enabled} disabled={apiConnectionBusy} onClick={() => toggleApiModelEnabled(model)}>
                             <span className="api-model-type">{MODEL_CAPABILITY_LABELS[model.capability].slice(0, 1)}</span>
-                            <span><strong>{formatModelDisplayName(model.name, { video: model.capability === 'video' })}</strong><small>ID: {model.id}</small></span>
+                            <span><strong title={model.name}>{formatModelDisplayName(model.name, { video: model.capability === 'video' })}</strong><small title={model.id}>{model.id}</small></span>
                             <span className="api-model-check">{model.enabled && <Check size={13} />}</span>
                           </button>
                           {!apiAccountOnly && <ApiModelCapabilitySelect
@@ -17977,15 +18438,14 @@ function App() {
                             modelName={formatModelDisplayName(model.name, { video: model.capability === 'video' })}
                             onChange={(capability) => {
                               setDraftModels((current) => current.map((item) => item.id === model.id ? { ...item, capability } : item))
-                              setApiModelTab(capability)
                             }}
                           />}
                         </div>
                       ))}
                       {!draftModels.length && <div className="api-model-empty"><Sparkles size={20} /><strong>还没有模型目录</strong><span>填写当前连接后，点击“获取当前连接模型”。系统不会请求其他连接。</span></div>}
-                      {draftModels.length > 0 && !draftModels.some((model) => model.capability === apiModelTab) && <div className="api-model-empty"><Info size={19} /><strong>没有{MODEL_CAPABILITY_LABELS[apiModelTab]}模型</strong><span>{apiModelTab === 'text' ? '如果这里只出现图像模型，文本节点会提示你切换连接。' : '可切换上方分类查看其他模型。'}</span></div>}
+                      {draftModels.length > 0 && !visibleApiModels.length && <div className="api-model-empty" role="status"><Search size={19} /><strong>没有匹配的模型</strong><span>试试模型 ID、缩短关键词，或切换到全部类型。</span><button type="button" className="api-link-action" onClick={() => { setApiModelSearch(''); setApiModelTab('all'); setApiModelEnabledOnly(false); apiModelSearchRef.current?.focus() }}>清除筛选</button></div>}
                     </div>
-                  </div>}
+                  </section>}
                   </div>
 
                   {!choosingApiProvider && (!apiAccountOnly || accountAuthorized) && <footer className="api-manager-footer">

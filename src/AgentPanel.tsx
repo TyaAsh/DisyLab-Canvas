@@ -9,7 +9,7 @@
  */
 import { Fragment, useEffect, useId, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
 import { compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
 import { resolveImageModelOptions, type ImageOutput, type ImageGenerationOptions } from './imageApi'
 import { imageOutputIntent } from './imageOutputIntent'
@@ -137,12 +137,14 @@ type Props = {
   onSkillAuthoringStarted: () => void
   onAttachSkill: (skill: SkillManifest) => void
   onRemoveSkill: () => void
-  filmRun: { nodeId: string; label: string } | null
+  filmRun: { nodeId: string; mediaNodeId?: string; label: string } | null
   filmReview: { id: string; stage: FilmReview; answer: (value: FilmReviewAnswer) => void } | null
   filmBusy: boolean
   onStopFilm: () => void
-  getFilmPlanInfo: (plan: NonNullable<AgentMessage['filmPlan']>) => { summary?: string; models?: string; cost?: string; issue?: string; settings?: boolean }
+  getFilmPlanInfo: (plan: NonNullable<AgentMessage['filmPlan']>) => { summary?: string; cost?: string; issue?: string; settings?: boolean; imageModels: AgentModelOption[]; videoModels: AgentModelOption[]; imageModelKey?: string; videoModelKey?: string }
+  onFilmModelChange: (messageId: string, kind: 'image' | 'video', key: string) => void
   onConfirmFilm: (messageId: string) => void
+  canResumeFilm: (nodeId: string) => boolean
   textModels: AgentModelOption[]
   imageModels: AgentModelOption[]
   videoModels: AgentModelOption[]
@@ -181,6 +183,8 @@ type Props = {
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
   onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni', team?: boolean) => void
+  onRetry: (messageId: string) => void
+  onOptimizePrompt: (prompt: string) => Promise<string>
   onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId'>>) => void
   onSelectPlanOptions: (groupPlanIds: string[], selectedPlanIds: string[]) => void
   onConfirmPlan: (id: string) => void
@@ -233,6 +237,16 @@ export function AgentPanel(props: Props) {
   }, [skillMenuOpen])
   const [mentionOpen, setMentionOpen] = useState(false)
   const [draftInvocationText, setDraftInvocationText] = useState('')
+  const [editorHeight, setEditorHeight] = useState<number>()
+  const editorResize = useRef<{ y: number; height: number } | null>(null)
+  const [optimizingPrompt, setOptimizingPrompt] = useState(false)
+  const [promptBackup, setPromptBackup] = useState<{ conversationId: string; contents: Node[] }>()
+  const [promptError, setPromptError] = useState('')
+  const conversationIdRef = useRef(props.activeConversationId)
+  conversationIdRef.current = props.activeConversationId
+  const latestUserMessage = props.messages.at(-2)
+  const canRetryLatest = latestMessage?.role === 'assistant' && latestUserMessage?.role === 'user'
+    && (latestMessage.retry?.userMessageId === latestUserMessage.id || latestMessage.content.startsWith('这次没有成功：'))
   const [activeReadyPlanId, setActiveReadyPlanId] = useState<string | null>(null)
   const [imageSettingsOpen, setImageSettingsOpen] = useState(false)
   const [customAspectRatioOpen, setCustomAspectRatioOpen] = useState(false)
@@ -677,6 +691,53 @@ export function AgentPanel(props: Props) {
     props.onReferencesChange(getEditorReferences())
     setDraftInvocationText(getInvocationText())
   }
+  const resizeEditor = (height: number) => {
+    const panelHeight = panelRef.current?.clientHeight ?? 500
+    setEditorHeight(Math.max(60, Math.min(Math.round(panelHeight * .56), height)))
+  }
+  const optimizePrompt = async () => {
+    const editor = editorRef.current
+    if (!editor || !getInvocationText() || optimizingPrompt) return
+    const conversationId = props.activeConversationId
+    const originalMarkup = editor.innerHTML
+    const contents = Array.from(editor.childNodes, (node) => node.cloneNode(true))
+    const draft = editor.cloneNode(true) as HTMLElement
+    const chips = Array.from(draft.querySelectorAll('.agent-inline-reference'))
+    chips.forEach((chip, index) => chip.replaceWith(document.createTextNode(` [[REF_${index + 1}]] `)))
+    const input = draft.innerText.trim()
+    setPromptError('')
+    setOptimizingPrompt(true)
+    try {
+      const output = (await props.onOptimizePrompt(input)).trim()
+      if (editorRef.current !== editor || editor.innerHTML !== originalMarkup || conversationIdRef.current !== conversationId) return
+      if (!output || output === input) return
+      const parts = output.split(/(\[\[REF_\d+\]\])/)
+      const tokens = parts.filter((part) => /^\[\[REF_\d+\]\]$/.test(part))
+      const chipByToken = new Map(chips.map((chip, index) => [`[[REF_${index + 1}]]`, chip]))
+      if (tokens.length !== chips.length || new Set(tokens).size !== chips.length || tokens.some((token) => !chipByToken.has(token))) {
+        setPromptError('优化结果未保留全部参考素材，请重试。')
+        return
+      }
+      editor.replaceChildren(...parts.map((part) => chipByToken.get(part) ?? document.createTextNode(part)))
+      setPromptBackup({ conversationId, contents })
+      savedRangeRef.current = null
+      syncReferencesFromEditor()
+    } catch {
+      if (conversationIdRef.current === conversationId) setPromptError('提示词优化失败，请重试。')
+    } finally {
+      setOptimizingPrompt(false)
+    }
+  }
+  const undoPromptOptimization = () => {
+    const editor = editorRef.current
+    if (!editor || promptBackup?.conversationId !== props.activeConversationId) return
+    editor.replaceChildren(...promptBackup.contents)
+    savedRangeRef.current = null
+    setPromptBackup(undefined)
+    setPromptError('')
+    syncReferencesFromEditor()
+    editor.focus()
+  }
   const addReference = (reference: AgentImageReference) => {
     referenceRegistryRef.current.set(reference.nodeId, reference)
     restoreSelection()
@@ -825,6 +886,8 @@ export function AgentPanel(props: Props) {
     props.onSend(value, invocationText, getEditorReferences().filter(modeAcceptsReference), !attachedSkill && mediaKind === 'video' ? videoGenerationMode : undefined, teamEnabled && !attachedSkill)
     if (editorRef.current) editorRef.current.innerHTML = ''
     setDraftInvocationText('')
+    setPromptBackup(undefined)
+    setPromptError('')
     setMentionOpen(false)
   }
   const attachSkill = (skill: SkillManifest) => {
@@ -1155,6 +1218,7 @@ export function AgentPanel(props: Props) {
           {props.messages.map((message) => <Fragment key={message.id}>
             <article className={`agent-message is-${message.role}`}>
               <p>{message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}</p>
+              {message === latestMessage && canRetryLatest && <button type="button" className="agent-draft-action agent-retry-message" disabled={props.busy} onClick={() => props.onRetry(message.id)}><RotateCcw size={13} />重新发送</button>}
               {message.role === 'user' && message.content.trim() && <button className="agent-message-memory" type="button" aria-label="将这条消息存为项目记忆" title="存为项目记忆" onClick={() => {
                 changeProjectView('memory')
                 setMemorySeed({ id: message.id, content: message.content.trim().slice(0, PROJECT_MEMORY_LENGTH) })
@@ -1165,20 +1229,34 @@ export function AgentPanel(props: Props) {
             {message.canvasEditDraft && !props.agentOnly && <AgentCanvasEditReview draft={message.canvasEditDraft}
               onChange={(update) => props.onCanvasDraftChange(message.id, update)} onSave={() => props.onSaveCanvasDraft(message.id)} onApply={() => props.onConfirmCanvasDraft(message.id)}
               onRevert={() => props.onRevertCanvasDraft(message.id)} onLocate={props.onLocateCanvasNode} />}
-            {message.filmPlan?.nodeId && <button type="button" className="agent-plan-card is-collapsed" onClick={() => props.onLocateCanvasNode(message.filmPlan!.nodeId!)}>
-              <span><Focus size={14} />查看画布中的成片任务</span>
-            </button>}
-            {message.filmPlan && !message.filmPlan.nodeId && message === props.messages.at(-1) && (() => {
-              const info = props.getFilmPlanInfo(message.filmPlan)
+            {message.filmPlan && (message.filmPlan.nodeId || message === props.messages.at(-1)) && (() => {
+              const plan = message.filmPlan
+              const info = plan.nodeId ? undefined : props.getFilmPlanInfo(plan)
               return <section className="agent-plan-card agent-film-card" aria-label="成片方案">
-                <strong>成片方案</strong>
-                <p>{info.summary ?? `${message.filmPlan.values.duration} 秒 · ${message.filmPlan.values.ratio}`}</p>
-                <details><summary>查看制作内容</summary><p>{message.filmPlan.subject}</p>{info.models && <p>{info.models}</p>}</details>
-                {info.issue ? <p role="status">{info.issue}</p> : <p>{info.cost}</p>}
+                <strong>{plan.nodeId ? '成片方案 · 已确认' : '成片方案'}</strong>
+                <p>{plan.confirmed?.summary ?? info?.summary ?? `${plan.values.duration} 秒 · ${plan.values.ratio}`}</p>
+                <details><summary>查看制作内容</summary><p>{plan.subject}</p>{plan.confirmed?.models && <p>{plan.confirmed.models}</p>}</details>
+                {info && <>
+                  {(['image', 'video'] as const).map((kind) => {
+                    const models = kind === 'image' ? info.imageModels : info.videoModels
+                    const label = kind === 'image' ? '生图模型' : '视频模型'
+                    return <div key={kind} className="agent-image-plan-field"><span>{label}</span><AgentSelect
+                      ariaLabel={label} value={(kind === 'image' ? info.imageModelKey : info.videoModelKey) ?? ''} placeholder={models.length ? `选择${label}` : `无可用${label}`} disabled={!models.length || props.busy || props.filmBusy}
+                      options={models.map(({ key, name, connectionName }) => ({ value: key, label: name, detail: connectionName, brand: getModelBrand(name) }))} icon={kind === 'image' ? <ImagePlus size={14} /> : <Film size={14} />}
+                      onChange={(key) => props.onFilmModelChange(message.id, kind, key)}
+                    /></div>
+                  })}
+                  <p>先生成参考图和关键帧，确认关键帧后再生成视频。</p>
+                </>}
+                {info?.issue ? <p role="status">{info.issue}</p> : info?.cost && <p>{info.cost}</p>}
                 <div className="agent-plan-actions">
-                  {info.settings
+                  {plan.nodeId ? <>
+                    <button type="button" className="agent-plan-cancel" onClick={() => props.onLocateCanvasNode(plan.nodeId!)}><Focus size={14} />查看画布中的成片任务</button>
+                    {props.canResumeFilm(plan.nodeId) && props.filmRun?.nodeId !== plan.nodeId && <button type="button" className="agent-plan-confirm" disabled={props.filmBusy || props.busy} onClick={() => props.onConfirmFilm(message.id)}>继续制作</button>}
+                  </>
+                    : info?.settings
                     ? <button type="button" className="agent-plan-cancel" onClick={props.onOpenApiSettings}>打开 API 设置</button>
-                    : <button type="button" className="agent-plan-confirm" disabled={Boolean(info.issue) || props.filmBusy || props.busy} onClick={() => props.onConfirmFilm(message.id)}>开始制作</button>}
+                    : <button type="button" className="agent-plan-confirm" disabled={Boolean(info?.issue) || props.filmBusy || props.busy} onClick={() => props.onConfirmFilm(message.id)}>开始制作</button>}
                 </div>
               </section>
             })()}
@@ -1193,6 +1271,7 @@ export function AgentPanel(props: Props) {
           {props.filmReview && <AgentFilmReview key={props.filmReview.id} stage={props.filmReview.stage} onAnswer={props.filmReview.answer} />}
           {props.filmRun && <div className="agent-film-progress" role="status">
             <span>{props.filmReview ? '等你确认后继续' : props.filmRun.label}</span>
+            {props.filmRun.mediaNodeId && <button type="button" className="agent-plan-cancel" onClick={() => props.onLocateCanvasNode(props.filmRun!.mediaNodeId!)}>定位当前节点</button>}
             <button type="button" className="agent-plan-cancel" onClick={props.onStopFilm}>停止制作</button>
           </div>}
         </div>
@@ -1231,8 +1310,33 @@ export function AgentPanel(props: Props) {
             <button type="button" aria-label={`移除 Skill ${attachedSkill.name}`} onClick={() => { props.onRemoveSkill(); editorRef.current?.focus() }}><X size={13} /></button>
           </div>}
           {guidedMessage?.questions && <AgentQuestions key={guidedMessage.id} questions={guidedMessage.questions} onSubmit={submit} />}
+          {!guidedMessage && <button
+            type="button"
+            className="agent-composer-resize"
+            aria-label="调整输入框高度"
+            title="上下拖动调整输入框高度"
+            onPointerDown={(event) => {
+              if (event.button !== 0 || !editorRef.current) return
+              event.preventDefault()
+              editorResize.current = { y: event.clientY, height: editorRef.current.offsetHeight }
+              event.currentTarget.setPointerCapture(event.pointerId)
+            }}
+            onPointerMove={(event) => {
+              const drag = editorResize.current
+              if (drag) resizeEditor(drag.height + drag.y - event.clientY)
+            }}
+            onLostPointerCapture={() => { editorResize.current = null }}
+            onDoubleClick={() => setEditorHeight(undefined)}
+            onKeyDown={(event) => {
+              if (!['ArrowUp', 'ArrowDown', 'Home'].includes(event.key) || !editorRef.current) return
+              event.preventDefault()
+              if (event.key === 'Home') setEditorHeight(undefined)
+              else resizeEditor(editorRef.current.offsetHeight + (event.key === 'ArrowUp' ? 20 : -20))
+            }}
+          ><span aria-hidden="true" /></button>}
           <div
             className={`agent-composer-input ${guidedMessage ? 'is-guided' : ''}`}
+            style={!guidedMessage && editorHeight !== undefined ? { height: editorHeight, maxHeight: '56cqh' } : undefined}
             ref={editorRef}
             contentEditable
             role="textbox"
@@ -1353,6 +1457,7 @@ export function AgentPanel(props: Props) {
               }}
             />)}
           </div>}
+          {promptError && <p className="agent-draft-error" role="status">{promptError}</p>}
           <footer className="agent-composer-footer">
             <div className="agent-composer-reference-bar">
               {!props.agentOnly && <button type="button" disabled={referencesDisabled} onMouseDown={rememberSelection} onClick={() => attachedSkill
@@ -1365,6 +1470,11 @@ export function AgentPanel(props: Props) {
               <input ref={uploadInputRef} className="agent-reference-upload-input" type="file" disabled={referencesDisabled} accept={acceptsVideoReference ? 'image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime' : 'image/png,image/jpeg,image/webp'} multiple aria-label="上传 Agent 参考素材" onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) void uploadReferences(files); event.target.value = '' }} />
             </div>
             <div className="agent-composer-actions">
+              {promptBackup?.conversationId === props.activeConversationId && <button type="button" className="agent-draft-action" disabled={optimizingPrompt} onClick={undoPromptOptimization}><RotateCcw size={13} />撤回</button>}
+              {!!draftInvocationText && <button type="button" className="agent-draft-action" disabled={optimizingPrompt || props.busy} onClick={() => {
+                if (!props.textModelKey) { props.onOpenApiSettings(); return }
+                void optimizePrompt()
+              }}>{optimizingPrompt ? <LoaderCircle size={13} className="is-spinning" /> : <Sparkles size={13} />}{optimizingPrompt ? '优化中' : '优化'}</button>}
               {props.busy && <button type="button" className="agent-stop-button" onClick={props.onStop} title="中止本次对话" aria-label="中止本次对话"><X size={16} /></button>}
               {!guidedMessage && <button type="button" className="agent-send-button" onClick={() => submit()} title={props.busy ? '发送并调整方向' : '发送'} aria-label={props.busy ? '发送并调整方向' : '发送'}><ArrowUp size={17} /></button>}
             </div>

@@ -19,12 +19,21 @@ export type AgentMessage = {
   questions?: AgentQuestion[]
   canvasEditDraft?: AgentCanvasEditDraft
   canvasEditTargetQuestion?: boolean
+  retry?: {
+    userMessageId: string
+    invocationText: string
+    videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
+    useTeam: boolean
+  }
   filmPlan?: {
     skillSlug: string
     subject: string
     values: Record<string, string | number | boolean>
     references: AgentImageReference[]
     nodeId?: string
+    imageModelKey?: string
+    videoModelKey?: string
+    confirmed?: { summary: string; models: string }
   }
   textNode?: {
     title: string

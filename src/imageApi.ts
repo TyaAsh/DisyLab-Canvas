@@ -809,6 +809,7 @@ function videoResultUrl(payload: unknown): string {
     output?.video_url, output?.videoUrl, output?.result_url, output?.resultUrl, output?.url,
   ]
   return candidates.find((value): value is string => typeof value === 'string' && /^https?:\/\//i.test(value))
+    ?? [record.data, record.result, record.result_data, record.output, record.outputs, record.video].flatMap((value) => Array.isArray(value) ? value : [value]).map(videoResultUrl).find(Boolean)
     ?? extractGeneratedImages(payload).find((item) => /^https?:\/\//i.test(item.url))?.url
     ?? ''
 }
@@ -1773,6 +1774,36 @@ function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video' | 'au
   throw new GenerationRequestError('platform', 'HFSY 仅支持公网素材链接', `请先将本地${label}上传到可公开访问的地址，再把 URL 用作参考素材。视频生成尚未提交。`)
 }
 
+export async function publishHfsyVideoReferenceImage(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob | string, signal?: AbortSignal) {
+  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
+  const failure = (detail: string) => new GenerationRequestError('platform', 'HFSY 参考图上传失败', `${detail}。视频生成尚未提交。`)
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考图服务需要 HTTPS 地址')
+  const image = typeof source === 'string' ? await readImageSourceBlob(source, signal, 'HFSY 参考图') : source
+  if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(image.type)) throw failure('请选择 PNG、JPEG、WebP 或 GIF 图片')
+  if (image.size > 20 * 1024 * 1024) throw failure('单张参考图最多 20 MB')
+  let response: Response
+  try {
+    response = await providerFetch(endpoint, {
+      method: 'POST', signal, body: image, redirect: 'error', ...{ maxRedirections: 0 },
+      headers: {
+        Authorization: `Bearer ${settings.apiKey.trim()}`,
+        'Content-Type': image.type,
+        'X-DisyLab-HFSY-Base': normalizedApiBaseUrl(settings.baseUrl),
+      },
+    })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw failure('无法连接 DisyLab 的参考图上传服务，请稍后重试')
+  }
+  const result = await response.json().catch(() => null) as { url?: string; error?: { message?: string } } | null
+  const url = result?.url && publicImageSourceUrl(result.url)
+  if (response.status === 201 && url) {
+    const published = new URL(url)
+    if (published.origin === endpoint.origin && published.pathname === endpoint.pathname) return url
+  }
+  throw failure(result?.error?.message || 'DisyLab 的参考图上传服务尚未启用或暂时不可用')
+}
+
 function hfsyFailureDetail(payload: unknown) {
   if (!payload || typeof payload !== 'object') return ''
   const root = payload as Record<string, unknown>
@@ -1921,11 +1952,20 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   if (createFailure) throw new GenerationRequestError('api', '视频接口拒绝了生成参数', createFailure)
   const taskId = extractTaskId(task)
   if (!taskId) throw new GenerationRequestError('platform', 'HFSY 没有返回视频任务编号', sanitizeAdminLogJson(task))
-  options.onTaskId?.(taskId)
+  await options.onTaskId?.(taskId)
+  return resumeHfsyVideoTask(settings, taskId, options, task)
+}
+
+export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: string, options: Pick<VideoGenerationOptions, 'signal' | 'onProgress'> = {}, initialTask?: unknown): Promise<GeneratedVideo> {
+  if (!isHfsyBaseUrl(settings.baseUrl)) throw new Error('请选择已有的 HFSY API 连接。')
+  if (!/^[\w-]{1,160}$/.test(taskId)) throw new Error('请输入有效的 HFSY 任务 ID。')
+  const model = settings.model.toLowerCase()
+  let task = initialTask
   const startedAt = Date.now()
   let pollSettings = settings
-  let queryParameter = false
   let pollMethod = model === 'muse-video' ? 'POST' : 'GET'
+  let queryParameter = pollMethod === 'GET'
+  let triedOtherQueryPath = false
   let consecutiveFailures = 0
   while (Date.now() - startedAt < 30 * 60_000) {
     const status = extractProviderTaskStatus(task)
@@ -1934,6 +1974,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     }
     const sourceUrl = videoResultUrl(task)
     if (sourceUrl && (!status || /^(?:success|succeeded|completed|complete)$/.test(status))) {
+      options.onProgress?.(100, 'downloading')
       let blob: Blob
       try {
         blob = await downloadGeneratedVideoBlob(sourceUrl, {
@@ -1949,7 +1990,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
       return { blob, taskId, progress: 100, sourceUrl }
     }
     options.onProgress?.(Math.min(99, providerTaskPercent(task) ?? 0), status || 'queued')
-    await waitForDelay(3_000, options.signal)
+    if (task) await waitForDelay(3_000, options.signal)
     try {
       const poll = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
         method: pollMethod,
@@ -1964,8 +2005,9 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
         pollMethod = 'GET'
         continue
       }
-      if (poll.status === 404 && !queryParameter) {
-        queryParameter = true
+      if ([404, 405].includes(poll.status) && !triedOtherQueryPath) {
+        triedOtherQueryPath = true
+        queryParameter = !queryParameter
         continue
       }
       if (!poll.ok) throw await createApiError(poll)

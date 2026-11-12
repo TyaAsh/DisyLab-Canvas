@@ -14,7 +14,7 @@
 <p align="center">
   <a href="https://disylab.pages.dev/">在线体验</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/">项目介绍</a> ·
-  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.0/DisyLab_2.0.0_x64-setup.exe">下载 Windows 版</a> ·
+  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.1/DisyLab_2.0.1_x64-setup.exe">下载 Windows 版</a> ·
   <a href="#本地运行">本地运行</a> ·
   <a href="#部署">部署</a> ·
   <a href="README.en.md">English</a> ·
@@ -79,7 +79,7 @@ DisyLab 将文本、参考图、生成图片、生成视频、资产和 Agent �
 
 ### Windows 桌面版
 
-- [下载 Windows x64 安装包](https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.0/DisyLab_2.0.0_x64-setup.exe)，也可在 [2.0 Release](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.0) 查阅发布说明与 SHA-256 校验文件。
+- [下载 Windows x64 安装包](https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.1/DisyLab_2.0.1_x64-setup.exe)，也可在 [2.0.1 发布页](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.1) 查阅发布说明与 SHA-256 校验文件。
 - 即梦账号通过官方 CLI 授权。Muse 账号在独立的桌面网页会话中登录，可用模型取决于账号权限。
 - macOS 版稍后推出。
 
@@ -87,6 +87,7 @@ DisyLab 将文本、参考图、生成图片、生成视频、资产和 Agent �
 
 - 项目、画布、资产、历史与 Agent 会话默认存储在 IndexedDB 或浏览器存储中。
 - API Key 只保存在 `sessionStorage`，不会写入项目文件或 `.disy` 工作区包。
+- 使用 HFSY 生成视频时，选中的本地参考图会临时上传到 DisyLab 的参考图服务，供 HFSY 读取，四小时后自动过期。
 - 媒体代理仅允许受支持的 HTTPS 域名，并限制重定向目标。
 - 请勿在 Issue、截图、聊天记录或提交中公开 API Key；发生泄露后应立即在服务商控制台撤销。
 

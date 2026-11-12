@@ -3,6 +3,7 @@ import type { SkillManifest } from '../../types'
 type FilmSkill = {
   slug: string
   name: string
+  hidden?: boolean
   description: string
   referenceVideo?: string
   sceneBeats: readonly string[]
@@ -31,8 +32,10 @@ const filmSkills: FilmSkill[] = [
       { name: 'performance', label: '主角职业与表演', type: 'string', required: true },
       { name: 'logo', label: '品牌 Logo 名称', type: 'string', required: true },
       { name: 'character', label: '角色类型', type: 'enum', enum: ['女主角', '男主角', '儿童', '动物或小怪物', '多角色'], default: '动物或小怪物' },
+      { name: 'characterCount', label: '多角色数量', type: 'number', min: 2, max: 4 },
       { name: 'look', label: '角色外形方向', type: 'enum', enum: ['圆润亲和', '利落活泼', '夸张喜剧', '按参考或自定义'], default: '圆润亲和' },
       { name: 'multiscene', label: '多场景转场', type: 'boolean', default: false },
+      { name: 'logoInLastFrame', label: '分镜末格已有品牌定格', type: 'boolean', default: false },
       { name: 'lyrics', label: '广告歌词 / 片尾短句（选填）', type: 'string' },
     ],
     workflow: `用原创的 3D 卡通角色和道具做一则品牌短片。角色造型强调清晰轮廓、表情和触感，避免把已有角色当作新品牌主角。
@@ -44,6 +47,7 @@ const filmSkills: FilmSkill[] = [
   },
   {
     slug: 'neo-chinese-tvc',
+    hidden: true,
     name: '新中式品牌 TVC',
     description: '从产品卖点提炼当代东方视觉，统一妆造、布景、镜头与声音。',
     sceneBeats: ["用东方材质与主光建立当代场景和产品轮廓。","微距展示产品材质、工艺或使用动作，保持包装一致。","由场景回到品牌产品主视觉，镜头稳定留出片尾排版空间。"],
@@ -68,6 +72,7 @@ const filmSkills: FilmSkill[] = [
   },
   {
     slug: 'gameplay-pv',
+    hidden: true,
     name: '游戏玩法概念 PV',
     description: '把玩法拆成可验证的演示片段，锁定镜头、角色和 HUD 的连续性。',
     sceneBeats: ["第三人称跟随镜头，展示任务指示和第一次输入反馈。","在同一地图延续任务目标，清楚展示交互及系统反馈。","表现挑战解决或战斗结算，保持角色、固定 HUD 锚点和世界方向。"],
@@ -91,6 +96,7 @@ const filmSkills: FilmSkill[] = [
   },
   {
     slug: 'symmetric-film',
+    hidden: true,
     name: '对称构图电影短片',
     description: '用对称构图、分区色彩和干脆的镜头节奏，把短故事转成可拍的方案。',
     sceneBeats: ["正面固定机位在中轴上建立主角、空间和道具母题。","匹配动作硬切到对称近景或俯拍，安排一个干脆的视觉反转。","回到中轴全景或平行横移收束笑点，维持主色和空间秩序。"],
@@ -107,6 +113,7 @@ const filmSkills: FilmSkill[] = [
   },
   {
     slug: 'toy-animation',
+    hidden: true,
     name: '手办微缩动画',
     description: '把手办图做成日式特摄、潮玩动画或毛毡定格短片，保留造型和配件。',
     sceneBeats: ["近景介绍同一手办角色及可触摸的微缩空间。","围绕一个明确小动作推进，保持配件、关节和材质连续。","用一个可读的动作结果收尾，给微缩布景和道具一个短停顿。"],
@@ -143,6 +150,7 @@ export const OFFICIAL_FILM_SKILLS: SkillManifest[] = filmSkills.map((film) => ({
   execution: 'configured',
   source: 'official',
   enabled: true,
+  factoryVisible: !film.hidden,
   parameters: [
     { name: 'subject', label: '创作简报', type: 'string', bind: 'prompt', required: true },
     { name: 'duration', label: '目标时长（秒）', type: 'number', min: film.duration.min, max: film.duration.max, default: film.duration.default },
