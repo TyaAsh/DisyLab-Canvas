@@ -5707,34 +5707,33 @@ function App() {
     return getGrsaiVideoCapabilities(connection?.baseUrl ?? '', data?.videoModelId ?? '')
   }, [apiSettings.connections])
 
-  const uploadVideoReferenceImage = useCallback((nodeId: string, input: File | string, slot: 'reference' | 'first' | 'last' = 'reference') => {
-    if (typeof input !== 'string' && !input.type.startsWith('image/')) { setToastMessage('请选择图片文件'); return false }
-    if (slot === 'reference') {
-      const target = nodes.find((item) => item.id === nodeId)
-      const mode = target?.data.videoGenerationMethod || 'text'
-      if (mode === 'omni') {
-        const connectedCount = edges.filter((edge) => edge.target === nodeId).reduce((count, edge) => {
-          const source = nodes.find((item) => item.id === edge.source)
-          return count + (source && (source.data.kind === 'image' || source.data.kind === 'upload') && source.data.imageUrl ? 1 : 0)
-        }, 0)
-        const localCount = (target?.data.referenceImages?.length ?? 0) + (target?.data.videoReferenceImageUrl ? 1 : 0)
-        const limit = getNodeHfsyVideo(target?.data)?.images ?? 9
-        if (connectedCount + localCount >= limit) { setToastMessage(`当前模型最多支持 ${limit} 张参考图`); return false }
-      }
-      if (mode === 'reference') {
-        const connectedCount = edges.filter((edge) => edge.target === nodeId).reduce((count, edge) => {
-          const source = nodes.find((item) => item.id === edge.source)
-          return count + (source && (source.data.kind === 'image' || source.data.kind === 'upload') && (source.data.imageUrl || source.data.referenceImageUrl) ? 1 : 0)
-        }, 0)
-        const localCount = target?.data.referenceImages?.length ?? 0
-        const limit = getNodeGrsaiVideo(target?.data)?.images ?? getNodeHfsyVideo(target?.data)?.images ?? 4
-        if (connectedCount + localCount >= limit) { setToastMessage(`图片参考模式最多支持 ${limit} 张图片`); return false }
-      }
+  const uploadVideoReferenceImage = useCallback((nodeId: string, input: File[] | string, slot: 'reference' | 'first' | 'last' = 'reference') => {
+    const files = typeof input === 'string' ? [] : input.filter((file) => file.type.startsWith('image/'))
+    if (typeof input !== 'string' && !files.length) { setToastMessage('请选择图片文件'); return false }
+    const target = nodes.find((item) => item.id === nodeId)
+    if (!target) return false
+    const mode = target.data.videoGenerationMethod ?? 'text'
+    const connections = edges.filter((edge) => edge.target === nodeId)
+    const limit = slot !== 'reference' ? 2
+      : mode === 'omni' ? getNodeHfsyVideo(target.data)?.images ?? 9
+      : mode === 'reference' ? getNodeGrsaiVideo(target.data)?.images ?? getNodeHfsyVideo(target.data)?.images ?? 4
+      : undefined
+    const limitMessage = slot !== 'reference' ? '首尾帧模式最多使用前两张图片' : `当前模型最多支持 ${limit} 张参考图`
+    let remaining = limit ?? files.length
+    if (slot === 'reference' && limit !== undefined) {
+      const connectedCount = connections.reduce((count, edge) => {
+        const source = nodes.find((item) => item.id === edge.source)
+        if (!source || (source.data.kind !== 'image' && source.data.kind !== 'upload')) return count
+        const primary = source.data.imageUrl || source.data.referenceImageUrl ? 1 : 0
+        const additional = source.data.kind === 'upload' ? source.data.referenceImages?.filter(({ url, mediaId }) => url || mediaId).length ?? 0 : 0
+        return count + primary + additional
+      }, 0)
+      const localCount = (target.data.referenceImages?.length ?? 0) + (target.data.videoReferenceImageUrl ? 1 : 0)
+      remaining = limit - connectedCount - localCount
+      if (remaining <= 0) { setToastMessage(limitMessage); return false }
     }
-    const connectedReferenceIds = edges
-      .filter((edge) => edge.target === nodeId)
-      .map((edge) => `connection-${edge.source}`)
-    const attachImage = (url: string, name: string, mediaId?: string) => {
+    const connectedReferenceIds = connections.map((edge) => `connection-${edge.source}`)
+    const attachImage = (url: string, name: string, mediaId?: string, frame = slot) => {
       setNodes((current) => current.map((node) => {
         if (node.id !== nodeId) return node
         const knownOrder = Array.from(new Set([
@@ -5750,8 +5749,8 @@ function App() {
           next.splice(Math.min(index, next.length), 0, id)
           return next
         }
-        if (slot === 'first') return { ...node, data: { ...node.data, videoFirstFrameUrl: url, videoFirstFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-first-frame', 0) } }
-        if (slot === 'last') return { ...node, data: { ...node.data, videoLastFrameUrl: url, videoLastFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-last-frame', 1) } }
+        if (frame === 'first') return { ...node, data: { ...node.data, videoFirstFrameUrl: url, videoFirstFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-first-frame', 0) } }
+        if (frame === 'last') return { ...node, data: { ...node.data, videoLastFrameUrl: url, videoLastFrameMediaId: mediaId, videoReferenceOrder: moveTo('video-last-frame', 1) } }
         const mode = node.data.videoGenerationMethod
         if (mode === 'omni' || mode === 'reference' || (mode === 'image' && mediaId && node.data.videoReferenceImageUrl)) {
           const reference = { id: `video-reference-image-${crypto.randomUUID()}`, name, url, mediaId }
@@ -5765,13 +5764,24 @@ function App() {
       attachImage(input, new URL(input).hostname)
       return true
     }
-    void (async () => {
+    const selectedFiles = files.slice(0, remaining)
+    void Promise.allSettled(selectedFiles.map(async (file) => {
       const mediaId = `image-${crypto.randomUUID()}`
-      await saveHistoryMedia({ id: mediaId, blob: input, fileName: input.name, createdAt: new Date().toISOString() })
-      const url = URL.createObjectURL(input)
+      await saveHistoryMedia({ id: mediaId, blob: file, fileName: file.name, createdAt: new Date().toISOString() })
+      const url = URL.createObjectURL(file)
       historyMediaObjectUrlsRef.current.set(mediaId, url)
-      attachImage(url, input.name, mediaId)
-    })().catch(() => setToastMessage('图片保存失败，请重新选择'))
+      return { url, name: file.name, mediaId }
+    })).then((saved) => {
+      saved.forEach((result, index) => {
+        if (result.status !== 'fulfilled') return
+        const { url, name, mediaId } = result.value
+        const frame = slot !== 'reference' && selectedFiles.length > 1 ? (index === 0 ? 'first' : 'last') : slot
+        attachImage(url, name, mediaId, frame)
+      })
+      if (saved.some((result) => result.status === 'rejected')) setToastMessage('部分图片保存失败，请重新选择')
+      else if (files.length > remaining) setToastMessage(limitMessage)
+      else if (slot === 'reference' && files.length > 1 && mode === 'image') setToastMessage('已添加多张图片，图生视频使用排序第一张作为首帧')
+    })
     return true
   }, [edges, getNodeGrsaiVideo, getNodeHfsyVideo, nodes, setNodes])
 
@@ -8123,9 +8133,8 @@ function App() {
     }
     if (mode === 'frames') {
       const existingCount = activeVideoReferences.filter((reference) => reference.kind === 'image' && reference.available !== false).length
-      images.slice(0, Math.max(0, 2 - existingCount)).forEach((file, index) => {
-        uploadVideoReferenceImage(activeVideoNode.id, file, existingCount + index === 0 ? 'first' : 'last')
-      })
+      const frames = images.slice(0, Math.max(0, 2 - existingCount))
+      if (frames.length) uploadVideoReferenceImage(activeVideoNode.id, frames, existingCount === 0 ? 'first' : 'last')
       if (existingCount >= 2 || images.length > 2 - existingCount) setToastMessage('首尾帧模式最多使用前两张图片')
       return
     }
@@ -8135,7 +8144,8 @@ function App() {
       const limits = getNodeHfsyVideo(activeVideoNode.data)
       const imageLimit = limits?.images ?? 9
       const videoLimit = limits?.videos ?? 3
-      images.slice(0, Math.max(0, imageLimit - imageCount)).forEach((file) => uploadVideoReferenceImage(activeVideoNode.id, file))
+      const referenceImages = images.slice(0, Math.max(0, imageLimit - imageCount))
+      if (referenceImages.length) uploadVideoReferenceImage(activeVideoNode.id, referenceImages)
       videos.slice(0, Math.max(0, videoLimit - videoCount)).forEach((file) => uploadVideoReference(activeVideoNode.id, file))
       if (images.length > imageLimit - imageCount || videos.length > videoLimit - videoCount) setToastMessage(`当前模型最多支持 ${imageLimit} 张参考图和 ${videoLimit} 个参考视频`)
       return
@@ -8144,11 +8154,12 @@ function App() {
       const imageCount = activeVideoReferences.filter((reference) => reference.kind === 'image').length
       const limit = getNodeGrsaiVideo(activeVideoNode.data)?.images ?? getNodeHfsyVideo(activeVideoNode.data)?.images ?? 4
       const remaining = Math.max(0, limit - imageCount)
-      images.slice(0, remaining).forEach((file) => uploadVideoReferenceImage(activeVideoNode.id, file, 'reference'))
+      const referenceImages = images.slice(0, remaining)
+      if (referenceImages.length) uploadVideoReferenceImage(activeVideoNode.id, referenceImages)
       if (videos.length || images.length > remaining) setToastMessage(`图片参考模式只支持图片，最多 ${limit} 张`)
       return
     }
-    images.forEach((file) => uploadVideoReferenceImage(activeVideoNode.id, file, 'reference'))
+    if (images.length) uploadVideoReferenceImage(activeVideoNode.id, images)
     if (images.length > 1 || videos.length) setToastMessage('图生视频只使用排序第一张图片作为首帧，其余图片可拖拽调整')
   }
   const activeImageAspectRatio = activeGenerationNode?.data.imageAspectRatio ?? '16:9'
@@ -14501,7 +14512,34 @@ function App() {
                    {activeVideoNode.data.videoGenerationMethod === 'image' && <button type="button" className="add-image-reference-button" title="上传首帧图片" aria-label="上传首帧图片" onClick={() => document.getElementById(`video-reference-image-${activeVideoNode.id}`)?.click()}><ImageUp size={15} /></button>}
                    {activeVideoNode.data.videoGenerationMethod === 'frames' && <><button type="button" className="add-image-reference-button" title="上传首帧图片" aria-label="上传首帧图片" onClick={() => document.getElementById(`video-reference-image-${activeVideoNode.id}`)?.click()}><BetweenHorizontalStart size={15} /></button><button type="button" className="add-image-reference-button" title="上传尾帧图片" aria-label="上传尾帧图片" onClick={() => document.getElementById(`video-reference-last-${activeVideoNode.id}`)?.click()}><BetweenHorizontalEnd size={15} /></button></>}
                    {activeVideoNode.data.videoGenerationMethod === 'reference' && <button type="button" className="add-image-reference-button" title="添加参考图" aria-label="添加参考图" onClick={() => document.getElementById(`video-reference-image-${activeVideoNode.id}`)?.click()}><ImageUp size={15} /></button>}
-                  {activeVideoNode.data.videoGenerationMethod !== 'text' && <><input id={`video-reference-image-${activeVideoNode.id}`} type="file" hidden accept="image/*" multiple={activeVideoNode.data.videoGenerationMethod === 'image'} onChange={(event) => { const files = Array.from(event.target.files ?? []); files.forEach((file) => uploadVideoReferenceImage(activeVideoNode.id, file, activeVideoNode.data.videoGenerationMethod === 'frames' ? 'first' : 'reference')); if (files.length > 1 && activeVideoNode.data.videoGenerationMethod === 'image') setToastMessage('图生视频只使用排序第一张图片作为首帧，其余图片可拖拽调整'); event.target.value = '' }} /><input id={`video-reference-last-${activeVideoNode.id}`} type="file" hidden accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadVideoReferenceImage(activeVideoNode.id, file, 'last'); event.target.value = '' }} /></>}
+                  {(activeVideoNode.data.videoGenerationMethod ?? 'text') !== 'text' && (
+                    <input
+                      id={`video-reference-image-${activeVideoNode.id}`}
+                      type="file"
+                      hidden
+                      accept="image/*"
+                      multiple
+                      onChange={(event) => {
+                        const files = Array.from(event.currentTarget.files ?? [])
+                        if (files.length) uploadVideoReferenceImage(activeVideoNode.id, files, activeVideoNode.data.videoGenerationMethod === 'frames' ? 'first' : 'reference')
+                        event.currentTarget.value = ''
+                      }}
+                    />
+                  )}
+                  {activeVideoNode.data.videoGenerationMethod === 'frames' && (
+                    <input
+                      id={`video-reference-last-${activeVideoNode.id}`}
+                      type="file"
+                      hidden
+                      accept="image/*"
+                      multiple
+                      onChange={(event) => {
+                        const files = Array.from(event.currentTarget.files ?? [])
+                        if (files.length) uploadVideoReferenceImage(activeVideoNode.id, files, 'last')
+                        event.currentTarget.value = ''
+                      }}
+                    />
+                  )}
                 </div>
                 {activeHfsyVideo && activeVideoNode.data.videoGenerationMethod && activeVideoNode.data.videoGenerationMethod !== 'text' && (
                   <details key={activeVideoNode.id} className="mx-3 my-1 text-xs">
@@ -16497,7 +16535,8 @@ function App() {
                   <button
                     type="button"
                     className="add-image-reference-button"
-                    title="上传参考图片"
+                    title="上传参考图片（支持多选）"
+                    aria-label="上传参考图片（支持多选）"
                     onClick={() => {
                       generationReferenceUploadModeRef.current = 'reference'
                       generationReferenceNodeIdRef.current = activeGenerationNode.id
