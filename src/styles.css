@@ -6374,3 +6374,8 @@ label.skill-category-member:hover, label.skill-category-member:has(input:checked
 .agent-image-operation-preview button:focus-visible { outline: 2px solid white; z-index: 1; }
 .canvas-video-recovery-task { overflow-wrap: anywhere; user-select: text; }
 .canvas-video-recovery :is(button:disabled, label:has(input:disabled)) { opacity: .55; cursor: default; }
+
+.agent-frame-preview-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr)); gap:6px; max-height:320px; overflow:auto; }
+.agent-frame-preview-grid button { display:grid; gap:4px; padding:4px; border:1px solid var(--accent-border); border-radius:8px; background:var(--surface-strong); color:var(--ink); }
+.agent-frame-preview-grid button[aria-pressed="false"] { opacity:.5; border-color:var(--line); }
+.agent-frame-preview-grid img { width:100%; aspect-ratio:16/9; object-fit:contain; border-radius:4px; }

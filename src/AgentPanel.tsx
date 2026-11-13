@@ -316,10 +316,10 @@ export function AgentPanel(props: Props) {
     `${props.videoDefaults.count}条`,
   ].join(' · ')
   const referencesDisabled = !attachedSkill && mediaKind === 'video' && videoGenerationMode === 'text'
-  const acceptsVideoReference = attachedSkill ? attachedSkill.kind === 'video' : mediaKind === 'video' && videoGenerationMode === 'omni'
+  const acceptsVideoReference = attachedSkill ? attachedSkill.kind === 'video' : mediaKind !== 'video' || videoGenerationMode === 'omni'
   const modeAcceptsReference = (reference: AgentImageReference) => {
     if (attachedSkill) return reference.kind !== 'video' || attachedSkill.kind === 'video'
-    if (mediaKind !== 'video') return reference.kind !== 'video'
+    if (mediaKind !== 'video') return true
     if (videoGenerationMode === 'text') return false
     return videoGenerationMode === 'omni' || reference.kind !== 'video'
   }
@@ -974,7 +974,7 @@ export function AgentPanel(props: Props) {
           if (plan.status === 'ready') setActiveReadyPlanId(plan.id)
         }}
       >
-        <header><span><ImagePlus size={15} />图像生成确认</span><em>{statusLabel}</em></header>
+        <header><span><ImagePlus size={15} />{plan.deliverableIndex === undefined ? '图像生成确认' : `${plan.deliverableIndex + 1}. ${plan.label || '图像'}`}</span><em>{statusLabel}</em></header>
         <div className="agent-image-plan-field agent-image-plan-model">
           <span>图像模型</span>
           <AgentSelect variant="floating" ariaLabel="选择本次图像模型" disabled={disabled} value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={14} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); props.onPlanChange(plan.id, { imageConnectionId, imageModelId }) }} />
@@ -982,7 +982,7 @@ export function AgentPanel(props: Props) {
         {!imageModelAvailable && <p className="agent-image-plan-notice">请选择可用的图像模型。</p>}
         <label className="agent-image-plan-field"><span>提示词</span><textarea value={plan.prompt} disabled={disabled} onChange={(event) => props.onPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑图像方案提示词" /></label>
         {plan.status === 'ready' && <div className="agent-image-plan-specs" role="group" aria-label="确认本次生成规格">
-          <div className="agent-image-plan-field"><span>生成张数</span><AgentSelect variant="floating" ariaLabel="生成张数" value={String(plan.count)} placeholder="张数" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 张` }))} icon={null} onChange={(value) => props.onPlanChange(plan.id, { count: Number(value) })} /></div>
+          {plan.deliverableIndex === undefined && <div className="agent-image-plan-field"><span>生成张数</span><AgentSelect variant="floating" ariaLabel="生成张数" value={String(plan.count)} placeholder="张数" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 张` }))} icon={null} onChange={(value) => props.onPlanChange(plan.id, { count: Number(value) })} /></div>}
           <div className="agent-image-plan-field"><span>画面比例</span><AgentSelect variant="floating" ariaLabel="画面比例" disabled={!imageModelAvailable} value={shown.aspectRatio ?? ''} placeholder="比例" options={parameters?.ratios ?? props.aspectOptions} icon={null} onChange={(aspectRatio) => props.onPlanChange(plan.id, { aspectRatio })} /></div>
           {(parameters?.resolutions ?? props.resolutionOptions).length > 0 && <div className="agent-image-plan-field"><span>清晰度</span><AgentSelect variant="floating" ariaLabel="清晰度" disabled={!imageModelAvailable} value={shown.resolution ?? ''} placeholder="清晰度" options={parameters?.resolutions ?? props.resolutionOptions} icon={null} onChange={(resolution) => props.onPlanChange(plan.id, { resolution })} /></div>}
           {(parameters?.qualities ?? props.detailOptions).length > 0 && <div className="agent-image-plan-field"><span>画质</span><AgentSelect variant="floating" ariaLabel="画质" disabled={!imageModelAvailable} value={shown.detail ?? ''} placeholder="画质" options={parameters?.qualities ?? props.detailOptions} icon={null} onChange={(detail) => props.onPlanChange(plan.id, { detail })} /></div>}
@@ -1005,7 +1005,7 @@ export function AgentPanel(props: Props) {
         {plan.status === 'ready' && <footer className="agent-plan-actions">
           <span className="agent-image-plan-confirm-note">{costLabel ? `预计 ${costLabel}` : '确认后才开始生成'}</span>
           <button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button>
-          <button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || outputIntent.blocked || !plan.prompt.trim()} title={outputIntent.blocked ? outputIntent.message : undefined} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />确认生成 {plan.count} 张</button>
+          <button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || outputIntent.blocked || !plan.prompt.trim()} title={outputIntent.blocked ? outputIntent.message : undefined} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />{plan.deliverableIndex === undefined ? `确认生成 ${plan.count} 张` : `确认第 ${plan.deliverableIndex + 1} 张`}</button>
         </footer>}
       </section>
     )
@@ -1066,7 +1066,7 @@ export function AgentPanel(props: Props) {
     </section>
   }
   const renderDirectionChoices = (plans: AgentImagePlan[]) => {
-    const selectablePlans = plans.filter((plan) => plan.status === 'proposed' || plan.status === 'ready')
+    const selectablePlans = plans.filter((plan) => plan.deliverableIndex === undefined && (plan.status === 'proposed' || plan.status === 'ready'))
     if (!selectablePlans.length) return null
     const planIds = selectablePlans.map((plan) => plan.id)
     const proposedIds = selectablePlans.filter((plan) => plan.status === 'proposed').map((plan) => plan.id)
@@ -1120,6 +1120,8 @@ export function AgentPanel(props: Props) {
   const renderAttachedPlans = (plans: AgentImagePlan[]) => (
     <>
       {renderDirectionChoices(plans)}
+      {plans.filter((plan) => plan.deliverableIndex !== undefined).length > 1 &&
+        <div className="agent-plan-summary"><ImagePlus size={15} />本轮共 {plans.filter((plan) => plan.deliverableIndex !== undefined).length} 张独立图片</div>}
       {plans.filter((plan) => plan.status !== 'proposed' && plan.status !== 'ready').map(renderPlan)}
       {plans.filter((plan) => plan.status === 'ready').map(renderPlan)}
     </>

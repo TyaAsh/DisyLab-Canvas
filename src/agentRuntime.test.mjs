@@ -384,3 +384,18 @@ test('Agent distinguishes requested alternatives from independent deliverables a
     aspectRatio: '9:16', duration: 10, resolution: '1080p', count: 1,
   })
 })
+
+test('explicit video frame and image counts describe different deliverables', async () => {
+  const operations = await import(asModule(await compileModule('./agentImageOperations.ts')))
+  const extraction = operations.inferAgentImageOperation('从视频里截取六张关键帧')
+  assert.equal(extraction.kind, 'video-frames')
+  assert.equal(extraction.requestedCount, 6)
+  assert.deepEqual(operations.videoFrameTimes(8, 4), [1, 3, 5, 7])
+  const specified = operations.inferAgentImageOperation('从视频在 1 秒、3.5 秒和 5 秒各抽帧')
+  assert.deepEqual(operations.videoFrameTimes(8, 3, specified.frameTimes), [1, 3.5, 5])
+  assert.throws(() => operations.videoFrameTimes(2, 3, specified.frameTimes), /超出/)
+  assert.equal(operations.inferAgentImageOperation('生成六张视频关键帧'), undefined)
+  assert.equal(agent.messageExpectsVideoPlans('生成六张视频关键帧'), false)
+  assert.equal(agent.requestedAgentImageCount('生成六张视频关键帧'), 6)
+  assert.equal(agent.requestedAgentImageCount('一共要十张独立图'), 10)
+})

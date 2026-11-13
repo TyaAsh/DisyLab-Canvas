@@ -100,6 +100,7 @@ export type AgentImagePlan = {
   count: number
   /** Separates cards with confirmed draft settings from older composer defaults. */
   hasDraftImageSpecs?: boolean
+  deliverableIndex?: number
   imageConnectionId?: string
   imageModelId?: string
   assistantMessageId?: string
@@ -271,6 +272,12 @@ function parsePlanCountText(value: string) {
   return CHINESE_DIGITS[value] ?? null
 }
 
+export function requestedAgentImageCount(content: string) {
+  const text = content.normalize('NFKC')
+  const count = /(?:生成|输出|制作|出|画|给我|要|一共|总共|共|设计)\s*(?:是|要)?\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:张|幅)/.exec(text)?.[1]
+  return count ? parsePlanCountText(count) : null
+}
+
 export function getRequestedAgentPlanCount(content: string) {
   const match = content.match(/(?:给|要|来|出|提供|做|准备|整理|生成|想要)?\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个|套|份|种|款)?\s*(?:不同的?|备选的?|独立的?)?\s*(?:方案|方向|创意|版本)/i)
   return match ? parsePlanCountText(match[1]) : null
@@ -346,6 +353,7 @@ export function requestsAgentCanvasTextEdits(content: string, hasSelectedText: b
 }
 
 export function messageExpectsVideoPlans(content: string) {
+  if (/(?:生成|制作|设计|出|画|输出).{0,16}(?:张|幅).{0,10}(?:关键帧|视频帧|分镜)/.test(content)) return false
   return /(?:生成|制作|创作|做|出|续写|延展).{0,12}(?:视频|短片|动画|动态画面)/i.test(content)
     || /(?:文生视频|图生视频|视频生成|生成视频|(?:让|把).{0,15}(?:图|画面).{0,8}动起来|\banimate (?:this|the) image\b)/i.test(content)
 }

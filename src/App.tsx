@@ -9,8 +9,8 @@
  */
 import { isDesktopApp } from './providerTransport'
 import { API_PROVIDER_PRESETS, apiProviderForBase, customApiConsoleUrl, type ApiProviderPreset } from './apiProviders'
-import { agentDirectionLimit, reconcileAgentImagePlanSpecs, requestsAgentImageEdit, resolveAgentImageDraftSettings, resolveAgentVideoDraftSettings } from './agent'
-import { imageRegionPixels, inferAgentImageOperation, legacyStoryboardOperation, parseStoryboardRegions, type AgentImageOperationDraft } from './agentImageOperations'
+import { agentDirectionLimit, reconcileAgentImagePlanSpecs, requestedAgentImageCount, requestsAgentImageEdit, resolveAgentImageDraftSettings, resolveAgentVideoDraftSettings } from './agent'
+import { imageRegionPixels, inferAgentImageOperation, legacyStoryboardOperation, parseStoryboardRegions, videoFrameTimes, type AgentImageOperationDraft } from './agentImageOperations'
 import { JimengConnection } from './JimengConnection'
 import { MuseAccount } from './MuseAccount'
 import { isMuseWebBase, MUSE_WEB_BASE, MUSE_WEB_CONNECTION, MUSE_WEB_MODELS } from './museWeb'
@@ -8802,6 +8802,40 @@ function App() {
   const selectedTextNodeReferences = activeTextReferences.filter((reference) => (
     reference.selected || (activeTextNode?.data.promptText ?? '').includes(reference.mention)
   ))
+  const readAgentVideoFrames = async (blob: Blob, signal: AbortSignal, use: (video: HTMLVideoElement, seek: (time: number) => Promise<void>) => Promise<void>) => {
+    const video = document.createElement('video')
+    const url = URL.createObjectURL(blob)
+    const wait = (eventName: 'loadeddata' | 'seeked', start: () => void) => new Promise<void>((resolve, reject) => {
+      signal.throwIfAborted()
+      const cleanup = () => {
+        video.removeEventListener(eventName, ready)
+        video.removeEventListener('error', error)
+        signal.removeEventListener('abort', abort)
+      }
+      const ready = () => { cleanup(); resolve() }
+      const error = () => { cleanup(); reject(new Error('无法解码原视频')) }
+      const abort = () => { cleanup(); reject(signal.reason) }
+      video.addEventListener(eventName, ready, { once: true })
+      video.addEventListener('error', error, { once: true })
+      signal.addEventListener('abort', abort, { once: true })
+      start()
+    })
+    try {
+      video.muted = true
+      video.preload = 'auto'
+      await wait('loadeddata', () => { video.src = url })
+      if (!video.videoWidth || !video.videoHeight) throw new Error('视频没有可读取的画面')
+      await use(video, (time) => {
+        signal.throwIfAborted()
+        return Math.abs(video.currentTime - time) < 0.001 ? Promise.resolve() : wait('seeked', () => { video.currentTime = time })
+      })
+    } finally {
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(url)
+    }
+  }
+
   const captureVideoReferenceFrames = async (reference: ActiveNodeReference, signal?: AbortSignal) => {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     const sourceNode = reference.sourceNodeId ? nodes.find((node) => node.id === reference.sourceNodeId) : undefined
@@ -11170,8 +11204,8 @@ function App() {
       return [{ nodeId: node.id, name: getNodeDisplayTitle(node.data), url: node.data.imageUrl, mediaId: node.data.imageMediaId, kind: 'image' as const }]
     }
     if (node.data.kind === 'video') {
-      const url = node.data.videoUrl || (node.data.videoMediaId ? historyMediaObjectUrlsRef.current.get(node.data.videoMediaId) : undefined)
-      if (url) return [{ nodeId: node.id, name: getNodeDisplayTitle(node.data), url, mediaId: node.data.videoMediaId, kind: 'video' as const }]
+      const url = videoNodeSource(node.data) || (node.data.videoMediaId ? historyMediaObjectUrlsRef.current.get(node.data.videoMediaId) : undefined)
+      if (url || node.data.videoMediaId) return [{ nodeId: node.id, name: getNodeDisplayTitle(node.data), url: url ?? '', mediaId: node.data.videoMediaId, kind: 'video' as const }]
     }
     return []
   })
@@ -11360,6 +11394,7 @@ function App() {
       setToastMessage('单次最多提供 20 个独立方案，请减少方案数量后重试')
       return
     }
+    const explicitImageCount = !skill && explicitPlanCount === null ? requestedAgentImageCount(invocationText) : null
     const directImagePlanRequested = messageRequestsDirectImagePlan(invocationText)
     const hasImageConversationContext = sentReferences.length > 0
       || history.slice(-6).some((message) => Boolean(message.references?.length))
@@ -11367,7 +11402,7 @@ function App() {
     const requestedPlanCount = directImagePlanRequested && explicitPlanCount === null ? 1 : agentDirectionLimit(invocationText)
     const expectsVideoPlans = !film && messageExpectsVideoPlans(invocationText)
     const userImageOutput = inferImageOutput(invocationText)
-    const expectsImagePlans = messageExpectsImagePlans(invocationText) || wantsImageEdit && sentReferences.some((reference) => reference.kind !== 'video')
+    const expectsImagePlans = messageExpectsImagePlans(invocationText) || (Boolean(explicitImageCount) && !expectsVideoPlans) || wantsImageEdit && sentReferences.some((reference) => reference.kind !== 'video')
       || (Boolean(userImageOutput) && !expectsVideoPlans && /生成|制作|画|做|输出|导出|做成|\b(?:generate|create|make|export)\b/i.test(invocationText))
       || (directImagePlanRequested && hasImageConversationContext && !expectsVideoPlans)
     const availableStyleKeywords = stylePresets
@@ -11400,17 +11435,22 @@ function App() {
     const continuesStoryboard = Boolean(previousStoryboard && /(?:拆出|拆成|拆分|保留).{0,12}(?:全部|前|\d{1,2}\s*张)/.test(invocationText))
     const imageOperation = !skill && !wantsTextEdit && !expectsVideoPlans && localDecision.mode !== 'inspect' && localDecision.mode !== 'plan'
       ? inferAgentImageOperation(invocationText) ?? (continuesStoryboard ? inferAgentImageOperation(`分镜图：${invocationText}`) : undefined) : undefined
+    const operationKind = imageOperation?.kind === 'video-frames' ? 'video' : 'image'
     const operationImages = (sentReferences.length || !continuesStoryboard ? sentReferences : previousStoryboard?.references ?? [])
-      .filter((reference) => reference.kind !== 'video')
+      .filter((reference) => (reference.kind ?? 'image') === operationKind)
     const mentionedImage = /@\[node:([^\]]+)\]/.exec(invocationText)?.[1]
-    const numberedImage = /(?:图|图片|参考图)\s*(\d+)/.exec(invocationText)?.[1]
-    const selectedImages = agentImageCandidates.filter((reference) => reference.kind === 'image' && selectedIds.has(reference.nodeId))
+    const numberedImage = (operationKind === 'video' ? /视频\s*(\d+)(?![\d秒])/ : /(?:图|图片|参考图)\s*(\d+)/).exec(invocationText)?.[1]
+    const selectedImages = agentImageCandidates.filter((reference) => reference.kind === operationKind && selectedIds.has(reference.nodeId))
     const operationSource = mentionedImage ? operationImages.find(({ nodeId }) => nodeId === mentionedImage)
       : numberedImage ? operationImages[Number(numberedImage) - 1]
       : operationImages.length === 1 ? operationImages[0]
       : !operationImages.length && selectedImages.length === 1 ? selectedImages[0] : undefined
     if (imageOperation && !operationSource) {
-      await finishWithQuestion('请上传一张原图，或在画布上选中要处理的图片。')
+      await finishWithQuestion(operationKind === 'video' ? '请上传一段视频，或在画布选中要抽帧的视频。' : '请上传一张原图，或在画布上选中要处理的图片。')
+      return
+    }
+    if (!imageOperation && !expectsVideoPlans && explicitImageCount && explicitImageCount > 20) {
+      await finishWithQuestion('单次最多准备 20 张独立生成图，请分批生成。')
       return
     }
     if (wantsTextEdit && !editTargets.length) {
@@ -11471,39 +11511,70 @@ function App() {
     setAgentBusy(true)
     try {
       if (imageOperation && operationSource) {
-        updateAgentRun(runId, { stage: imageOperation.kind === 'split' ? '识别分镜边界' : '读取原图' })
+        const isVideo = imageOperation.kind === 'video-frames'
+        updateAgentRun(runId, { stage: isVideo ? '读取原视频并预览抽帧' : imageOperation.kind === 'split' ? '识别分镜边界' : '读取原图' })
         const stored = operationSource.mediaId ? await loadHistoryMedia(operationSource.mediaId) : null
-        const blob = stored?.blob ?? await readImageSourceBlob(operationSource.url, controller.signal, '待处理原图')
-        const bitmap = await createImageBitmap(blob)
-        let previewUrl: string
-        try {
-          const scale = Math.min(1, 1536 / Math.max(bitmap.width, bitmap.height))
-          const canvas = document.createElement('canvas')
-          canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-          canvas.height = Math.max(1, Math.round(bitmap.height * scale))
-          const context = canvas.getContext('2d')
-          if (!context) throw new Error('无法创建原图预览')
-          context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-          previewUrl = canvas.toDataURL('image/jpeg', 0.9)
-        } finally {
-          bitmap.close()
+        const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)])
+        const sourceNode = nodes.find(({ id }) => id === operationSource.nodeId)
+        const blob = stored?.blob ?? (isVideo
+          ? (sourceNode?.data.kind === 'video' ? await readVideoNodeResult(sourceNode.data, signal) : await readRecoverableVideo({ sourceUrl: operationSource.url, signal })).blob
+          : await readImageSourceBlob(operationSource.url, signal, '待处理原图'))
+        let previewUrl = ''
+        let regions: AgentImageOperationDraft['regions'] = []
+        let frames: AgentImageOperationDraft['frames']
+        if (isVideo) {
+          const previews: NonNullable<AgentImageOperationDraft['frames']> = []
+          const count = imageOperation.frameTimes?.length ?? imageOperation.requestedCount ?? 4
+          if (count > 60) throw new Error('单次最多抽取 60 帧，请分批处理')
+          await readAgentVideoFrames(blob, signal, async (video, seek) => {
+            const canvas = document.createElement('canvas')
+            canvas.width = Math.min(240, video.videoWidth)
+            canvas.height = Math.max(1, Math.round(canvas.width * video.videoHeight / video.videoWidth))
+            const context = canvas.getContext('2d')
+            if (!context) throw new Error('无法创建视频帧预览')
+            let duration = video.duration
+            if (!Number.isFinite(duration)) {
+              await seek(1e10)
+              duration = Number.isFinite(video.duration) ? video.duration : video.currentTime
+            }
+            for (const time of videoFrameTimes(duration, count, imageOperation.frameTimes)) {
+              await seek(time)
+              context.drawImage(video, 0, 0, canvas.width, canvas.height)
+              previews.push({ time, previewUrl: canvas.toDataURL('image/jpeg', 0.72) })
+            }
+          })
+          frames = previews
+        } else {
+          const bitmap = await createImageBitmap(blob)
+          try {
+            const scale = Math.min(1, 1536 / Math.max(bitmap.width, bitmap.height))
+            const canvas = document.createElement('canvas')
+            canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+            canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+            const context = canvas.getContext('2d')
+            if (!context) throw new Error('无法创建原图预览')
+            context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+            previewUrl = canvas.toDataURL('image/jpeg', 0.9)
+          } finally {
+            bitmap.close()
+          }
+          regions = imageOperation.kind === 'split'
+            ? parseStoryboardRegions(await generateRemoteText(
+              { baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id },
+              '读取附图中的分镜拼图。只返回 JSON 对象 {"regions":[[左,上,右,下]]}。四个坐标为相对整张图的 0 到 1000 数值。识别实际存在的每一格，按从上到下、同一行从左到右排列。边界贴合各格画面，排除外框、格间留白和格外字幕。不同格子的尺寸可以不同。不要按预期数量硬分格，也不要把格子里的物体单独当作镜头。如果看不清或不是分镜拼图，返回空数组。',
+              { referenceImages: [previewUrl], signal: AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]) },
+            ))
+            : [[0, 0, 1000, 1000]] as AgentImageOperationDraft['regions']
         }
-        const regions = imageOperation.kind === 'split'
-          ? parseStoryboardRegions(await generateRemoteText(
-            { baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id },
-            '读取附图中的分镜拼图。只返回 JSON 对象 {"regions":[[左,上,右,下]]}。四个坐标为相对整张图的 0 到 1000 数值。识别实际存在的每一格，按从上到下、同一行从左到右排列。边界贴合各格画面，排除外框、格间留白和格外字幕。不同格子的尺寸可以不同。不要按预期数量硬分格，也不要把格子里的物体单独当作镜头。如果看不清或不是分镜拼图，返回空数组。',
-            { referenceImages: [previewUrl], signal: AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]) },
-          ))
-          : [[0, 0, 1000, 1000]] as AgentImageOperationDraft['regions']
         if (controller.signal.aborted) return
         const mediaId = stored?.id ?? `agent-operation-source-${crypto.randomUUID()}`
         const createdAt = new Date().toISOString()
         if (!stored) await saveHistoryMedia({ id: mediaId, blob, fileName: operationSource.name, createdAt })
         if (controller.signal.aborted) return
-        const draft: AgentImageOperationDraft = { ...imageOperation, source: { ...operationSource, mediaId }, previewUrl, regions }
+        const draft: AgentImageOperationDraft = { ...imageOperation, source: { ...operationSource, mediaId }, previewUrl, regions, frames }
         await commitAgentTurnAtOrigin(origin, userMessage, {
           id: `agent-message-${crypto.randomUUID()}`, role: 'assistant', createdAt,
-          content: imageOperation.kind === 'split' ? '已标出原图中的镜头，点编号可选取要拆出的画面。' : '已准备好按原画幅放大这张图。',
+          content: isVideo ? `已准备 ${frames?.length} 个${imageOperation.frameTimes ? '指定的' : '均匀分布的'}取帧点，可预览并选择要保存的画面。` : imageOperation.kind === 'split' ? '已标出原图中的镜头，点编号可选取要拆出的画面。' : '已准备好按原画幅放大这张图。',
           decision: { mode: 'execute', confidence: 1, needsApproval: true, reason: '本地图片处理' },
           imageOperation: draft,
         }, [], retryTurn?.failureId)
@@ -11553,7 +11624,10 @@ function App() {
         : '本轮不允许返回 textEdits。'
       const skillGuide = skill ? skillConversationInstructions(skill, imageReferences.length > 0) : ''
       const instruction = `你是 Disy 创意画布助手。请和用户中文对话、脑暴。${orchestrationGuide} ${textNodeGuide} ${directPlanGuide} ${decisionGuide} 禁止直接生成媒体，也禁止声称图片或视频已经生成；必须先提出对应确认方案。严格只返回 JSON，不要 Markdown：{"decision":{"mode":"plan","confidence":0.9,"needsApproval":false,"reason":"需要先确定方向"},"reply":"自然对话回复；文本/脚本请用清晰标题、列表与可复制内容组织","textNode":{"title":"仅最终交付物标题","content":"仅最终整合正文"},"imagePlanIntent":"alternatives|deliverables（多个图像项时填写）","imagePlans":[{"label":"图像方案一","prompt":"可直接用于生图的完整中文提示词","aspectRatio":"1:1","resolution":"1K","detail":"medium","count":1}],"questions":[{"prompt":"仅信息不足时的简短问题","options":["可选回答"],"example":"可省略"}],"videoPlans":[{"label":"视频方案一","prompt":"包含主体动作、镜头运动、场景和节奏的完整中文视频提示词","aspectRatio":"16:9","resolution":"720p","duration":4,"count":1}]}。decision 和 reply 必须返回；其他只返回任务需要的字段。不满足最终文本交付条件时省略 textNode；不需要图像时省略 imagePlans，不需要视频时省略 videoPlans。若用户明确要求多个创意方向，返回 ${requestedPlanCount} 个备选方案并标为 alternatives。目标明确且未要求多个方向时，直接返回一份可执行方案。用户要一组不同交付物（例如每个平台一张海报），使用 deliverables，按交付顺序分别给提示词和画幅，每项 count 为 1，最多 20 项。count 只表示同一提示词的重复输出份数。用户提到图1、图片1或参考图1时，都表示下方编号中的同一张图片；每份方案必须保留用户指定的图片编号及其用途，不得交换顺序。${canvasContextGuide}\n\n${resolvedContextGuide}${referenceUsageGuide ? `\n\n${referenceUsageGuide}` : ''}\n\n${agentReferenceGuide || '本次对话没有参考图。'}\n\n${styleInvocationWords.length ? `用户本次已调用风格预设：${invokedStylePresets.map((preset) => `${preset.name}（${preset.keyword}）`).join('、')}，确认卡会自动附带对应风格图。` : availableStyleKeywords.length ? `可用风格预设为：${availableStyleKeywords.join('；')}。仅当用户本次消息包含对应调用词时才附带风格图。` : '项目未设置可用的风格调用词。'}${skillGuide}\n\n${editGuide}\n\n${transcript}`
-      const taskInstruction = [instruction, projectMemoryPrompt(agentProjectSettings.memory)].filter(Boolean).join('\n\n')
+      const exactImageCount = expectsImagePlans && !expectsVideoPlans && explicitImageCount && explicitImageCount > 1 ? explicitImageCount : undefined
+      const exactImageGuide = exactImageCount
+        ? `用户要求 ${exactImageCount} 张独立图片。返回 imagePlanIntent=deliverables 和恰好 ${exactImageCount} 个 imagePlans，每项 count=1，每张单独说明用途、内容与比例。根据用户要的系列、分镜或不同视频关键帧逐张构思，保留已确认的角色、场景和风格。禁止将所有图写进一个 prompt 或输出拼图，除非用户明确要求拼图。` : ''
+      const taskInstruction = [instruction, exactImageGuide, projectMemoryPrompt(agentProjectSettings.memory)].filter(Boolean).join('\n\n')
       if (!teamEnabled) updateAgentRun(runId, { stage: '等待模型回复' })
       const requestText = async (prompt: string, timeoutMs = 90_000, model = selection) => {
         const timeout = AbortSignal.timeout(timeoutMs)
@@ -11581,10 +11655,11 @@ function App() {
         const imagePlans = canPropose && !wantsTextEdit && !film ? response.imagePlans ?? [] : []
         const videoPlans = canPropose && !wantsTextEdit && !film ? response.videoPlans ?? [] : []
         const filmReply = film && skill ? assessFilmReply(skill, response, localDecision, requestedFilmCard, imageReferences.length > 0) : null
+        const wrongImageCount = Boolean(exactImageCount && imagePlans.length !== exactImageCount)
         const needsRepair = canPropose && !film && (wantsTextEdit ? !textEdits.length :
-          (expectsImagePlans && (!imagePlans.length || explicitPlanCount !== null && imagePlans.length < explicitPlanCount))
+          (expectsImagePlans && (!imagePlans.length || wrongImageCount || explicitPlanCount !== null && imagePlans.length < explicitPlanCount))
           || (expectsVideoPlans && (!videoPlans.length || explicitPlanCount !== null && videoPlans.length < explicitPlanCount)))
-        return { canPropose, textEdits, imagePlans, videoPlans, filmReply, needsRepair, score: textEdits.length + imagePlans.length + videoPlans.length }
+        return { canPropose, textEdits, imagePlans, videoPlans, filmReply, needsRepair, wrongImageCount, score: textEdits.length + imagePlans.length + videoPlans.length }
       }
       let assessed = assess(parsed)
       const repairFilm = assessed.filmReply?.needsRepair
@@ -11605,14 +11680,14 @@ function App() {
         } catch { /* keep the first reply */ }
         if (controller.signal.aborted) return
       }
-      let parsedPlans = assessed.imagePlans
+      let parsedPlans = assessed.wrongImageCount ? [] : assessed.imagePlans
       let parsedVideoPlans = assessed.videoPlans
       const filmDraft = assessed.filmReply?.check?.draft
       const filmIssue = assessed.filmReply?.check?.issue
       const questions = filmIssue ? filmIssue.questions : parsed.questions
       const filmReplyNotice = filmIssue?.message ?? (assessed.filmReply && !filmDraft && (assessed.filmReply.missingCard || assessed.filmReply.claimsCard)
         ? (questions?.length ? '先确认下面的信息，再整理成片确认卡。' : '这次对话模型未能整理出可用的成片确认稿。已保留本轮对话，可以重试整理确认稿。') : undefined)
-      const fallbackNotice = assessed.needsRepair && (wantsTextEdit
+      const fallbackNotice = assessed.needsRepair && (assessed.wrongImageCount ? `这次模型只准备了 ${assessed.imagePlans.length} 项，要求是 ${exactImageCount} 张。请重试或换一个对话模型。` : wantsTextEdit
         ? '这次没有得到可应用的修改方案，画布未变更。可以缩小修改范围，或换一个对话模型再试。'
         : assessed.score ? '本次仅保留模型返回的可用方案。' : '模型没有返回可执行的方案。这次只保留文字回复，你可以补充要求或换一个对话模型。')
       const assistantMessage: AgentMessage = {
@@ -11631,13 +11706,14 @@ function App() {
         parsed.textNode = undefined
       }
       const createdPlans: StoredAgentPlan[] = []
-      const separateImageDeliverables = explicitPlanCount === null && parsed.imagePlanIntent === 'deliverables'
+      const separateImageDeliverables = Boolean(exactImageCount) || explicitPlanCount === null && parsed.imagePlanIntent === 'deliverables'
       parsedPlans = parsedPlans.slice(0, separateImageDeliverables ? 20 : requestedPlanCount).map((draft) => ({
         ...draft,
         prompt: ensureAgentPlanReferenceContext(draft.prompt, numberedUserRequest, sentReferences),
       }))
       if (parsedPlans.length) {
         const [imageConnectionId, imageModelId] = agentImageModelKey.split('::')
+        const generationReferences = sentReferences.filter((reference) => reference.kind !== 'video')
         const createdAt = new Date().toISOString()
         const needsChoice = parsedPlans.length > 1 && !separateImageDeliverables
         createdPlans.push(...parsedPlans.map((draft, index): AgentImagePlan => ({
@@ -11647,14 +11723,14 @@ function App() {
           prompt: userImageOutput && inferImageOutput(draft.prompt) !== userImageOutput
             ? `${draft.prompt}\n输出格式：${IMAGE_OUTPUT_LABELS[userImageOutput]}。`
             : draft.prompt,
-          referenceNodeIds: sentReferences.map((item) => item.nodeId),
-          references: sentReferences,
+          referenceNodeIds: generationReferences.map((item) => item.nodeId),
+          references: generationReferences,
           contextReferences: resolvedContextReferences,
           invokedStyleReferences,
           styleInvocationWord: styleInvocationWords.length ? styleInvocationWords.join('、') : undefined,
           invokedStylePresets,
           ...resolveAgentImageDraftSettings(separateImageDeliverables ? '' : invocationText, draft, agentImageDefaults),
-          ...(separateImageDeliverables ? { count: 1 } : {}),
+          ...(separateImageDeliverables ? { count: 1, deliverableIndex: index } : {}),
           hasDraftImageSpecs: true,
           imageConnectionId,
           imageModelId,
@@ -12047,10 +12123,12 @@ function App() {
     agentPlanLocksRef.current.add(planId)
     const origin = { projectId: activeProjectId, canvasId: activeCanvasId, sessionId: agentConversationId }
     agentImageRunOriginsRef.current.set(nodeId, { ...origin, planId })
-    const flowPosition = screenToFlowPosition({ x: Math.max(360, window.innerWidth - (agentOpen ? 720 : 420)), y: 230 })
+    const start = screenToFlowPosition({ x: Math.max(360, window.innerWidth - (agentOpen ? 720 : 420)), y: 230 })
+    const index = plan.deliverableIndex
+    const flowPosition = index === undefined ? start : { x: start.x + index % 4 * 480, y: start.y + Math.floor(index / 4) * 480 }
     // Freeze the confirmed card values once. The node geometry, persisted metadata,
     // request payload and history must all describe this exact generation attempt.
-    const confirmedOptions = normalizeImageGenerationOptions(plan)
+    const confirmedOptions = normalizeImageGenerationOptions(plan.deliverableIndex === undefined ? plan : { ...plan, count: 1 })
     const requestOptions = resolveImageModelOptions(model.connection.baseUrl, model.model.id, {
       ...confirmedOptions,
       output: outputIntent.output,
@@ -12067,7 +12145,7 @@ function App() {
       style: confirmedNodeSize,
       data: {
         kind: 'image',
-        title: '图像',
+        title: index === undefined ? '图像' : plan.label || `图像 ${index + 1}`,
         body: plan.prompt,
         status: '生成中',
         imageAspectRatio: aspectRatio,
@@ -12098,7 +12176,7 @@ function App() {
           canvasId: origin.canvasId,
           title: agentMessages[0]?.content.slice(0, 36) || '新的对话',
           messages: agentMessages,
-          plans: nextPlans,
+          plans: [...nextPlans, ...agentVideoPlans, ...agentTextPlans],
           selectedChatModelId: agentTextModelKey,
           selectedImageModelId: agentImageModelKey,
           selectedVideoModelId: agentVideoModelKey,
@@ -12190,7 +12268,7 @@ function App() {
           generationError: undefined,
           status: completedStatus,
         },
-      } : node))
+      } : node), plan.deliverableIndex !== undefined)
       await patchAgentPlansAtOrigin(origin, (current) => current.map((item) => item.id === planId ? {
         ...item,
         status: wasInterrupted ? 'cancelled' : partialFailure ? 'failed' : 'completed',
@@ -12657,7 +12735,6 @@ function App() {
     try {
       const stored = draft.source.mediaId ? await loadHistoryMedia(draft.source.mediaId) : null
       if (!stored) throw new Error('原图文件已丢失，请重新上传后再处理')
-      const bitmap = await createImageBitmap(stored.blob)
       const output: CanvasNode[] = []
       const createdAt = new Date().toISOString()
       const canvas = document.createElement('canvas')
@@ -12665,36 +12742,54 @@ function App() {
       const source = nodes.find((node) => node.id === draft.source.nodeId)
       const x = nodes.reduce((right, node) => Math.max(right, node.position.x + (node.measured?.width || Number(node.style?.width) || 320)), source?.position.x ?? 0) + 100
       const y = source?.position.y ?? 0
-      try {
-        if (!context) throw new Error('无法创建图片处理画布')
-        for (const index of indices) {
-          if (controller.signal.aborted) throw new Error('图片处理已取消')
-          const region = draft.regions[index]
-          if (!region) throw new Error('选中的镜头已不存在')
-          const pixels = imageRegionPixels(region, bitmap.width, bitmap.height, draft.longEdge)
-          canvas.width = pixels.width
-          canvas.height = pixels.height
-          context.imageSmoothingQuality = 'high'
-          context.drawImage(bitmap, pixels.left, pixels.top, pixels.cropWidth, pixels.cropHeight, 0, 0, pixels.width, pixels.height)
-          const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码输出图片')), 'image/png'))
-          const id = `agent-image-operation-${messageId}-${index}`
-          const mediaId = `${id}-media`
-          const title = draft.kind === 'split' ? `镜头 ${String(index + 1).padStart(2, '0')}` : `${draft.source.name.replace(/\.[^.]+$/, '')} · 放大`
-          const fileName = `${title}.png`
-          await saveHistoryMedia({ id: mediaId, blob, fileName, createdAt })
-          const previousUrl = historyMediaObjectUrlsRef.current.get(mediaId)
-          if (previousUrl) URL.revokeObjectURL(previousUrl)
-          const imageUrl = URL.createObjectURL(blob)
-          historyMediaObjectUrlsRef.current.set(mediaId, imageUrl)
-          const mediaAspectRatio = pixels.width / pixels.height
-          output.push({
-            id, type: 'disy', position: { x: x + (output.length % 4) * 480, y: y + Math.floor(output.length / 4) * 480 },
-            style: getImageGenerationNodeSize(mediaAspectRatio),
-            data: { kind: 'upload', title, body: '', status: '已完成', imageUrl, imageMediaId: mediaId, mediaAspectRatio, fileName, generationSourceNodeId: draft.source.nodeId },
-          })
+      if (!context) throw new Error('无法创建图片处理画布')
+      const saveImage = async (index: number) => {
+        const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码输出图片')), 'image/png'))
+        const id = `agent-image-operation-${messageId}-${index}`
+        const mediaId = `${id}-media`
+        const title = draft.kind === 'video-frames' ? `视频帧 ${String(index + 1).padStart(2, '0')} · ${draft.frames![index].time.toFixed(2)}s` : draft.kind === 'split' ? `镜头 ${String(index + 1).padStart(2, '0')}` : `${draft.source.name.replace(/\.[^.]+$/, '')} · 放大`
+        const fileName = `${title}.png`
+        await saveHistoryMedia({ id: mediaId, blob, fileName, createdAt })
+        const previousUrl = historyMediaObjectUrlsRef.current.get(mediaId)
+        if (previousUrl) URL.revokeObjectURL(previousUrl)
+        const imageUrl = URL.createObjectURL(blob)
+        historyMediaObjectUrlsRef.current.set(mediaId, imageUrl)
+        const mediaAspectRatio = canvas.width / canvas.height
+        output.push({
+          id, type: 'disy', position: { x: x + (output.length % 4) * 480, y: y + Math.floor(output.length / 4) * 480 },
+          style: getImageGenerationNodeSize(mediaAspectRatio),
+          data: { kind: 'upload', title, body: '', status: '已完成', imageUrl, imageMediaId: mediaId, mediaAspectRatio, fileName, generationSourceNodeId: draft.source.nodeId },
+        })
+      }
+      if (draft.kind === 'video-frames') {
+        await readAgentVideoFrames(stored.blob, AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]), async (video, seek) => {
+          canvas.width = video.videoWidth
+          canvas.height = video.videoHeight
+          for (const index of indices) {
+            const frame = draft.frames?.[index]
+            if (!frame) throw new Error('选中的视频帧已不存在')
+            await seek(frame.time)
+            context.drawImage(video, 0, 0)
+            await saveImage(index)
+          }
+        })
+      } else {
+        const bitmap = await createImageBitmap(stored.blob)
+        try {
+          for (const index of indices) {
+            controller.signal.throwIfAborted()
+            const region = draft.regions[index]
+            if (!region) throw new Error('选中的镜头已不存在')
+            const pixels = imageRegionPixels(region, bitmap.width, bitmap.height, draft.longEdge)
+            canvas.width = pixels.width
+            canvas.height = pixels.height
+            context.imageSmoothingQuality = 'high'
+            context.drawImage(bitmap, pixels.left, pixels.top, pixels.cropWidth, pixels.cropHeight, 0, 0, pixels.width, pixels.height)
+            await saveImage(index)
+          }
+        } finally {
+          bitmap.close()
         }
-      } finally {
-        bitmap.close()
       }
       if (controller.signal.aborted) throw new Error('图片处理已取消')
       const append = (current: CanvasNode[]) => {
