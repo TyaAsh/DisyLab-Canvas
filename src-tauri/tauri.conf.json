@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DisyLab",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "identifier": "com.disylab.canvas",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data: https: http:; media-src 'self' blob: data: https: http:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost https: http:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data: https: http:; media-src 'self' blob: data: https: http:; connect-src 'self' blob: data: ipc: http://ipc.localhost https://ipc.localhost https: http:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'"
     }
   },
   "bundle": {

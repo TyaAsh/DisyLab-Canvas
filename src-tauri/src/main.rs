@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod desktop_storage;
 mod jimeng;
 mod muse;
 
@@ -150,6 +151,7 @@ fn update_window_region(window: &tauri::WebviewWindow) {
 
 fn main() {
     tauri::Builder::default()
+        .manage(desktop_storage::Storage::default())
         .plugin(tauri_plugin_http::init())
         .setup(|app| {
             use tauri::webview::NewWindowResponse;
@@ -192,6 +194,11 @@ fn main() {
             jimeng::jimeng_open_login,
             muse::muse_open_account,
             muse::muse_web,
+            desktop_storage::desktop_storage_location,
+            desktop_storage::desktop_choose_storage,
+            desktop_storage::desktop_start_write,
+            desktop_storage::desktop_write_chunk,
+            desktop_storage::desktop_finish_write,
             open_provider_url
         ])
         .run(tauri::generate_context!())

@@ -211,7 +211,15 @@ export async function blobToDataUrl(blob: Blob) {
   })
 }
 
-const MEDIA_KEYS = new Set(['url', 'imageUrl', 'styleReferenceUrl', 'referenceImageUrl'])
+const MEDIA_KEYS = new Set(['url', 'imageUrl', 'styleReferenceUrl', 'referenceImageUrl', 'videoUrl'])
+const MEDIA_ID_KEYS = ['mediaId', 'imageMediaId', 'referenceImageMediaId', 'videoMediaId', 'videoReferenceMediaId',
+  'videoReferenceImageMediaId', 'videoFirstFrameMediaId', 'videoLastFrameMediaId'] as const
+const MEDIA_ID_BY_URL: Record<string, string | undefined> = {
+  url: 'mediaId',
+  imageUrl: 'imageMediaId',
+  referenceImageUrl: 'referenceImageMediaId',
+  videoUrl: 'videoMediaId',
+}
 
 function mediaSourceKey(source: string, kind: NonNullable<BundleMediaEntry['kind']>) {
   return `${kind}:${source}`
@@ -233,7 +241,10 @@ export function collectReferencedMediaIds(value: unknown, ids = new Set<string>(
     return ids
   }
   const record = value as Record<string, unknown>
-  if (typeof record.mediaId === 'string' && record.mediaId) ids.add(record.mediaId)
+  for (const key of MEDIA_ID_KEYS) {
+    const id = record[key]
+    if (typeof id === 'string' && id) ids.add(id)
+  }
   Object.values(record).forEach((child) => collectReferencedMediaIds(child, ids))
   return ids
 }
@@ -281,6 +292,12 @@ export async function extractMediaIntoBundle(
       if (!source || source.startsWith(BUNDLE_MEDIA_PREFIX)) continue
       if (!/^(?:https?:|blob:|data:)/i.test(source)) continue
 
+      const savedId = record[MEDIA_ID_BY_URL[key] ?? '']
+      if (typeof savedId === 'string' && media.has(savedId)) {
+        // A saved blob is restored by its ID on import. Never export an expiring blob URL.
+        record[key] = ''
+        continue
+      }
       const intendedKind: NonNullable<BundleMediaEntry['kind']> = mediaId && key === 'imageUrl' ? 'history' : 'asset'
       const existingId = sourceIds.get(mediaSourceKey(source, intendedKind))
       if (existingId && media.has(existingId)) {

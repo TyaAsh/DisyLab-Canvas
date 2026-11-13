@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import { isDesktopApp } from './providerTransport'
+import { chooseDesktopStorage, desktopWorkspaceFile, readDesktopStorage, writeDesktopWorkspace } from './desktopStorage'
 import { API_PROVIDER_PRESETS, apiProviderForBase, customApiConsoleUrl, type ApiProviderPreset } from './apiProviders'
 import { agentDirectionLimit, reconcileAgentImagePlanSpecs, requestedAgentImageCount, requestsAgentImageEdit, resolveAgentImageDraftSettings, resolveAgentVideoDraftSettings } from './agent'
 import { imageRegionPixels, inferAgentImageOperation, legacyStoryboardOperation, parseStoryboardRegions, videoFrameTimes, type AgentImageOperationDraft } from './agentImageOperations'
@@ -3781,6 +3782,13 @@ function App() {
   const [storageInsights, setStorageInsights] = useState<{ localBytes: number; historyBytes: number; historyCount: number }>({ localBytes: 0, historyBytes: 0, historyCount: 0 })
   const [storageScanning, setStorageScanning] = useState(false)
   const [storageOpen, setStorageOpen] = useState(false)
+  const [desktopStoragePath, setDesktopStoragePath] = useState<string | null>(null)
+  const [desktopStorageBusy, setDesktopStorageBusy] = useState(false)
+  const [desktopStorageError, setDesktopStorageError] = useState('')
+  useEffect(() => {
+    if (!isDesktopApp()) return
+    void readDesktopStorage().then(setDesktopStoragePath).catch((error) => setDesktopStorageError(String(error)))
+  }, [])
   const [connectionHealthByConnection, setConnectionHealthByConnection] = useState<Record<string, 'checking' | 'online' | 'offline'>>({})
   const [providerPricesByConnection, setProviderPricesByConnection] = useState<Record<string, Record<string, ProviderModelPrice>>>({})
   const [creditsLoading, setCreditsLoading] = useState(false)
@@ -6052,6 +6060,11 @@ function App() {
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return
       const key = event.key.toLowerCase()
       const target = event.target
+      const selection = window.getSelection()
+      if (key === 'c' && selection && !selection.isCollapsed && selection.toString()) {
+        internalNodePastePreferredRef.current = false
+        return
+      }
       if (target instanceof HTMLElement && target.closest('#disy-agent-panel')) {
         if (key === 'c') internalNodePastePreferredRef.current = false
         return
@@ -6826,14 +6839,16 @@ function App() {
         updatedAt: new Date().toISOString(),
       } : canvas))
       if (!silent) setToastMessage('项目已保存到本机')
+      return true
     } catch {
       setCanvasSaved(false)
       setToastMessage('项目保存失败，请检查浏览器存储权限')
+      return false
     }
   }
 
   autoSaveActionRef.current = () => {
-    void saveCanvasState(canvasName, true)
+    void saveCanvasWithDesktopCopy(true)
   }
 
   const patchCanvasNodesAtOrigin = async (
@@ -7453,7 +7468,30 @@ function App() {
     setToastMessage(deletingAll ? '全部项目已删除' : `已删除 ${ids.length} 个项目`)
   }
 
-  const exportWholeWorkspace = async (options?: { asBackup?: boolean; manageProgress?: boolean; scope?: 'workspace' | 'projects' | 'canvases'; projectIds?: string[]; canvasIds?: string[] }) => {
+  const saveDesktopCopy = async (choose = false, silent = false) => {
+    if (desktopStorageBusy || transferBusy) return
+    setDesktopStorageBusy(true)
+    setDesktopStorageError('')
+    try {
+      const path = choose ? await chooseDesktopStorage() : desktopStoragePath
+      if (!path) return
+      if (choose) setDesktopStoragePath(path)
+      await exportWholeWorkspace({ desktopCopy: true, manageProgress: false })
+      if (!silent) setToastMessage(`已保存 ${desktopWorkspaceFile}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setDesktopStorageError(message)
+      setToastMessage(`写入本地工作区失败：${message}`)
+    } finally {
+      setDesktopStorageBusy(false)
+    }
+  }
+  const saveCanvasWithDesktopCopy = async (silent = false) => {
+    if (desktopStoragePath && !desktopStorageBusy && !transferBusy) await saveDesktopCopy(false, silent)
+    else await saveCanvasState(canvasName, silent)
+  }
+
+  const exportWholeWorkspace = async (options?: { desktopCopy?: boolean; asBackup?: boolean; manageProgress?: boolean; scope?: 'workspace' | 'projects' | 'canvases'; projectIds?: string[]; canvasIds?: string[] }) => {
     const asBackup = Boolean(options?.asBackup)
     const manageProgress = options?.manageProgress ?? true
     const scope = options?.scope ?? 'workspace'
@@ -7481,7 +7519,8 @@ function App() {
       }) => Promise<SaveFileHandle>
     }).showSaveFilePicker
     let saveHandle: SaveFileHandle | null = null
-    if (!asBackup && savePicker) {
+    const saveToDesktop = Boolean(isDesktopApp() && (options?.desktopCopy || desktopStoragePath))
+    if (!asBackup && !saveToDesktop && savePicker) {
       try {
         saveHandle = await savePicker({
           suggestedName: fileName,
@@ -7495,9 +7534,9 @@ function App() {
     }
     if (manageProgress) setTransferProgress(asBackup ? '正在备份当前项目…' : '正在打包完整项目…')
     try {
-      setTransferProgress(asBackup ? '正在保存当前工作区…' : '正在保存画布与对话…')
-      await saveCanvasState(canvasName, true)
-      await saveAgentSession({
+      if (manageProgress) setTransferProgress(asBackup ? '正在保存当前工作区…' : '正在保存画布与对话…')
+      if (workspaceProjects.length && !await saveCanvasState(canvasName, true)) throw new Error('当前画布保存失败')
+      if (workspaceProjects.length) await saveAgentSession({
         id: agentConversationId,
         projectId: activeProjectId,
         canvasId: activeCanvasId,
@@ -7522,7 +7561,7 @@ function App() {
 
       // Mutate the export snapshot in place so huge data-URLs are replaced with
       // media refs before JSON.stringify — never clone the fat graph first.
-      setTransferProgress(asBackup ? '正在写入备份包…' : '正在打包项目数据…')
+      if (manageProgress) setTransferProgress(asBackup ? '正在写入备份包…' : '正在打包项目数据…')
       const snapshot = await exportWorkspaceSnapshot()
       if (exportingProjects) {
         if (!selectedProjectIds.length) throw new Error('请至少选择一个项目')
@@ -7582,11 +7621,13 @@ function App() {
         throw new Error(`有 ${missingMediaIds.length} 张本机图片资料缺失。为避免生成缺图项目包，已取消导出。`)
       }
 
-      setTransferProgress(asBackup ? '正在生成备份下载…' : '正在生成下载文件…')
+      if (manageProgress) setTransferProgress(saveToDesktop ? '正在写入本地项目文件…' : '正在生成下载文件…')
       const bundle = await packWorkspaceBundle(manifest, media.values())
       const projectCount = Array.isArray(manifest.projects) ? manifest.projects.length : 0
       const canvasCount = Array.isArray(manifest.canvases) ? manifest.canvases.length : 0
-      if (saveHandle) {
+      if (saveToDesktop) {
+        await writeDesktopWorkspace(bundle, options?.desktopCopy ? desktopWorkspaceFile : fileName)
+      } else if (saveHandle) {
         const writable = await saveHandle.createWritable()
         await writable.write(bundle)
         await writable.close()
@@ -7594,7 +7635,9 @@ function App() {
         triggerBlobDownload(bundle, fileName)
       }
       const skipNote = skipped.count ? `，${skipped.count} 张外链未能打包` : ''
-      const successMessage = asBackup
+      const successMessage = saveToDesktop
+        ? `已写入本地存储目录 · ${options?.desktopCopy ? desktopWorkspaceFile : fileName}${skipNote}`
+        : asBackup
         ? `备份已开始下载：${projectCount} 个项目、${canvasCount} 张画布`
         : `导出成功：${projectCount} 个项目、${canvasCount} 张画布、${media.size} 张图片，${(bundle.size / 1024 / 1024).toFixed(1)} MB${skipNote}（不含 API Key）`
       if (manageProgress) {
@@ -7765,7 +7808,7 @@ function App() {
     const onSaveShortcut = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
       event.preventDefault()
-      void saveCanvasState()
+      void saveCanvasWithDesktopCopy()
     }
     window.addEventListener('keydown', onSaveShortcut)
     return () => window.removeEventListener('keydown', onSaveShortcut)
@@ -11300,7 +11343,31 @@ function App() {
     })
   }
 
-  const createAgentUploadedReference = (reference: Omit<AgentImageReference, 'nodeId'>): AgentImageReference => {
+  const readAgentImageReference = async (reference: AgentImageReference, signal?: AbortSignal) => {
+    const current = canvasGraphRef.current.nodes.find(({ id }) => id === reference.nodeId)?.data
+    const ids = new Set([reference.mediaId, ...(!reference.mediaId ? [current?.imageMediaId] : [])])
+    for (const id of ids) {
+      if (!id) continue
+      const media = await loadHistoryMedia(id)
+      if (media?.blob.size) return media.blob
+    }
+    try {
+      return await readImageSourceBlob(reference.url || current?.imageUrl || '', signal, reference.name)
+    } catch (error) {
+      if (signal?.aborted || !current?.imageUrl || current.imageUrl === reference.url || !reference.url.startsWith('blob:')) throw error
+      return readImageSourceBlob(current.imageUrl, signal, reference.name)
+    }
+  }
+
+  const createAgentUploadedReference = async (file: File): Promise<AgentImageReference> => {
+    const isVideo = file.type.startsWith('video/')
+    const saved = isVideo ? await (async () => {
+      const mediaId = `video-${crypto.randomUUID()}`
+      await saveHistoryMedia({ id: mediaId, blob: file, fileName: file.name, createdAt: new Date().toISOString() })
+      return { mediaId, url: URL.createObjectURL(file), name: file.name }
+    })() : await readReferenceImage(file)
+    const reference = { name: saved.name, url: saved.url, mediaId: saved.mediaId, kind: isVideo ? 'video' as const : 'image' as const }
+    if (saved.mediaId) historyMediaObjectUrlsRef.current.set(saved.mediaId, saved.url)
     const nodeId = `agent-upload-${crypto.randomUUID()}`
     const center = screenToFlowPosition({ x: Math.max(320, (window.innerWidth - (agentOpen ? 420 : 0)) / 2), y: window.innerHeight / 2 })
     setNodes((current) => [...current, {
@@ -11514,7 +11581,7 @@ function App() {
         const sourceNode = nodes.find(({ id }) => id === operationSource.nodeId)
         const blob = stored?.blob ?? (isVideo
           ? (sourceNode?.data.kind === 'video' ? await readVideoNodeResult(sourceNode.data, signal) : await readRecoverableVideo({ sourceUrl: operationSource.url, signal })).blob
-          : await readImageSourceBlob(operationSource.url, signal, '待处理原图'))
+          : await readAgentImageReference(operationSource, signal))
         let previewUrl = ''
         let regions: AgentImageOperationDraft['regions'] = []
         let frames: AgentImageOperationDraft['frames']
@@ -11587,10 +11654,8 @@ function App() {
       }
       const imageReferences = sentReferences.filter((reference) => reference.kind !== 'video')
       const videoReferences = sentReferences.filter((reference) => reference.kind === 'video')
-      const images = await Promise.all(imageReferences.map(async (reference) => {
-        const media = reference.mediaId ? await loadHistoryMedia(reference.mediaId) : null
-        return prepareReferenceImageForRequest(media?.blob || reference.url, controller.signal, reference.name)
-      }))
+      const images = await Promise.all(imageReferences.map(async (reference) =>
+        prepareReferenceImageForRequest(await readAgentImageReference(reference, controller.signal), controller.signal, reference.name)))
       const videoFrames = (await Promise.all(videoReferences.map((reference) => captureVideoReferenceFrames({ id: reference.nodeId, source: 'connection', sourceNodeId: reference.nodeId, selected: true, name: reference.name, mention: `@[node:${reference.nodeId}]`, kind: 'video', available: true, url: reference.url, mediaId: reference.mediaId }, controller.signal)))).flat()
       images.push(...videoFrames)
       const transcript = buildAgentConversationContext(nextMessages)
@@ -14304,7 +14369,15 @@ function App() {
         {storageOpen && <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setStorageOpen(false)}>
           <motion.div className="api-modal storage-modal" role="dialog" aria-modal="true" aria-labelledby="storage-dialog-title" initial={{ y: 18, opacity: 0, scale: .98 }} animate={{ y: 0, opacity: 1, scale: 1 }} exit={{ y: 18, opacity: 0, scale: .98 }} onClick={(event) => event.stopPropagation()}>
             <div className="modal-heading api-manager-heading"><div><span className="eyebrow">设置</span><h2 id="storage-dialog-title">存储空间</h2><p>检查项目的存储占用与可优化空间。</p></div><button aria-label="关闭存储空间" className="modal-close" onClick={() => setStorageOpen(false)}><X size={18} /></button></div>
-            <div className="settings-shell storage-settings-shell"><aside className="settings-sidebar" aria-label="设置分类"><button type="button" onClick={openApiSettings}><KeyRound size={14} />API 设置</button><button type="button" className="is-active"><HardDrive size={14} />存储空间</button></aside><section className="storage-health-panel"><div className="storage-panel-heading"><div className="storage-panel-title"><span className="storage-panel-icon"><HardDrive size={17} /></span><span><strong>存储健康中心</strong><small>检测项目的存储占用与可优化空间</small></span></div><button type="button" className="storage-scan-button" onClick={() => void scanStorage()} disabled={storageScanning}>{storageScanning ? <LoaderCircle size={14} className="is-spinning" /> : <RefreshCw size={14} />}{storageScanning ? '扫描中' : '重新扫描'}</button></div>{storageUsage ? <><div className="storage-health-result"><div className="storage-total"><HardDrive size={30} /><strong>{formatStorageBytes(storageUsage.usage)}</strong><span>{storageUsage.quota ? `占浏览器配额 ${Math.round(storageUsage.usage / storageUsage.quota * 100)}%` : '当前浏览器未提供容量上限'}</span></div>{storageUsage.quota > 0 && <div className="storage-usage-track"><i style={{ width: `${Math.min(100, Math.max(2, storageUsage.usage / storageUsage.quota * 100))}%` }} /></div>}</div><div className="storage-breakdown"><div><span><i className="storage-dot is-project" />浏览器本地数据</span><strong>{formatStorageBytes(storageInsights.localBytes)}</strong></div><div><span><i className="storage-dot is-history" />历史媒体 · {storageInsights.historyCount} 条</span><strong>{formatStorageBytes(storageInsights.historyBytes)}</strong></div></div><div className="storage-optimization"><div className="storage-optimization-heading"><span><Lightbulb size={15} /><strong>优化建议</strong></span><b>可优化空间 {formatStorageBytes(storageInsights.historyBytes)}</b></div><p>{storageInsights.historyBytes > 0 ? '历史媒体通常占用最多空间。删除不再需要的输出记录后，浏览器会回收对应文件。' : '当前没有发现可直接清理的历史媒体，继续保持定期导出与清理即可。'}</p><button type="button" onClick={() => { setStorageOpen(false); setOutputHistoryOpen(true) }}><History size={14} />管理历史媒体</button></div></> : <div className="storage-health-empty"><HardDrive size={34} /><strong>还没有扫描数据</strong><span>扫描后查看占用明细、优化建议和可释放空间。</span><button type="button" onClick={() => void scanStorage()}><RefreshCw size={14} />开始扫描</button></div>}<div className="storage-health-note"><Info size={14} /><span>项目数据保存在当前浏览器本地。导出项目包可用于备份或迁移到其他设备。</span></div></section></div>
+            <div className="settings-shell storage-settings-shell"><aside className="settings-sidebar" aria-label="设置分类"><button type="button" onClick={openApiSettings}><KeyRound size={14} />API 设置</button><button type="button" className="is-active"><HardDrive size={14} />存储空间</button></aside><section className="storage-health-panel">{isDesktopApp() && <div className="desktop-storage-settings">
+              <div><strong>本地存储目录</strong><p>手动保存或画布自动保存时，更新此目录里的工作区文件。可通过导入 .disy 恢复项目。</p></div>
+              <div className="desktop-storage-path" title={desktopStoragePath ?? undefined}>{desktopStoragePath ?? '尚未选择目录'}</div>
+              <div className="desktop-storage-actions">
+                <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy(true)}>{desktopStoragePath ? '更换目录' : '选择目录'}</button>
+                {desktopStoragePath && <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy()}>{desktopStorageBusy ? '正在保存…' : '立即保存工作区'}</button>}
+              </div>
+              {desktopStorageError && <p role="alert">{desktopStorageError}</p>}
+            </div>}<div className="storage-panel-heading"><div className="storage-panel-title"><span className="storage-panel-icon"><HardDrive size={17} /></span><span><strong>存储健康中心</strong><small>检测项目的存储占用与可优化空间</small></span></div><button type="button" className="storage-scan-button" onClick={() => void scanStorage()} disabled={storageScanning}>{storageScanning ? <LoaderCircle size={14} className="is-spinning" /> : <RefreshCw size={14} />}{storageScanning ? '扫描中' : '重新扫描'}</button></div>{storageUsage ? <><div className="storage-health-result"><div className="storage-total"><HardDrive size={30} /><strong>{formatStorageBytes(storageUsage.usage)}</strong><span>{storageUsage.quota ? `占浏览器配额 ${Math.round(storageUsage.usage / storageUsage.quota * 100)}%` : '当前浏览器未提供容量上限'}</span></div>{storageUsage.quota > 0 && <div className="storage-usage-track"><i style={{ width: `${Math.min(100, Math.max(2, storageUsage.usage / storageUsage.quota * 100))}%` }} /></div>}</div><div className="storage-breakdown"><div><span><i className="storage-dot is-project" />浏览器本地数据</span><strong>{formatStorageBytes(storageInsights.localBytes)}</strong></div><div><span><i className="storage-dot is-history" />历史媒体 · {storageInsights.historyCount} 条</span><strong>{formatStorageBytes(storageInsights.historyBytes)}</strong></div></div><div className="storage-optimization"><div className="storage-optimization-heading"><span><Lightbulb size={15} /><strong>优化建议</strong></span><b>可优化空间 {formatStorageBytes(storageInsights.historyBytes)}</b></div><p>{storageInsights.historyBytes > 0 ? '历史媒体通常占用最多空间。删除不再需要的输出记录后，浏览器会回收对应文件。' : '当前没有发现可直接清理的历史媒体，继续保持定期导出与清理即可。'}</p><button type="button" onClick={() => { setStorageOpen(false); setOutputHistoryOpen(true) }}><History size={14} />管理历史媒体</button></div></> : <div className="storage-health-empty"><HardDrive size={34} /><strong>还没有扫描数据</strong><span>扫描后查看占用明细、优化建议和可释放空间。</span><button type="button" onClick={() => void scanStorage()}><RefreshCw size={14} />开始扫描</button></div>}<div className="storage-health-note"><Info size={14} /><span>{isDesktopApp() ? '应用内数据保存在本机。工作区文件可用于恢复项目或迁移到其他设备。' : '项目数据保存在当前浏览器本地。导出项目包可用于备份或迁移到其他设备。'}</span></div></section></div>
           </motion.div>
         </motion.div>}
       </AnimatePresence>
@@ -15536,7 +15609,7 @@ function App() {
             className={`canvas-save-status ${canvasSaved ? 'is-saved' : 'is-unsaved'}`}
             aria-label={canvasSaved ? '已保存' : '未保存，点击保存'}
             title={canvasSaved ? '已保存' : '未保存，点击保存'}
-            onClick={() => void saveCanvasState()}
+            onClick={() => void saveCanvasWithDesktopCopy()}
           >
             {canvasSaved ? <Check size={13} /> : <span className="unsaved-dot" />}
           </button>
@@ -16612,7 +16685,7 @@ function App() {
         {createPortal(<AnimatePresence>
           {previewImage && (
             <motion.div
-              className={`image-preview-backdrop ${previewImageItems.length > 1 ? 'has-multiple' : ''}`}
+              className={`image-preview-backdrop ${isDesktopApp() ? 'is-desktop' : ''} ${previewImageItems.length > 1 ? 'has-multiple' : ''}`}
               role="dialog"
               aria-modal="true"
               aria-label="图片预览画廊"

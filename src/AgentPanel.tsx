@@ -188,7 +188,7 @@ type Props = {
   onImageDefaultsChange: (patch: Partial<{ aspectRatio: string; resolution: string; detail: string; count: number }>) => void
   onVideoDefaultsChange: (patch: Partial<{ aspectRatio: string; resolution: string; duration: number; count: number }>) => void
   onReferencesChange: (references: AgentImageReference[]) => void
-  onCreateUploadedReference: (reference: Omit<AgentImageReference, 'nodeId'>) => AgentImageReference
+  onCreateUploadedReference: (file: File) => Promise<AgentImageReference>
   onUploadNotice: (message: string) => void
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
@@ -865,28 +865,19 @@ export function AgentPanel(props: Props) {
       props.onUploadNotice('参考图最多 16 张，请先移除部分图片')
       return
     }
-    const seenUrls = new Set(props.references.map((reference) => reference.url))
     let added = 0
-    let duplicates = 0
+    let failed = 0
     for (const file of supported.slice(0, remaining)) {
-      const url = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('文件读取失败'))
-        reader.onerror = () => reject(reader.error ?? new Error('文件读取失败'))
-        reader.readAsDataURL(file)
-      }).catch(() => '')
-      if (!url) continue
-      if (seenUrls.has(url)) {
-        duplicates += 1
-        continue
+      try {
+        addReference(await props.onCreateUploadedReference(file))
+        added += 1
+      } catch {
+        failed += 1
       }
-      seenUrls.add(url)
-      addReference(props.onCreateUploadedReference({ name: file.name, url, kind: file.type.startsWith('video/') ? 'video' : 'image' }))
-      added += 1
     }
     const rejected = files.length - supported.length
     const overLimit = Math.max(0, supported.length - remaining)
-    const notes = [rejected ? `${rejected} 个格式不支持` : '', duplicates ? `${duplicates} 张重复` : '', overLimit ? `${overLimit} 张超出上限` : ''].filter(Boolean)
+    const notes = [rejected ? `${rejected} 个格式不支持` : '', failed ? `${failed} 个文件无法保存` : '', overLimit ? `${overLimit} 张超出上限` : ''].filter(Boolean)
     props.onUploadNotice(added ? `已添加 ${added} 张参考图${notes.length ? `，跳过${notes.join('、')}` : ''}` : `没有添加图片${notes.length ? `：${notes.join('、')}` : ''}`)
   }
   useEffect(() => {
