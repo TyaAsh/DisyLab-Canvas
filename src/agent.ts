@@ -16,6 +16,7 @@ export type AgentMessage = {
   content: string
   createdAt: string
   references?: AgentImageReference[]
+  turnOptions?: AgentTurnOptions
   skillUseId?: string
   questions?: AgentQuestion[]
   canvasEditDraft?: AgentCanvasEditDraft
@@ -48,6 +49,34 @@ export type AgentMessage = {
 
 export type AgentQuestion = { prompt: string; options: string[]; example?: string }
 
+export const AGENT_REFERENCE_PURPOSES = {
+  subject: '主体 / 外观', style: '风格 / 配色', composition: '构图 / 布局', motion: '动作 / 运镜',
+} as const
+
+export type AgentReferencePurpose = keyof typeof AGENT_REFERENCE_PURPOSES
+export type AgentPace = 'auto' | 'quick' | 'deep'
+export type AgentWebReference = { url: string; title: string; summary: string; observations: string[]; limitation: string; readAt: string; pasted?: boolean }
+export type AgentModelMention = { key: string; name: string }
+export type AgentTurnOptions = {
+  pace?: AgentPace
+  models?: Partial<Record<'text' | 'image' | 'video', AgentModelMention>>
+  styleIds?: string[]
+  textNodeIds?: string[]
+  webReferences?: AgentWebReference[]
+}
+
+export function agentPaceGuide(pace: AgentPace | undefined) {
+  if (pace === 'quick') return '本轮采用快速节奏。脑暴时给少量短方向；目标清楚时直接给精简答案或准备待确认方案。仅为影响交付的缺失信息追问。保留用户指定的数量、规格、模型和素材。'
+  if (pace === 'deep') return '本轮采用深度节奏。复杂任务先在 reply 中列明交付物、关键约束、先后依赖与需审核的节点；简单任务仍直接回答。资料不足时只问会改变结果的问题。用户只要求规划时保持规划范围，任何生成或画布变更仍走确认。'
+  return ''
+}
+
+export function agentReferencePurposeGuide(references: ReadonlyArray<Pick<AgentImageReference, 'name' | 'purpose' | 'kind'>>) {
+  return references.flatMap((reference, index) => reference.purpose
+    ? [`素材${index + 1}（${reference.kind === 'video' ? '视频' : '图片'}，${reference.name}）：${AGENT_REFERENCE_PURPOSES[reference.purpose]}`]
+    : []).join('\n')
+}
+
 export type AgentImageReference = {
   nodeId: string
   name: string
@@ -56,6 +85,7 @@ export type AgentImageReference = {
   kind?: 'image' | 'video'
   autoResolved?: boolean
   resolutionReason?: string
+  purpose?: AgentReferencePurpose
 }
 
 export type AgentContextReference = {
@@ -67,6 +97,7 @@ export type AgentContextReference = {
   excerpt?: string
   autoResolved?: boolean
   resolutionReason?: string
+  purpose?: AgentReferencePurpose
 }
 
 export type AgentStyleReference = {
@@ -103,6 +134,7 @@ export type AgentImagePlan = {
   deliverableIndex?: number
   imageConnectionId?: string
   imageModelId?: string
+  modelMention?: AgentModelMention
   assistantMessageId?: string
   createdAt?: string
   collapsed?: boolean
@@ -169,6 +201,7 @@ export type AgentVideoPlan = {
   generationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
   videoConnectionId?: string
   videoModelId?: string
+  modelMention?: AgentModelMention
   assistantMessageId?: string
   createdAt?: string
   nodeId?: string

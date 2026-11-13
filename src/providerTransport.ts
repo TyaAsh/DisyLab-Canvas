@@ -69,7 +69,18 @@ export async function providerFetch(input: string | URL, init?: RequestInit) {
     const request = resolveDesktopProviderRequest(input, init, window.location.origin)
     if (request) {
       const { fetch: nativeFetch } = await import('@tauri-apps/plugin-http')
-      return nativeFetch(request.url, request.init)
+      const headers = new Headers(request.init?.headers)
+      // Native requests have no browser origin. Preserve the explicit origin for media relays.
+      if (!headers.has('Origin')) headers.set('Origin', '')
+      try {
+        return await nativeFetch(request.url, { ...request.init, headers })
+      } catch (error) {
+        if (request.init?.signal?.aborted) throw request.init.signal.reason
+        const detail = error instanceof Error ? error.message : String(error)
+        // Native errors can contain the full URL, including credentials in its query string.
+        const safeDetail = detail.replace(/https?:\/\/[^\s)]+/gi, () => request.url.origin)
+        throw new Error(safeDetail || '桌面网络请求失败')
+      }
     }
   }
   return fetch(input, init)

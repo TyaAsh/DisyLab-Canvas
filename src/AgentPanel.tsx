@@ -9,8 +9,10 @@
  */
 import { Fragment, useEffect, useId, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
-import { compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentVideoPlan } from './agent'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import { ArrowLeft, ArrowUp, Brain, Check, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, Link2, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
+import { AGENT_REFERENCE_PURPOSES, compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentPace, type AgentReferencePurpose, type AgentTextPlan, type AgentTurnOptions, type AgentVideoPlan, type AgentWebReference } from './agent'
+import { AgentWebDisclosure, AgentWebReferenceCard, AgentWebReferenceInput } from './skill-ui/AgentWebReference'
 import { resolveImageModelOptions, type ImageOutput, type ImageGenerationOptions } from './imageApi'
 import { imageOutputIntent } from './imageOutputIntent'
 import { legacyStoryboardOperation } from './agentImageOperations'
@@ -30,7 +32,8 @@ import type { SkillManifest } from './skills/types'
 
 export type AgentModelOption = {
   key: string; name: string; connectionName: string; outputs?: readonly ImageOutput[]
-  imageParameters?: { baseUrl: string; modelId: string; ratios: SelectOption[]; resolutions: SelectOption[]; qualities: SelectOption[] }
+  imageParameters?: { baseUrl: string; modelId: string; ratios: SelectOption[]; resolutions: SelectOption[]; qualities: SelectOption[]; maxReferences?: number }
+  videoParameters?: { ratios: SelectOption[]; resolutions: SelectOption[]; durations: SelectOption[] }
 }
 export type AgentConversationOption = { id: string; title: string; updatedAt: string }
 
@@ -130,6 +133,11 @@ type Props = {
   references: AgentImageReference[]
   pendingReferences: AgentImageReference[]
   candidates: AgentImageReference[]
+  styleCandidates: { id: string; name: string; keyword: string }[]
+  textCandidates: { id: string; name: string }[]
+  onReadWebReference: (url: URL, modelKey: string, signal: AbortSignal, pastedText?: string) => Promise<AgentWebReference>
+  onSaveWebReference: (reference: AgentWebReference) => void
+  getVideoPlanIssue: (plan: AgentVideoPlan) => string | undefined
   conversations: AgentConversationOption[]
   activeConversationId: string
   skillSelection?: { id: string; skill: SkillManifest }
@@ -184,17 +192,17 @@ type Props = {
   onUploadNotice: (message: string) => void
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
-  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni', team?: boolean) => void
+  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode: 'text' | 'image' | 'frames' | 'reference' | 'omni' | undefined, team: boolean, options: AgentTurnOptions) => void
   onRetry: (messageId: string) => void
   onOptimizePrompt: (prompt: string) => Promise<string>
-  onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId'>>) => void
+  onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'imageConnectionId' | 'imageModelId' | 'modelMention'>>) => void
   onSelectPlanOptions: (groupPlanIds: string[], selectedPlanIds: string[]) => void
   onConfirmPlan: (id: string) => void
   onConfirmImageOperation: (id: string, indices: number[]) => Promise<void>
   getImagePlanCostLabel?: (plan: AgentImagePlan) => string | null
   onCancelPlan: (id: string) => void
   onRemovePlanContextReference: (planId: string, nodeId: string) => void
-  onVideoPlanChange: (id: string, patch: Partial<Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'videoConnectionId' | 'videoModelId'>>) => void
+  onVideoPlanChange: (id: string, patch: Partial<Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'videoConnectionId' | 'videoModelId' | 'modelMention'>>) => void
   onConfirmVideoPlan: (id: string) => void
   onCancelVideoPlan: (id: string) => void
   onRemoveVideoPlanContextReference: (planId: string, nodeId: string) => void
@@ -222,7 +230,7 @@ export function AgentPanel(props: Props) {
   const [skillMenuOpen, setSkillMenuOpen] = useState(false)
   const [skillAuthoring, setSkillAuthoring] = useState(false)
   const attachedSkill = props.skillSelection?.skill ?? null
-  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '和 Disy 对话，或选中画布文本，请 Disy 帮你修改'
+  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '描述创作目标，输入 @ 引用素材、风格或模型'
   const latestMessage = props.messages.at(-1)
   const guidedMessage = !props.busy && !skillAuthoring && latestMessage?.role === 'assistant'
     && latestMessage.skillUseId === props.skillSelection?.id && latestMessage.questions?.length ? latestMessage : undefined
@@ -239,6 +247,24 @@ export function AgentPanel(props: Props) {
     return () => document.removeEventListener('pointerdown', dismiss)
   }, [skillMenuOpen])
   const [mentionOpen, setMentionOpen] = useState(false)
+  const reduceMenuMotion = useReducedMotion()
+  const parameterMotion = {
+    initial: reduceMenuMotion ? false as const : { opacity: 0, y: 6 },
+    animate: { opacity: 1, y: 0 },
+    exit: { opacity: 0, y: 6, pointerEvents: 'none' as const },
+    transition: { duration: reduceMenuMotion ? 0 : .2, ease: [0.22, 1, 0.36, 1] as const },
+  }
+  const [mentionQuery, setMentionQuery] = useState('')
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const mentionMenuId = useId()
+  const [pace, setPace] = useState<AgentPace>('auto')
+  const [turnModels, setTurnModels] = useState<NonNullable<AgentTurnOptions['models']>>({})
+  const [turnStyles, setTurnStyles] = useState<Props['styleCandidates']>([])
+  const [turnTextNodes, setTurnTextNodes] = useState<Props['textCandidates']>([])
+  const [webReferences, setWebReferences] = useState<AgentWebReference[]>([])
+  const [webInputUrl, setWebInputUrl] = useState<string>()
+  const webInputVersion = useRef(0)
+  const [webDraftOpen, setWebDraftOpen] = useState(false)
   const [draftInvocationText, setDraftInvocationText] = useState('')
   const [editorHeight, setEditorHeight] = useState<number>()
   const editorResize = useRef<{ y: number; height: number } | null>(null)
@@ -300,7 +326,7 @@ export function AgentPanel(props: Props) {
   }, [])
   const activeReadyPlan = readyPlans.find((plan) => plan.id === activeReadyPlanId) ?? readyPlans[readyPlans.length - 1]
   const imageSettingLabel = (options: SelectOption[], value: string) => options.find((option) => option.value === value)?.label ?? value
-  const draftImageModel = mediaKind === 'image' && imageModelChosen ? props.imageModels.find((model) => model.key === props.imageModelKey) : undefined
+  const draftImageModel = props.imageModels.find((model) => model.key === (turnModels.image?.key ?? (mediaKind === 'image' && imageModelChosen ? props.imageModelKey : undefined)))
   const draftOutputIntent = draftImageModel ? imageOutputIntent(draftInvocationText, draftImageModel.outputs) : undefined
   const imageSettingsSummary = [
     imageSettingLabel(props.aspectOptions, props.imageDefaults.aspectRatio),
@@ -323,7 +349,39 @@ export function AgentPanel(props: Props) {
     if (videoGenerationMode === 'text') return false
     return videoGenerationMode === 'omni' || reference.kind !== 'video'
   }
-  const mentionCandidates = props.candidates.filter(modeAcceptsReference)
+  const modelMentionGroups = [
+    ['text', '对话模型', props.textModels], ['image', '图像模型', props.imageModels], ['video', '视频模型', props.videoModels],
+  ] as const
+  const mentionCandidates = [
+    ...props.candidates.filter(modeAcceptsReference).map((reference) => ({
+      key: reference.nodeId, name: reference.name, kind: reference.kind === 'video' ? '画布视频' : '画布图片',
+      preview: reference.kind === 'video' ? undefined : reference.url, choose: () => addReference(reference),
+    })),
+    ...props.textCandidates.map((item) => ({
+      key: `text:${item.id}`, name: item.name, kind: '画布文本', preview: undefined,
+      choose: () => selectMention(() => setTurnTextNodes((current) => current.some(({ id }) => id === item.id) ? current : [...current, item])),
+    })),
+    ...(!referencesDisabled ? props.styleCandidates : []).map((item) => ({
+      key: `style:${item.id}`, name: item.name, kind: '风格预设', detail: item.keyword, preview: undefined,
+      choose: () => selectMention(() => setTurnStyles((current) => current.some(({ id }) => id === item.id) ? current : [...current, item])),
+    })),
+    ...modelMentionGroups.flatMap(([key, kind, models]) => models.map((model) => ({
+      key: `model:${key}:${model.key}`, name: model.name, kind, detail: model.connectionName, preview: undefined,
+      choose: () => selectMention(() => setTurnModels((current) => ({ ...current, [key]: { key: model.key, name: model.name } }))),
+    }))),
+  ].filter((item) => `${item.name} ${item.kind} ${'detail' in item ? item.detail ?? '' : ''}`.toLocaleLowerCase().includes(mentionQuery.toLocaleLowerCase()))
+  const effectiveTextModelKey = turnModels.text?.key ?? props.textModelKey
+  const attachWebReference = (reference: AgentWebReference) => {
+    if (!webReferences.some(({ url }) => url === reference.url) && webReferences.length >= 3) {
+      setPromptError('本轮最多引用 3 个网页。请先移除一条参考。')
+      return
+    }
+    setWebReferences((current) => [...current.filter(({ url }) => url !== reference.url), reference])
+    setWebInputUrl(undefined)
+    setWebDraftOpen(false)
+    setPromptError('')
+    editorRef.current?.focus()
+  }
   const applyCustomAspectRatio = () => {
     const width = Number(customAspectWidth)
     const height = Number(customAspectHeight)
@@ -516,12 +574,12 @@ export function AgentPanel(props: Props) {
     if (!selection || !selection.rangeCount || !editor?.contains(selection.anchorNode)) return
     savedRangeRef.current = selection.getRangeAt(0).cloneRange()
   }
-  const hasTypedMentionTrigger = () => {
+  const updateMentionTrigger = () => {
     const editor = editorRef.current
     const selection = window.getSelection()
-    if (!editor || !selection?.rangeCount) return false
+    if (!editor || !selection?.rangeCount) return setMentionOpen(false)
     const range = selection.getRangeAt(0)
-    if (!editor.contains(range.endContainer)) return false
+    if (!editor.contains(range.endContainer) || !range.collapsed) return setMentionOpen(false)
     const prefix = range.cloneRange()
     prefix.selectNodeContents(editor)
     prefix.setEnd(range.endContainer, range.endOffset)
@@ -529,7 +587,10 @@ export function AgentPanel(props: Props) {
     holder.append(prefix.cloneContents())
     holder.querySelectorAll('.agent-inline-reference').forEach((chip) => chip.replaceWith(document.createTextNode(' ')))
     const beforeCaret = holder.innerText.replace(/\u00a0/g, ' ')
-    return /@[^\s@]*$/.test(beforeCaret)
+    const trigger = beforeCaret.match(/@([^\s@]*)$/)
+    setMentionQuery(trigger?.[1] ?? '')
+    setMentionIndex(0)
+    setMentionOpen(Boolean(trigger))
   }
   const removeReferenceBeforeCaret = () => {
     const editor = editorRef.current
@@ -667,16 +728,24 @@ export function AgentPanel(props: Props) {
     if (!selection?.rangeCount) return
     const range = selection.getRangeAt(0)
     const textNode = range.startContainer
-    if (textNode.nodeType !== Node.TEXT_NODE) return
-    const value = textNode.textContent ?? ''
+    if (!(textNode instanceof Text)) return
+    const value = textNode.data
     const before = value.slice(0, range.startOffset)
     const match = before.match(/@[^\s@]*$/)
     if (!match) return
-    textNode.textContent = `${value.slice(0, before.length - match[0].length)}${value.slice(range.startOffset)}`
-    range.setStart(textNode, before.length - match[0].length)
+    const start = before.length - match[0].length
+    textNode.deleteData(start, match[0].length)
+    range.setStart(textNode, start)
     range.collapse(true)
     selection.removeAllRanges()
     selection.addRange(range)
+  }
+  const selectMention = (apply: () => void) => {
+    restoreSelection()
+    clearMentionTrigger()
+    apply()
+    syncReferencesFromEditor()
+    setMentionOpen(false)
   }
   const getEditorReferences = () => {
     const ids = Array.from(editorRef.current?.querySelectorAll<HTMLElement>('[data-reference-id]') ?? []).map((node) => node.dataset.referenceId).filter(Boolean) as string[]
@@ -742,7 +811,6 @@ export function AgentPanel(props: Props) {
     editor.focus()
   }
   const addReference = (reference: AgentImageReference) => {
-    referenceRegistryRef.current.set(reference.nodeId, reference)
     restoreSelection()
     clearMentionTrigger()
     const editorReferences = getEditorReferences()
@@ -750,6 +818,12 @@ export function AgentPanel(props: Props) {
       setMentionOpen(false)
       return
     }
+    if (editorReferences.length >= 16) {
+      props.onUploadNotice('本轮最多引用 16 个媒体素材')
+      setMentionOpen(false)
+      return
+    }
+    referenceRegistryRef.current.set(reference.nodeId, reference)
     props.onReferencesChange([...editorReferences, reference])
     const selection = window.getSelection()
     if (selection?.rangeCount) {
@@ -763,7 +837,14 @@ export function AgentPanel(props: Props) {
       selection.addRange(range)
       savedRangeRef.current = range.cloneRange()
     }
+    syncReferencesFromEditor()
     setMentionOpen(false)
+  }
+  const setReferencePurpose = (id: string, purpose: AgentReferencePurpose | undefined) => {
+    const reference = referenceRegistryRef.current.get(id)
+    if (!reference) return
+    referenceRegistryRef.current.set(id, { ...reference, purpose })
+    syncReferencesFromEditor()
   }
   const uploadReferences = async (files: File[]) => {
     if (referencesDisabled) {
@@ -850,6 +931,20 @@ export function AgentPanel(props: Props) {
     })
   }, [props.references])
   useEffect(() => {
+    setTurnModels({})
+    setTurnStyles([])
+    setTurnTextNodes([])
+    setWebReferences([])
+    setWebInputUrl(undefined)
+    setWebDraftOpen(false)
+    setMentionOpen(false)
+    setPromptError('')
+  }, [props.activeConversationId])
+  useEffect(() => {
+    if (!mentionOpen) return
+    document.getElementById(`${mentionMenuId}-${mentionIndex}`)?.scrollIntoView({ block: 'nearest' })
+  }, [mentionOpen, mentionIndex, mentionMenuId])
+  useEffect(() => {
     const container = messagesRef.current
     if (!container) return
     const update = () => {
@@ -882,12 +977,42 @@ export function AgentPanel(props: Props) {
     return () => window.cancelAnimationFrame(frame)
   }, [props.filmReview?.id])
   const submit = (answers?: string) => {
+    const invocationText = [answers, getInvocationText()].filter(Boolean).join('\n\n')
     const value = [answers, getEditorText()].filter(Boolean).join('\n\n')
     if (!value) return
-    if (!props.textModelKey) { props.onOpenApiSettings(); return }
-    const invocationText = [answers, getInvocationText()].filter(Boolean).join('\n\n')
-    props.onSend(value, invocationText, getEditorReferences().filter(modeAcceptsReference), !attachedSkill && mediaKind === 'video' ? videoGenerationMode : undefined, teamEnabled && !attachedSkill)
+    if (!props.textModels.some(({ key }) => key === effectiveTextModelKey)) {
+      if (turnModels.text) setPromptError('本轮指定的对话模型不可用，请重新指定。')
+      else props.onOpenApiSettings()
+      return
+    }
+    if (turnStyles.some(({ id }) => !props.styleCandidates.some((item) => item.id === id))
+      || turnTextNodes.some(({ id }) => !props.textCandidates.some((item) => item.id === id))) {
+      setPromptError('部分引用已不可用，请移除后重新选择。')
+      return
+    }
+    if (referencesDisabled && turnStyles.length) {
+      setPromptError('文生视频不接收风格参考图。请移除风格预设或切换视频生成模式。')
+      return
+    }
+    const incompatibleReferences = getEditorReferences().filter((reference) => !modeAcceptsReference(reference))
+    if (incompatibleReferences.length) {
+      setPromptError('当前生成模式不接收已添加的部分素材。请移除这些引用或切换生成模式。')
+      return
+    }
+    props.onSend(value, invocationText, getEditorReferences().filter(modeAcceptsReference), !attachedSkill && mediaKind === 'video' ? videoGenerationMode : undefined, teamEnabled && !attachedSkill, {
+      pace,
+      models: turnModels,
+      styleIds: turnStyles.map(({ id }) => id),
+      textNodeIds: turnTextNodes.map(({ id }) => id),
+      webReferences,
+    })
     if (editorRef.current) editorRef.current.innerHTML = ''
+    setTurnModels({})
+    setTurnStyles([])
+    setTurnTextNodes([])
+    setWebReferences([])
+    setWebInputUrl(undefined)
+    setWebDraftOpen(false)
     setDraftInvocationText('')
     setPromptBackup(undefined)
     setPromptError('')
@@ -909,6 +1034,9 @@ export function AgentPanel(props: Props) {
     const imageModelAvailable = Boolean(imageModel)
     const outputIntent = imageOutputIntent(plan.prompt, imageModel?.outputs)
     const parameters = imageModel?.imageParameters
+    const referenceCount = new Set([...(plan.references ?? []).map(({ url }) => url), ...(plan.invokedStyleReferences ?? []).map(({ url }) => url)]).size
+    const maxReferences = Math.min(16, parameters?.maxReferences ?? 16)
+    const referenceIssue = referenceCount > maxReferences ? (maxReferences ? `当前模型最多接收 ${maxReferences} 张参考图，请移除多余参考或换模型。` : '当前模型不接收参考图，请更换模型。') : undefined
     const shown = parameters ? resolveImageModelOptions(parameters.baseUrl, parameters.modelId, {
       aspectRatio: plan.aspectRatio,
       resolution: plan.resolution as ImageGenerationOptions['resolution'],
@@ -976,10 +1104,11 @@ export function AgentPanel(props: Props) {
       >
         <header><span><ImagePlus size={15} />{plan.deliverableIndex === undefined ? '图像生成确认' : `${plan.deliverableIndex + 1}. ${plan.label || '图像'}`}</span><em>{statusLabel}</em></header>
         <div className="agent-image-plan-field agent-image-plan-model">
-          <span>图像模型</span>
-          <AgentSelect variant="floating" ariaLabel="选择本次图像模型" disabled={disabled} value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={14} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); props.onPlanChange(plan.id, { imageConnectionId, imageModelId }) }} />
+          <span>图像模型{plan.modelMention ? ' · 本轮指定' : ''}</span>
+          <AgentSelect variant="floating" ariaLabel="选择本次图像模型" disabled={disabled} value={imageModelAvailable ? imageModelKey : ''} placeholder="选择图像模型" options={props.imageModels.map((model) => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))} icon={<ImagePlus size={14} />} onChange={(key) => { const [imageConnectionId = '', imageModelId = ''] = key.split('::'); const chosen = props.imageModels.find((model) => model.key === key); props.onPlanChange(plan.id, { imageConnectionId, imageModelId, modelMention: chosen && { key, name: chosen.name } }) }} />
         </div>
-        {!imageModelAvailable && <p className="agent-image-plan-notice">请选择可用的图像模型。</p>}
+        {!imageModelAvailable && <p className="agent-image-plan-notice">{plan.modelMention ? `指定模型 ${plan.modelMention.name} 不可用。请选择其他模型。` : '请选择可用的图像模型。'}</p>}
+        {imageModelAvailable && referenceIssue && <p className="agent-image-plan-notice" role="status">{referenceIssue}</p>}
         <label className="agent-image-plan-field"><span>提示词</span><textarea value={plan.prompt} disabled={disabled} onChange={(event) => props.onPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑图像方案提示词" /></label>
         {plan.status === 'ready' && <div className="agent-image-plan-specs" role="group" aria-label="确认本次生成规格">
           {plan.deliverableIndex === undefined && <div className="agent-image-plan-field"><span>生成张数</span><AgentSelect variant="floating" ariaLabel="生成张数" value={String(plan.count)} placeholder="张数" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 张` }))} icon={null} onChange={(value) => props.onPlanChange(plan.id, { count: Number(value) })} /></div>}
@@ -1005,7 +1134,7 @@ export function AgentPanel(props: Props) {
         {plan.status === 'ready' && <footer className="agent-plan-actions">
           <span className="agent-image-plan-confirm-note">{costLabel ? `预计 ${costLabel}` : '确认后才开始生成'}</span>
           <button type="button" className="agent-plan-cancel" onClick={() => props.onCancelPlan(plan.id)}>取消</button>
-          <button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || outputIntent.blocked || !plan.prompt.trim()} title={outputIntent.blocked ? outputIntent.message : undefined} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />{plan.deliverableIndex === undefined ? `确认生成 ${plan.count} 张` : `确认第 ${plan.deliverableIndex + 1} 张`}</button>
+          <button type="button" className="agent-plan-confirm" disabled={!imageModelAvailable || Boolean(referenceIssue) || outputIntent.blocked || !plan.prompt.trim()} title={referenceIssue ?? (outputIntent.blocked ? outputIntent.message : undefined)} onClick={() => props.onConfirmPlan(plan.id)}><Check size={15} />{plan.deliverableIndex === undefined ? `确认生成 ${plan.count} 张` : `确认第 ${plan.deliverableIndex + 1} 张`}</button>
         </footer>}
       </section>
     )
@@ -1016,7 +1145,7 @@ export function AgentPanel(props: Props) {
       <div>{references.map((reference, index) => <div className={`agent-plan-context-reference is-${reference.kind}`} key={`${reference.kind}-${reference.nodeId}`}>
         <button type="button" className="agent-context-locate" title={`${reference.name}${reference.resolutionReason ? ` · ${reference.resolutionReason}` : ''}`} onClick={() => props.onLocateCanvasNode(reference.nodeId)}>
           {reference.url ? (reference.kind === 'video' ? <video src={reference.url} muted playsInline preload="metadata" aria-label={reference.name} /> : <img src={reference.url} alt="" />) : <span className="agent-context-text-icon"><FileText size={14} /></span>}
-          <span><strong>{reference.kind === 'image' ? `图${index + 1} · ` : reference.kind === 'video' ? `视频${index + 1} · ` : ''}{compactReferenceName(reference.name, 14)}</strong>{reference.excerpt && <small>{reference.excerpt}</small>}{reference.autoResolved && <small>{reference.resolutionReason || '根据上下文自动关联'}</small>}</span>
+          <span><strong>{reference.kind === 'image' ? `图${index + 1} · ` : reference.kind === 'video' ? `视频${index + 1} · ` : ''}{compactReferenceName(reference.name, 14)}</strong>{reference.purpose && <small>{AGENT_REFERENCE_PURPOSES[reference.purpose]}</small>}{reference.excerpt && <small>{reference.excerpt.slice(0, 180)}</small>}{reference.autoResolved && <small>{reference.resolutionReason || '根据上下文自动关联'}</small>}</span>
           <Focus size={12} />
         </button>
         {onRemove && <button type="button" className="agent-context-remove" aria-label={`移除关联 ${reference.name}`} title="从本次确认卡移除" onClick={() => onRemove(reference.nodeId)}><X size={12} /></button>}
@@ -1035,16 +1164,30 @@ export function AgentPanel(props: Props) {
       ? plan.contextReferences
       : (plan.references ?? []).map((reference) => ({ ...reference, kind: reference.kind ?? 'image' as const }))
     const videoModelKey = `${plan.videoConnectionId ?? ''}::${plan.videoModelId ?? ''}`
-    const videoModelAvailable = props.videoModels.some((model) => model.key === videoModelKey)
+    const videoModel = props.videoModels.find((model) => model.key === videoModelKey)
+    const videoModelAvailable = Boolean(videoModel)
+    const referenceIssue = videoModelAvailable ? props.getVideoPlanIssue(plan) : undefined
     return <section className="agent-plan-card agent-video-plan-card is-ready" key={plan.id}>
       <header><span><Film size={15} />视频生成确认</span><em>{statusLabel}</em></header>
-      <div className="mb-2 grid gap-1"><span className="text-[10px] text-[color:var(--muted)]">视频模型</span><AgentSelect className="w-full" ariaLabel="选择本次视频模型" value={videoModelAvailable ? videoModelKey : ''} placeholder="选择视频模型" options={props.videoModels.map((model) => ({ value: model.key, label: `${model.name} · ${model.connectionName}`, brand: getModelBrand(model.name) }))} icon={<Film size={13} />} onChange={(key) => { const [videoConnectionId = '', videoModelId = ''] = key.split('::'); props.onVideoPlanChange(plan.id, { videoConnectionId, videoModelId }) }} /></div>
+      <div className="mb-2 grid gap-1"><span className="text-[10px] text-[color:var(--muted)]">视频模型{plan.modelMention ? ' · 本轮指定' : ''}</span><AgentSelect className="w-full" ariaLabel="选择本次视频模型" value={videoModelAvailable ? videoModelKey : ''} placeholder="选择视频模型" options={props.videoModels.map((model) => ({ value: model.key, label: `${model.name} · ${model.connectionName}`, brand: getModelBrand(model.name) }))} icon={<Film size={13} />} onChange={(key) => {
+        const [videoConnectionId = '', videoModelId = ''] = key.split('::')
+        const chosen = props.videoModels.find((model) => model.key === key)
+        const options = chosen?.videoParameters
+        props.onVideoPlanChange(plan.id, {
+          videoConnectionId, videoModelId, modelMention: chosen && { key, name: chosen.name },
+          aspectRatio: options?.ratios.some(({ value }) => value === plan.aspectRatio) ? plan.aspectRatio : options?.ratios[0]?.value ?? plan.aspectRatio,
+          resolution: options?.resolutions.some(({ value }) => value === plan.resolution) ? plan.resolution : options?.resolutions[0]?.value ?? plan.resolution,
+          duration: options?.durations.some(({ value }) => Number(value) === plan.duration) ? plan.duration : Number(options?.durations[0]?.value ?? plan.duration),
+        })
+      }} /></div>
+      {plan.modelMention && !videoModelAvailable && <p className="agent-image-plan-notice">指定模型 {plan.modelMention.name} 不可用。请选择其他模型。</p>}
+      {referenceIssue && <p className="agent-image-plan-notice" role="status">{referenceIssue}</p>}
       {!videoModelAvailable && <p className="mb-2 text-[11px] text-amber-300">原视频模型已不可用，请重新选择。</p>}
       <textarea value={plan.prompt} onChange={(event) => props.onVideoPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑视频方案提示词" />
       <div className="agent-video-plan-settings">
-        <AgentSelect ariaLabel="视频比例" value={plan.aspectRatio} placeholder="比例" options={props.videoAspectOptions} icon={<SlidersHorizontal size={13} />} onChange={(aspectRatio) => props.onVideoPlanChange(plan.id, { aspectRatio })} />
-        <AgentSelect ariaLabel="视频清晰度" value={plan.resolution} placeholder="清晰度" options={props.videoResolutionOptions} icon={<SlidersHorizontal size={13} />} onChange={(resolution) => props.onVideoPlanChange(plan.id, { resolution })} />
-        <AgentSelect ariaLabel="视频时长" value={String(plan.duration)} placeholder="时长" options={props.videoDurationOptions} icon={<SlidersHorizontal size={13} />} onChange={(duration) => props.onVideoPlanChange(plan.id, { duration: Number(duration) })} />
+        <AgentSelect ariaLabel="视频比例" value={plan.aspectRatio} placeholder="比例" options={videoModel?.videoParameters?.ratios ?? props.videoAspectOptions} icon={<SlidersHorizontal size={13} />} onChange={(aspectRatio) => props.onVideoPlanChange(plan.id, { aspectRatio })} />
+        <AgentSelect ariaLabel="视频清晰度" value={plan.resolution} placeholder="清晰度" options={videoModel?.videoParameters?.resolutions ?? props.videoResolutionOptions} icon={<SlidersHorizontal size={13} />} onChange={(resolution) => props.onVideoPlanChange(plan.id, { resolution })} />
+        <AgentSelect ariaLabel="视频时长" value={String(plan.duration)} placeholder="时长" options={videoModel?.videoParameters?.durations ?? props.videoDurationOptions} icon={<SlidersHorizontal size={13} />} onChange={(duration) => props.onVideoPlanChange(plan.id, { duration: Number(duration) })} />
         <AgentSelect ariaLabel="视频数量" value={String(plan.count)} placeholder="数量" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 条` }))} icon={<SlidersHorizontal size={13} />} onChange={(count) => props.onVideoPlanChange(plan.id, { count: Number(count) })} />
       </div>
       {!!displayedContextReferences.length && renderContextReferences(displayedContextReferences, (nodeId) => props.onRemoveVideoPlanContextReference(plan.id, nodeId))}
@@ -1052,7 +1195,7 @@ export function AgentPanel(props: Props) {
         {(plan.invokedStylePresets?.length ? plan.invokedStylePresets : [{ id: 'legacy-video-style', name: '风格设定', keyword: plan.styleInvocationWord || '', references: plan.invokedStyleReferences ?? [] }]).map((preset) => <div className="agent-plan-invoked-style" key={preset.id}><span><Sparkles size={12} />{preset.name}{preset.keyword ? ` · ${preset.keyword}` : ''}</span><div>{preset.references.map((reference) => <img src={reference.url} alt={reference.name} title={reference.name} key={reference.id} />)}</div></div>)}
       </div>}
       {plan.error && <p className="agent-plan-error">{plan.error}</p>}
-      <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelVideoPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!videoModelAvailable} title={videoModelAvailable ? '使用所选模型生成视频' : '请先选择可用的视频模型'} onClick={() => props.onConfirmVideoPlan(plan.id)}><Check size={15} />确认生成视频</button></footer>
+      <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelVideoPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!videoModelAvailable || Boolean(referenceIssue) || !plan.prompt.trim()} title={referenceIssue ?? (videoModelAvailable ? '使用所选模型生成视频' : '请先选择可用的视频模型')} onClick={() => props.onConfirmVideoPlan(plan.id)}><Check size={15} />确认生成视频</button></footer>
     </section>
   }
   const renderTextPlan = (plan: AgentTextPlan) => {
@@ -1237,7 +1380,12 @@ export function AgentPanel(props: Props) {
                 changeProjectView('memory')
                 setMemorySeed({ id: message.id, content: message.content.trim().slice(0, PROJECT_MEMORY_LENGTH) })
               }}><Brain size={14} aria-hidden="true" /></button>}
-              {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="metadata" /> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}</span><Focus size={12} /></button>)}</div>}
+              {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="metadata" /> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}{reference.purpose ? ` · ${AGENT_REFERENCE_PURPOSES[reference.purpose]}` : ''}</span><Focus size={12} /></button>)}</div>}
+              {(message.turnOptions?.pace === 'quick' || message.turnOptions?.pace === 'deep' || message.turnOptions?.models?.text) && <p className="agent-turn-meta">{[
+                message.turnOptions?.pace === 'quick' ? '快速' : message.turnOptions?.pace === 'deep' ? '深度' : '',
+                message.turnOptions?.models?.text?.name,
+              ].filter(Boolean).join(' · ')}</p>}
+              {message.turnOptions?.webReferences?.map((reference) => <AgentWebReferenceCard key={reference.url} reference={reference} onReuse={() => attachWebReference(reference)} onSave={() => props.onSaveWebReference(reference)} />)}
               {message.textNode?.nodeId && <button type="button" className="agent-message-to-canvas" onClick={() => props.onLocateCanvasNode(message.textNode!.nodeId!)}><Focus size={13} />查看整合文本节点</button>}
             </article>
             {message.imageOperation && <AgentImageOperationReview draft={message.imageOperation}
@@ -1326,6 +1474,37 @@ export function AgentPanel(props: Props) {
             <Wrench size={13} /><span title={attachedSkill.name}>{attachedSkill.name}</span>
             <button type="button" aria-label={`移除 Skill ${attachedSkill.name}`} onClick={() => { props.onRemoveSkill(); editorRef.current?.focus() }}><X size={13} /></button>
           </div>}
+          <div className="agent-turn-tools">
+            <AgentSelect className="agent-composer-select" variant="floating" minMenuWidth={218}
+              ariaLabel="创作节奏" value={pace} placeholder="创作节奏" icon={<Brain size={15} aria-hidden="true" />}
+              onChange={(value) => setPace(value as AgentPace)}
+              options={[
+                { value: 'auto', label: '自动节奏', detail: '沿用 Agent 的默认处理方式' },
+                { value: 'quick', label: '快速', detail: '简短给方向或准备方案' },
+                { value: 'deep', label: '深度', detail: '梳理交付、依赖和审核点' },
+              ]} />
+            <button type="button" aria-expanded={webInputUrl !== undefined} onClick={() => {
+              const links = getInvocationText().match(/https?:\/\/[^\s<>"，。；！？）】]+/gi) ?? []
+              if (webInputUrl === undefined) {
+                webInputVersion.current += 1
+                setWebInputUrl(links[0] ?? '')
+              } else setWebInputUrl(undefined)
+            }}><Link2 size={15} aria-hidden="true" />网页参考</button>
+          </div>
+          <AnimatePresence initial={false} mode="wait">{webInputUrl !== undefined && <AgentWebReferenceInput key={`${props.activeConversationId}:${webInputVersion.current}`} initialUrl={webInputUrl}
+            onRead={(url, signal, pastedText) => props.onReadWebReference(url, effectiveTextModelKey, signal, pastedText)}
+            onAttach={attachWebReference} onClose={() => { setWebInputUrl(undefined); editorRef.current?.focus() }} />}</AnimatePresence>
+          {!!webReferences.length && <AgentWebDisclosure className="agent-web-drafts" label={`已引用 ${webReferences.length} 个网页`} open={webDraftOpen} onToggle={() => setWebDraftOpen((open) => !open)}>
+            <div className="agent-web-draft-list">{webReferences.map((reference) => <AgentWebReferenceCard key={reference.url} reference={reference}
+              onRemove={() => setWebReferences((current) => current.filter(({ url }) => url !== reference.url))}
+              onSave={() => props.onSaveWebReference(reference)} />)}</div>
+          </AgentWebDisclosure>}
+          {(Object.values(turnModels).some(Boolean) || turnStyles.length > 0 || turnTextNodes.length > 0) && <div className="agent-turn-mentions" aria-label="本轮指定资源">
+            {modelMentionGroups.map(([key, label]) => turnModels[key] && <button type="button" key={key} aria-label={`移除本轮${label} ${turnModels[key].name}`}
+              onClick={() => setTurnModels((current) => ({ ...current, [key]: undefined }))}>{label} · {turnModels[key].name}<X size={13} aria-hidden="true" /></button>)}
+            {turnStyles.map(({ id, name }) => <button type="button" key={`style:${id}`} aria-label={`移除风格预设 ${name}`} onClick={() => setTurnStyles((current) => current.filter((item) => item.id !== id))}>风格 · {name}<X size={13} aria-hidden="true" /></button>)}
+            {turnTextNodes.map(({ id, name }) => <button type="button" key={`text:${id}`} aria-label={`移除画布文本 ${name}`} onClick={() => setTurnTextNodes((current) => current.filter((item) => item.id !== id))}>文本 · {name}<X size={13} aria-hidden="true" /></button>)}
+          </div>}
           {guidedMessage?.questions && <AgentQuestions key={guidedMessage.id} questions={guidedMessage.questions} onSubmit={submit} />}
           {!guidedMessage && <button
             type="button"
@@ -1358,20 +1537,22 @@ export function AgentPanel(props: Props) {
             contentEditable
             role="textbox"
             aria-multiline="true"
+            aria-controls={mentionOpen ? mentionMenuId : undefined}
+            aria-activedescendant={mentionOpen && mentionCandidates[mentionIndex] ? `${mentionMenuId}-${mentionIndex}` : undefined}
             aria-label={guidedMessage ? '补充素材或说明' : '对话输入'}
             tabIndex={guidedMessage && !props.references.length && !draftInvocationText ? -1 : undefined}
             aria-placeholder={guidedMessage ? undefined : composerHint}
             data-placeholder={guidedMessage ? undefined : composerHint}
             onInput={() => {
               rememberSelection()
-              setMentionOpen(hasTypedMentionTrigger())
+              updateMentionTrigger()
               syncReferencesFromEditor()
             }}
             onPaste={(event) => {
               event.preventDefault()
               const plainText = event.clipboardData.getData('text/plain')
               insertPlainTextAtSelection(plainText)
-              setMentionOpen(hasTypedMentionTrigger())
+              updateMentionTrigger()
               syncReferencesFromEditor()
             }}
             onKeyUp={rememberSelection}
@@ -1388,6 +1569,19 @@ export function AgentPanel(props: Props) {
               }
             }}
             onKeyDown={(event) => {
+              if (mentionOpen && !event.nativeEvent.isComposing) {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  setMentionOpen(false)
+                  return
+                }
+                if (mentionCandidates.length && ['ArrowDown', 'ArrowUp', 'Enter', 'Tab'].includes(event.key) && !event.shiftKey) {
+                  event.preventDefault()
+                  if (event.key === 'Enter' || event.key === 'Tab') mentionCandidates[mentionIndex]?.choose()
+                  else setMentionIndex((index) => (index + (event.key === 'ArrowDown' ? 1 : -1) + mentionCandidates.length) % mentionCandidates.length)
+                  return
+                }
+              }
               if (event.key === 'Backspace' && !event.nativeEvent.isComposing && removeReferenceBeforeCaret()) {
                 event.preventDefault()
                 return
@@ -1402,7 +1596,28 @@ export function AgentPanel(props: Props) {
               }
             }}
           />
-          {mentionOpen && <div className="agent-mention-menu">{mentionCandidates.map((reference) => <button key={reference.nodeId} onMouseDown={(event) => event.preventDefault()} onClick={() => addReference(reference)}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="auto" onLoadedMetadata={(event) => { const video = event.currentTarget; if (video.duration > 0) video.currentTime = Math.min(.05, video.duration / 2) }} /> : <img src={reference.url} alt="" />}<span>{reference.name}</span></button>)}{!mentionCandidates.length && <p>{referencesDisabled ? '文生视频无需引用参考素材' : '画布上还没有可引用的素材'}</p>}</div>}
+          <AnimatePresence>{mentionOpen && <motion.div className="agent-mention-menu" id={mentionMenuId} role="listbox" aria-label="可引用资源"
+            initial={reduceMenuMotion ? false : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5, pointerEvents: 'none' }}
+            transition={{ duration: reduceMenuMotion ? 0 : 0.18, ease: [0.22, 1, 0.36, 1] }}>
+            {mentionCandidates.map((item, index) => <button type="button" key={item.key} id={`${mentionMenuId}-${index}`} role="option" aria-selected={index === mentionIndex}
+              tabIndex={-1} onMouseDown={(event) => event.preventDefault()} onClick={item.choose}>
+              {item.preview ? <img src={item.preview} alt="" /> : <span className="agent-mention-icon">{item.kind === '画布视频' || item.kind === '视频模型' ? <Film size={15} /> : item.kind === '画布文本' ? <FileText size={15} /> : <Sparkles size={15} />}</span>}
+              <span><strong>{item.name}</strong><small>{item.kind}{'detail' in item && item.detail ? ` · ${item.detail}` : ''}</small></span>
+            </button>)}
+            {!mentionCandidates.length && <p role="status">没有匹配的引用</p>}
+          </motion.div>}</AnimatePresence>
+          {!!props.references.filter(modeAcceptsReference).length && <div className="agent-reference-purposes" aria-label="媒体素材用途">
+            {props.references.filter(modeAcceptsReference).map((reference) => <div className="agent-reference-purpose" key={reference.nodeId}>
+              <span className="agent-reference-purpose-name" title={reference.name}>{compactReferenceName(reference.name, 16)}</span>
+              <AgentSelect className="agent-composer-select agent-reference-purpose-select" variant="floating" minMenuWidth={218}
+                ariaLabel={`${reference.name}的用途`} value={reference.purpose ?? ''} placeholder="用途：自动判断" icon={null}
+                onChange={(value) => setReferencePurpose(reference.nodeId, (value || undefined) as AgentReferencePurpose | undefined)}
+                options={[
+                  { value: '', label: '用途：自动判断', detail: '按本轮提示词理解素材用途' },
+                  ...Object.entries(AGENT_REFERENCE_PURPOSES).map(([value, label]) => ({ value, label })),
+                ]} />
+            </div>)}
+          </div>}
           {!attachedSkill && draftOutputIntent?.message && <p className={`image-output-hint agent-image-output-hint ${draftOutputIntent.blocked ? 'is-unsupported' : ''}`} role="status">{draftOutputIntent.message}</p>}
           {!guidedMessage && <div className="agent-composer-models">
             <AgentSelect
@@ -1496,13 +1711,13 @@ export function AgentPanel(props: Props) {
               {!guidedMessage && <button type="button" className="agent-send-button" onClick={() => submit()} title={props.busy ? '发送并调整方向' : '发送'} aria-label={props.busy ? '发送并调整方向' : '发送'}><ArrowUp size={17} /></button>}
             </div>
           </footer>
-          {skillMenuOpen && <AgentSkillMenu id={skillMenuId} menuRef={skillMenuRef} activeSkill={attachedSkill}
+          <AnimatePresence>{skillMenuOpen && <AgentSkillMenu id={skillMenuId} menuRef={skillMenuRef} activeSkill={attachedSkill}
             onAttach={attachSkill}
             onCreate={() => { setSkillMenuOpen(false); setSkillAuthoring(true) }}
             onOpenFactory={(view, skillSlug) => { setSkillMenuOpen(false); skillButtonRef.current?.focus(); props.onOpenSkillFactory(view, skillSlug) }}
             onDismiss={() => { setSkillMenuOpen(false); skillButtonRef.current?.focus() }}
-          />}
-          {imageSettingsOpen && mediaKind === 'image' && imageModelChosen && props.imageModelKey && <div className="agent-image-parameter-popover" role="dialog" aria-label="图像参数">
+          />}</AnimatePresence>
+          <AnimatePresence>{imageSettingsOpen && mediaKind === 'image' && imageModelChosen && props.imageModelKey && <motion.div {...parameterMotion} className="agent-image-parameter-popover" role="dialog" aria-label="图像参数">
             <header><strong>图像参数</strong><button type="button" className="agent-parameter-close" onClick={() => setImageSettingsOpen(false)} title="关闭图像参数" aria-label="关闭图像参数"><X size={16} strokeWidth={1.8} /></button></header>
             {props.detailOptions.length > 0 && <div className="agent-image-parameter-section"><span>画质</span><div>{props.detailOptions.map((option) => <button type="button" className={(props.detailOptions.some((item) => item.value === props.imageDefaults.detail) ? props.imageDefaults.detail : props.detailOptions[0]?.value) === option.value ? 'is-selected' : ''} key={option.value} onClick={() => props.onImageDefaultsChange({ detail: option.value })}>{option.label}</button>)}</div></div>}
             <div className="agent-image-parameter-section"><span>清晰度</span><div>{props.resolutionOptions.map((option) => <button type="button" className={props.imageDefaults.resolution === option.value ? 'is-selected' : ''} key={option.value} onClick={() => props.onImageDefaultsChange({ resolution: option.value })}>{option.label}</button>)}</div></div>
@@ -1512,23 +1727,26 @@ export function AgentPanel(props: Props) {
                 {props.aspectOptions.map((option) => <button type="button" data-aspect={option.value} className={props.imageDefaults.aspectRatio === option.value ? 'is-selected' : ''} key={option.value} onClick={() => props.onImageDefaultsChange({ aspectRatio: option.value })}><i aria-hidden="true" /><span>{option.label}</span></button>)}
                 <button type="button" className={`is-custom ${customAspectRatioOpen ? 'is-selected' : ''}`} onClick={() => setCustomAspectRatioOpen((open) => !open)}><i aria-hidden="true">+</i><span>自定义</span></button>
               </div>
-              {customAspectRatioOpen && <form className="agent-custom-aspect-ratio" onSubmit={(event) => { event.preventDefault(); applyCustomAspectRatio() }}>
+              <AnimatePresence>{customAspectRatioOpen && <motion.div className="agent-web-input-motion"
+                initial={reduceMenuMotion ? false : { height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0, pointerEvents: 'none' }} transition={parameterMotion.transition}>
+                <form className="agent-custom-aspect-ratio" onSubmit={(event) => { event.preventDefault(); applyCustomAspectRatio() }}>
                 <label>宽<input aria-label="自定义比例宽度" inputMode="decimal" min="0.01" step="0.01" type="number" value={customAspectWidth} onChange={(event) => setCustomAspectWidth(event.target.value)} /></label>
                 <span>:</span>
                 <label>高<input aria-label="自定义比例高度" inputMode="decimal" min="0.01" step="0.01" type="number" value={customAspectHeight} onChange={(event) => setCustomAspectHeight(event.target.value)} /></label>
                 <button type="submit">应用</button>
-              </form>}
+              </form></motion.div>}</AnimatePresence>
             </div>
             <div className="agent-image-parameter-section"><span>数量</span><div>{[1, 2, 3, 4].map((count) => <button type="button" className={props.imageDefaults.count === count ? 'is-selected' : ''} key={count} onClick={() => props.onImageDefaultsChange({ count })}>{count} 张</button>)}</div></div>
-          </div>}
-          {videoSettingsOpen && mediaKind === 'video' && videoModelChosen && props.videoModelKey && <div className="agent-image-parameter-popover" role="dialog" aria-label="视频参数">
+          </motion.div>}</AnimatePresence>
+          <AnimatePresence>{videoSettingsOpen && mediaKind === 'video' && videoModelChosen && props.videoModelKey && <motion.div {...parameterMotion} className="agent-image-parameter-popover" role="dialog" aria-label="视频参数">
             <header><strong>视频参数</strong><button type="button" className="agent-parameter-close" onClick={() => setVideoSettingsOpen(false)} title="关闭视频参数" aria-label="关闭视频参数"><X size={16} strokeWidth={1.8} /></button></header>
             <div className="agent-image-parameter-section agent-video-mode-section"><span>生成模式</span><div>{([['text', '文生视频', '仅使用文字描述生成视频，不接收图片或视频参考'], ['omni', '全能参考', '可同时使用图片与视频作为角色、动作和风格参考'], ['image', '图生视频', '使用一张图片作为视频首帧'], ['frames', '首尾帧', '使用前两张图片分别作为首帧和尾帧'], ['reference', '图片参考', '使用最多四张图片作为主体与风格参考']] as const).map(([value, label, tip]) => <button type="button" data-tooltip={tip} aria-label={`${label}：${tip}`} className={videoGenerationMode === value ? 'is-selected' : ''} key={value} onClick={() => setVideoGenerationMode(value)}>{label}</button>)}</div></div>
             <div className="agent-image-parameter-section"><span>清晰度</span><div>{props.videoResolutionOptions.map((option) => <button type="button" className={props.videoDefaults.resolution === option.value ? 'is-selected' : ''} key={option.value} onClick={() => props.onVideoDefaultsChange({ resolution: option.value })}>{option.label}</button>)}</div></div>
             <div className="agent-image-parameter-section is-aspect"><span>比例</span><div>{props.videoAspectOptions.map((option) => <button type="button" data-aspect={option.value} className={props.videoDefaults.aspectRatio === option.value ? 'is-selected' : ''} key={option.value} onClick={() => props.onVideoDefaultsChange({ aspectRatio: option.value })}><i aria-hidden="true" /><span>{option.label}</span></button>)}</div></div>
             <div className="agent-image-parameter-section agent-video-duration-section"><span>时长</span><div><input type="range" min="4" max="15" step="1" value={props.videoDefaults.duration} aria-label="视频时长" onChange={(event) => props.onVideoDefaultsChange({ duration: Number(event.target.value) })} /><label><input type="number" min="4" max="15" step="1" value={props.videoDefaults.duration} aria-label="手动输入视频时长" onChange={(event) => props.onVideoDefaultsChange({ duration: Math.max(4, Math.min(15, Number(event.target.value) || 4)) })} /><span>秒</span></label></div></div>
             <div className="agent-image-parameter-section"><span>数量</span><div>{[1, 2, 3, 4].map((count) => <button type="button" className={props.videoDefaults.count === count ? 'is-selected' : ''} key={count} onClick={() => props.onVideoDefaultsChange({ count })}>{count} 条</button>)}</div></div>
-          </div>}
+          </motion.div>}</AnimatePresence>
         </div>
       </div>
       {panelFloating && AGENT_PANEL_FLOAT_HANDLES.map((edge) => (

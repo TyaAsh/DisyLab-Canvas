@@ -24,7 +24,7 @@
   <a href="https://disylab.pages.dev">Live App</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/">Project Site</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.1/DisyLab_2.0.1_x64-setup.exe">Download for Windows</a> ·
+  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.2/DisyLab_2.0.2_x64.exe">Download for Windows</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/#roadmap">Roadmap</a>
 </p>
 
@@ -81,7 +81,7 @@ npm run build
 
 ## Current scope
 
-DisyLab 2.0 is available on the web and for Windows x64. The desktop app supports official Jimeng CLI authorization and a separate Muse web sign-in session. macOS is planned for a later release. Projects remain local and can be transferred using `.disy` packages. See the [2.0.1 release](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.1) for downloads and the checksum.
+DisyLab 2.0 is available on the web and for Windows x64. The desktop app supports official Jimeng CLI authorization and a separate Muse web sign-in session. macOS is planned for a later release. Projects remain local and can be transferred using `.disy` packages. See the [2.0.2 release](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.2) for downloads and the checksum.
 
 ## License
 

@@ -1,4 +1,5 @@
 import { useEffect, useState, type RefObject } from 'react'
+import { motion, useIsPresent, useReducedMotion } from 'framer-motion'
 import { ChevronDown, FilePlus2, FileUp, Play, Plus, Search, Star, Trash2, Wrench } from 'lucide-react'
 import { listSkills, officialSkills } from '../skills/registry'
 import { deleteUserSkillManifest, subscribeToSkillDeletion } from '../skills/storage'
@@ -23,6 +24,8 @@ type Props = {
 }
 
 export function AgentSkillMenu({ id, menuRef, activeSkill, onAttach, onCreate, onOpenFactory, onDismiss }: Props) {
+  const reducedMotion = useReducedMotion()
+  const present = useIsPresent()
   const [tab, setTab] = useState<typeof TABS[number]['id']>('official')
   const [search, setSearch] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -71,7 +74,9 @@ export function AgentSkillMenu({ id, menuRef, activeSkill, onAttach, onCreate, o
     && (tab === 'favorites' ? favorites.has(skillKey(skill)) : skill.source === tab)
     && (!query || [skill.name, skill.slug, skill.description].some((value) => value.toLowerCase().includes(query))))
 
-  return <div ref={menuRef} id={id} className="agent-skill-menu" role="region" aria-label="Skill 菜单" onKeyDown={(event) => {
+  return <motion.div ref={menuRef} id={id} className="agent-skill-menu" role="region" aria-label="Skill 菜单" inert={!present}
+    initial={reducedMotion ? false : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }}
+    transition={{ duration: reducedMotion ? 0 : .2, ease: [0.22, 1, 0.36, 1] }} onKeyDown={(event) => {
     if (event.key !== 'Escape') return
     event.preventDefault()
     event.stopPropagation()
@@ -126,5 +131,5 @@ export function AgentSkillMenu({ id, menuRef, activeSkill, onAttach, onCreate, o
       })}
       {!visible.length && <li className="agent-skill-menu-empty">{loadFailed && tab !== 'official' ? '暂时无法读取本地 Skill' : query ? '没有匹配的 Skill' : tab === 'favorites' ? '点按星标即可收藏 Skill' : tab === 'user' ? '创建或导入后，Skill 会出现在这里' : '暂无通用 Skill'}</li>}
     </ul>
-  </div>
+  </motion.div>
 }

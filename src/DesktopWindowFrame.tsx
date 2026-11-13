@@ -13,13 +13,18 @@ export function DesktopWindowFrame({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let active = true
+    let timeout = 0
     const sync = () => {
       void current.isMaximized().then((value) => { if (active) setMaximized(value) }).catch(() => {})
     }
     sync()
-    const subscription = current.onResized(sync)
+    const subscription = current.onResized(() => {
+      window.clearTimeout(timeout)
+      timeout = window.setTimeout(sync, 100)
+    })
     return () => {
       active = false
+      window.clearTimeout(timeout)
       void subscription.then((unlisten) => unlisten()).catch(() => {})
     }
   }, [current])

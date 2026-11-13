@@ -30,6 +30,21 @@ type Props = {
   onMove: (move: CanvasLayerMove) => void
 }
 
+type PanelDrag = {
+  pointerId: number
+  pointerX: number
+  pointerY: number
+  left: number
+  top: number
+  minX: number
+  maxX: number
+  minY: number
+  maxY: number
+  x: number
+  y: number
+  frame: number
+}
+
 type LayerDrag = {
   sourceId: string
   pointerId: number
@@ -49,12 +64,11 @@ export function CanvasLayersPanel({
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const [rename, setRename] = useState<{ id: string; draft: string } | null>(null)
-  const [position, setPosition] = useState<{ x: number; y: number } | null>(null)
   const [draggedId, setDraggedId] = useState('')
   const [drop, setDrop] = useState<CanvasLayerMove | null>(null)
   const anchor = useRef('')
   const panelRef = useRef<HTMLElement>(null)
-  const drag = useRef<{ dx: number; dy: number } | null>(null)
+  const drag = useRef<PanelDrag | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const layerDrag = useRef<LayerDrag | null>(null)
   const layerScrollFrame = useRef(0)
@@ -134,18 +148,53 @@ export function CanvasLayersPanel({
     setRename(null)
   }
   const startDrag = (event: PointerEvent<HTMLElement>) => {
-    if (docked || event.pointerType !== 'mouse' || event.button !== 0 || (event.target as HTMLElement).closest('button')) return
-    const rect = panelRef.current?.getBoundingClientRect()
-    if (!rect) return
-    drag.current = { dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+    const panel = panelRef.current
+    const container = panel?.offsetParent
+    if (!panel || !container || docked || drag.current || !event.isPrimary || event.button !== 0
+      || (event.target as Element).closest('button')) return
+    const left = panel.offsetLeft
+    const top = panel.offsetTop
+    drag.current = {
+      pointerId: event.pointerId, pointerX: event.clientX, pointerY: event.clientY,
+      left, top, x: left, y: top, frame: 0,
+      minX: Math.min(8, left), maxX: Math.max(left, container.clientWidth - panel.offsetWidth - 8),
+      minY: Math.min(8, top), maxY: Math.max(top, container.clientHeight - panel.offsetHeight - 8),
+    }
+    event.preventDefault()
+    panel.classList.add('is-panel-dragging')
     event.currentTarget.setPointerCapture(event.pointerId)
   }
+  const updateDragPosition = (current: PanelDrag, event: PointerEvent<HTMLElement>) => {
+    current.x = Math.max(current.minX, Math.min(current.maxX, current.left + event.clientX - current.pointerX))
+    current.y = Math.max(current.minY, Math.min(current.maxY, current.top + event.clientY - current.pointerY))
+  }
   const moveDrag = (event: PointerEvent<HTMLElement>) => {
-    if (!drag.current) return
-    setPosition({ x: Math.max(8, event.clientX - drag.current.dx), y: Math.max(8, event.clientY - drag.current.dy) })
+    const current = drag.current
+    if (!current || current.pointerId !== event.pointerId) return
+    updateDragPosition(current, event)
+    if (current.frame) return
+    current.frame = window.requestAnimationFrame(() => {
+      current.frame = 0
+      panelRef.current?.style.setProperty('translate', `${current.x - current.left}px ${current.y - current.top}px`)
+    })
+  }
+  const finishDrag = (event: PointerEvent<HTMLElement>) => {
+    const current = drag.current
+    if (!current || current.pointerId !== event.pointerId) return
+    if (event.type === 'pointerup') updateDragPosition(current, event)
+    drag.current = null
+    window.cancelAnimationFrame(current.frame)
+    const panel = panelRef.current
+    panel?.style.setProperty('--layers-x', `${current.x}px`)
+    panel?.style.setProperty('--layers-y', `${current.y}px`)
+    panel?.style.removeProperty('translate')
+    panel?.classList.remove('is-panel-dragging')
   }
 
-  useEffect(() => () => window.cancelAnimationFrame(layerScrollFrame.current), [])
+  useEffect(() => () => {
+    window.cancelAnimationFrame(layerScrollFrame.current)
+    if (drag.current) window.cancelAnimationFrame(drag.current.frame)
+  }, [])
 
   const updateDrop = (current: LayerDrag) => {
     const row = document.elementFromPoint(current.x, current.y)?.closest<HTMLElement>('[data-layer-id]')
@@ -171,8 +220,8 @@ export function CanvasLayersPanel({
       const fromBottom = rect.bottom - current.y
       if (fromTop < 28) list.scrollTop -= Math.min(16, 1 + (28 - fromTop) / 4)
       else if (fromBottom < 28) list.scrollTop += Math.min(16, 1 + (28 - fromBottom) / 4)
-      updateDrop(current)
     }
+    updateDrop(current)
     layerScrollFrame.current = window.requestAnimationFrame(scrollWhileDragging)
   }
 
@@ -188,7 +237,6 @@ export function CanvasLayersPanel({
       setDraggedId(current.sourceId)
       layerScrollFrame.current = window.requestAnimationFrame(scrollWhileDragging)
     }
-    if (current.moving) updateDrop(current)
   }
 
   const finishLayerDrag = (event: PointerEvent<HTMLDivElement>, commit = false) => {
@@ -196,7 +244,12 @@ export function CanvasLayersPanel({
     if (!current || current.pointerId !== event.pointerId) return
     layerDrag.current = null
     window.cancelAnimationFrame(layerScrollFrame.current)
-    if (commit && current.drop) onMove(current.drop)
+    if (commit && current.moving) {
+      current.x = event.clientX
+      current.y = event.clientY
+      updateDrop(current)
+      if (current.drop) onMove(current.drop)
+    }
     setDraggedId('')
     setDrop(null)
   }
@@ -206,7 +259,7 @@ export function CanvasLayersPanel({
     animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
     exit={reduceMotion ? { opacity: 0 } : { opacity: 0, x: -8, y: docked ? 0 : 5, scale: docked ? 1 : .985 }}
     transition={{ duration: reduceMotion ? 0 : .19, ease: [.22, .8, .25, 1] }}
-    aria-label="画布图层" style={!docked && position ? { '--layers-x': `${position.x}px`, '--layers-y': `${position.y}px` } as CSSProperties : undefined}
+    aria-label="画布图层"
     onKeyDown={(event) => {
       if (event.target instanceof HTMLInputElement) return
       if (event.key === 'F2' && single) {
@@ -224,7 +277,7 @@ export function CanvasLayersPanel({
       }
     }}>
     <header className="canvas-layers-header" onPointerDown={startDrag} onPointerMove={moveDrag}
-      onPointerUp={() => { drag.current = null }} onLostPointerCapture={() => { drag.current = null }}>
+      onPointerUp={finishDrag} onPointerCancel={finishDrag} onLostPointerCapture={finishDrag}>
       <span className="canvas-layers-mark"><Layers3 size={17} /></span>
       <h2>图层</h2>
       <button type="button" className="canvas-layers-dock" aria-label={docked ? '取消固定图层' : '固定图层到左侧'} aria-pressed={docked}

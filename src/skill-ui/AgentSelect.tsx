@@ -63,7 +63,7 @@ function ModelBrandMark({ brand }: { brand: ModelBrand }) {
   )
 }
 
-export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onChange, className = '', variant = 'default', disabled = false }: {
+export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onChange, className = '', variant = 'default', disabled = false, minMenuWidth = 0 }: {
   ariaLabel: string
   value: string
   placeholder: string
@@ -73,6 +73,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
   className?: string
   variant?: 'default' | 'conversation' | 'floating'
   disabled?: boolean
+  minMenuWidth?: number
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -82,7 +83,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
   const selected = options.find((option) => option.value === value)
 
   useLayoutEffect(() => {
-    if (!open || variant !== 'floating') return
+    if (!open || disabled || variant !== 'floating') return
     const menu = menuRef.current
     const trigger = triggerRef.current
     if (!menu || !trigger) return
@@ -90,14 +91,16 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
     const below = window.innerHeight - rect.bottom - 14
     const above = rect.top - 14
     const upward = below < 210 && above > below
-    menu.style.left = `${Math.max(8, rect.left)}px`
-    menu.style.width = `${Math.min(rect.width, window.innerWidth - Math.max(8, rect.left) - 8)}px`
+    menu.dataset.direction = upward ? 'up' : 'down'
+    const width = Math.min(Math.max(rect.width, minMenuWidth), window.innerWidth - 16)
+    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`
+    menu.style.width = `${width}px`
     menu.style.top = upward ? 'auto' : `${rect.bottom + 5}px`
     menu.style.bottom = upward ? `${window.innerHeight - rect.top + 5}px` : 'auto'
     menu.style.maxHeight = `${Math.min(260, upward ? above : below)}px`
     menu.showPopover()
     const close = () => setOpen(false)
-    const pane = trigger.closest('.agent-project-pane, .agent-panel-messages')
+    const pane = trigger.closest('.agent-project-pane, .agent-panel-messages, .agent-reference-purposes')
     pane?.addEventListener('scroll', close)
     window.addEventListener('resize', close)
     return () => {
@@ -105,7 +108,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
       window.removeEventListener('resize', close)
       if (menu.matches(':popover-open')) menu.hidePopover()
     }
-  }, [open, variant])
+  }, [open, disabled, variant, minMenuWidth])
 
   useEffect(() => {
     if (!open) return
@@ -157,13 +160,14 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
         <span className={`agent-select-value ${selected ? '' : 'is-placeholder'}`}>{selected?.label ?? placeholder}</span>
         <ChevronDown size={14} className="agent-select-chevron" />
       </button>
-      {open && !disabled && (
         <div
           ref={menuRef}
           id={menuId}
           className={`agent-select-menu is-${variant}`}
+          data-expanded={open && !disabled}
           popover={variant === 'floating' ? 'manual' : undefined}
           role="listbox"
+          inert={!open || disabled}
           aria-label={`${ariaLabel}选项`}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
@@ -177,6 +181,9 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
               event.preventDefault()
               const optionButtons = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]')
               optionButtons?.[event.key === 'Home' ? 0 : optionButtons.length - 1]?.focus()
+            } else if (event.key === 'Enter' && event.target instanceof HTMLButtonElement) {
+              event.preventDefault()
+              event.target.click()
             }
           }}
         >
@@ -203,7 +210,6 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
             </button>
           )) : <p>暂无可用选项</p>}
         </div>
-      )}
     </div>
   )
 }

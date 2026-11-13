@@ -9,14 +9,18 @@ fn open_provider_url(window: tauri::WebviewWindow, url: String) -> Result<(), St
         return Err("此操作只能在画布主窗口使用".into());
     }
     let url = tauri::Url::parse(&url).map_err(|_| "链接地址无效")?;
-    if url.scheme() != "https"
+    open_external_url(&url)
+}
+
+fn open_external_url(url: &tauri::Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err("请使用有效的 HTTPS 厂商链接".into());
+        return Err("请使用有效的网页链接".into());
     }
-    jimeng::open_browser_url(&url)
+    jimeng::open_browser_url(url)
 }
 
 #[cfg(windows)]
@@ -148,26 +152,38 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .setup(|app| {
+            use tauri::webview::NewWindowResponse;
+            let main = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == "main")
+                .expect("missing main window configuration");
+            let window = tauri::WebviewWindowBuilder::from_config(app, main)?
+                .on_new_window(|url, _| {
+                    if let Err(error) = open_external_url(&url) {
+                        eprintln!("{error}");
+                    }
+                    NewWindowResponse::Deny
+                })
+                .build()?;
             #[cfg(windows)]
             {
-                use tauri::Manager;
-                if let Some(window) = app.get_webview_window("main") {
-                    update_window_region(&window);
-                    let resized_window = window.clone();
-                    window.on_window_event(move |event| {
-                        if matches!(
-                            event,
-                            tauri::WindowEvent::Resized(_)
-                                | tauri::WindowEvent::Moved(_)
-                                | tauri::WindowEvent::ScaleFactorChanged { .. }
-                        ) {
-                            update_window_region(&resized_window);
-                        }
-                    });
-                }
+                update_window_region(&window);
+                let resized_window = window.clone();
+                window.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::Resized(_)
+                            | tauri::WindowEvent::ScaleFactorChanged { .. }
+                    ) {
+                        update_window_region(&resized_window);
+                    }
+                });
             }
             #[cfg(not(windows))]
-            let _ = app;
+            let _ = window;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
