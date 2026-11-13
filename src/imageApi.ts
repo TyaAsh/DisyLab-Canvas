@@ -10,7 +10,8 @@
 import { isDesktopApp, providerFetch } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
-import { inferModelCapability, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
+import type { VideoReferenceRules } from './videoReference'
+import { parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
 import { apiProviderForBase } from './apiProviders'
 import { checkMuseWebAccount, isMuseWebBase, listMuseWebModels, runMuseWebTask } from './museWeb'
 import { checkJimengAccount, isJimengCliBase, jimengImageRatios, jimengImageResolutions, listJimengModels, parseJimengJson, readJimengMedia, runJimengCli } from './jimengCli'
@@ -1788,25 +1789,36 @@ function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video' | 'au
 }
 
 export async function publishHfsyVideoReferenceImage(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob | string, signal?: AbortSignal) {
-  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
-  const failure = (detail: string) => new GenerationRequestError('platform', 'HFSY 参考图上传失败', `${detail}。视频生成尚未提交。`)
-  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考图服务需要 HTTPS 地址')
   const image = typeof source === 'string' ? await readImageSourceBlob(source, signal, 'HFSY 参考图') : source
-  if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(image.type)) throw failure('请选择 PNG、JPEG、WebP 或 GIF 图片')
-  if (image.size > 20 * 1024 * 1024) throw failure('单张参考图最多 20 MB')
+  return publishHfsyReferenceAsset(settings, image, 'image', signal)
+}
+
+export async function publishHfsyVideoReferenceVideo(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob, signal?: AbortSignal) {
+  return publishHfsyReferenceAsset(settings, source, 'video', signal)
+}
+
+async function publishHfsyReferenceAsset(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, blob: Blob, kind: 'image' | 'video', signal?: AbortSignal) {
+  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
+  const label = kind === 'video' ? '参考视频' : '参考图'
+  const failure = (detail: string) => new GenerationRequestError('platform', `HFSY ${label}上传失败`, `${detail}。视频生成尚未提交。`)
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考素材服务需要 HTTPS 地址')
+  const types = kind === 'video' ? ['video/mp4', 'video/quicktime'] : ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+  if (!types.includes(blob.type)) throw failure(kind === 'video' ? '请选择 MP4 或 MOV 视频' : '请选择 PNG、JPEG、WebP 或 GIF 图片')
+  const limit = kind === 'video' ? 24 : 20
+  if (!blob.size || blob.size > limit * 1024 * 1024) throw failure(`${label}须小于或等于 ${limit} MB 且不能为空`)
   let response: Response
   try {
     response = await providerFetch(endpoint, {
-      method: 'POST', signal, body: image, redirect: 'error', ...{ maxRedirections: 0 },
+      method: 'POST', signal, body: blob, redirect: 'error', ...{ maxRedirections: 0 },
       headers: {
         Authorization: `Bearer ${settings.apiKey.trim()}`,
-        'Content-Type': image.type,
+        'Content-Type': blob.type,
         'X-DisyLab-HFSY-Base': normalizedApiBaseUrl(settings.baseUrl),
       },
     })
   } catch (error) {
     if (signal?.aborted) throw error
-    throw failure('无法连接 DisyLab 的参考图上传服务，请稍后重试')
+    throw failure('无法连接 DisyLab 的参考素材上传服务，请稍后重试')
   }
   const result = await response.json().catch(() => null) as { url?: string; error?: { message?: string } } | null
   const url = result?.url && publicImageSourceUrl(result.url)
@@ -1814,7 +1826,10 @@ export async function publishHfsyVideoReferenceImage(settings: Pick<ApiRequestSe
     const published = new URL(url)
     if (published.origin === endpoint.origin && published.pathname === endpoint.pathname) return url
   }
-  throw failure(result?.error?.message || 'DisyLab 的参考图上传服务尚未启用或暂时不可用')
+  if (kind === 'video' && response.status === 415 && result?.error?.message === '参考图须为 PNG、JPEG、WebP 或 GIF') {
+    throw failure('当前临时素材服务尚未启用视频上传，已有公网视频链接仍可使用')
+  }
+  throw failure(result?.error?.message || 'DisyLab 的参考素材上传服务尚未启用或暂时不可用')
 }
 
 function hfsyFailureDetail(payload: unknown) {
@@ -1870,6 +1885,34 @@ export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
   if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, audios: 0, minReferenceImages: 2, prompt: 5000, durations: [6, 10, 15], ratios: [...HFSY_VERTICAL_RATIOS, '4:3', '3:4', '3:2', '2:3'] }
   if (model === 'kling-o3') return { minSeconds: 5, maxSeconds: 15, images: 8, videos: 0, audios: 0, prompt: 5000, ratios: [...HFSY_VERTICAL_RATIOS, '1:1'] }
   return undefined
+}
+
+export function videoReferenceRules(baseUrl: string, model: string): VideoReferenceRules | undefined {
+  const id = model.trim().toLowerCase()
+  const provider = apiProviderForBase(baseUrl)?.id
+  const hfsy = isHfsyBaseUrl(baseUrl)
+  if (isMuseWebBase(baseUrl) || isJimengCliBase(baseUrl) || getGrsaiVideoCapabilities(baseUrl, id)
+    || (provider === 'minimax' && !/^minimax-h3/.test(id))
+    || (/apiyi\.com/i.test(baseUrl) && (/veo/.test(id) || (/wan2\.|happyhorse/.test(id) && !/-r2v$/.test(id))))) return { maxCount: 0 }
+  if (provider === 'xai') return { maxCount: 1 }
+  if ((provider === 'ark' || /apiyi\.com/i.test(baseUrl)) && /seedance(?:[- ]?v)?[- ]?1/.test(id)) return { maxCount: 0 }
+  const nativeSeedance = (hfsy || provider === 'ark' || /apiyi\.com/i.test(baseUrl))
+    && /seedance(?:[- ]?v)?[- ]?2[. -]?[05](?!\d)/.test(id)
+  const gatewaySeedance = hfsy && /^sd-2(?:[.-]|$)/.test(id) && Boolean(hfsyVideoLimits(id))
+  const hfsyLimits = hfsy ? hfsyVideoLimits(id) : undefined
+  const upload = hfsy ? { localMaxBytes: 24 * 1024 ** 2, mp4OrMov: true } : {}
+  if (nativeSeedance || gatewaySeedance) {
+    const extended = /^(?:sd-2\.5|.*seedance(?:[- ]?v)?[- ]?2[. -]?5)(?!\d)/.test(id)
+    // Ark publishes the Seedance input dimensions. HFSY documents a narrower reference duration for VIP.
+    const vip = hfsy && /^sd-2-vip(?:-720)?$/.test(id)
+    return {
+      ...upload, mp4OrMov: true, seedanceDimensions: true, maxBytes: 200_000_000,
+      maxCount: hfsyLimits?.videos ?? (extended ? 10 : 3),
+      minSeconds: vip ? 3 : 2, maxSeconds: vip ? 10 : extended ? 30 : 15,
+      maxTotalSeconds: extended ? 30 : 15,
+    }
+  }
+  if (hfsy) return { ...upload, maxCount: hfsyLimits?.videos }
 }
 
 async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {

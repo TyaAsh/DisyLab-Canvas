@@ -15,7 +15,7 @@ const portSchema = z.object({
 export const skillManifestSchema = z.object({
   id: z.string().min(1).max(120), slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
   version: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/), name: z.string().min(1).max(80),
-  description: z.string().min(1).max(1024), kind: z.enum(['text', 'image', 'video', 'storyboard_comic', 'composite']), execution: z.enum(['instant', 'configured']).default('configured'), source: z.enum(['official', 'user']),
+  description: z.string().min(1).max(1024), kind: z.enum(['text', 'image', 'video', 'composite']), execution: z.enum(['instant', 'configured']).default('configured'), source: z.enum(['official', 'user']),
   enabled: z.boolean(), factoryVisible: z.boolean().optional(), parameters: z.array(parameterSchema).max(40), inputs: z.array(portSchema).max(20), output: portSchema,
   template: z.object({ prompt: z.string().min(1).max(24000), negativePrompt: z.string().max(8000).optional(), format: z.literal('plain').optional() }).strict(),
   capability: z.object({ supportedModes: z.array(z.string().min(1).max(60)).max(20), requiresReference: z.boolean().optional(), allowedModelCapabilities: z.array(z.enum(['text', 'image', 'video'])).min(1).max(3) }).strict(),

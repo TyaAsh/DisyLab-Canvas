@@ -893,3 +893,61 @@ test('video downloads reject partial responses and can read local blob URLs with
     return true
   })
 })
+
+test('HFSY publishes a local MP4 before creating an omni video task and serves byte ranges', async (t) => {
+  const endpoint = 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets'
+  const video = Buffer.from('000000186674797069736f6d0000000069736f6d6d703432', 'hex')
+  const assets = new Map()
+  const env = { HFSY_REFERENCE_ASSETS: {
+    async put(key, value, { metadata }) { assets.set(key, { value, metadata }) },
+    async getWithMetadata(key) { return assets.get(key) ?? { value: null, metadata: null } },
+  } }
+  const route = (request) => referenceAssets({ request, env })
+  let submitted = false
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url) === endpoint) return route(new Request(url, init))
+    if (String(url) === 'https://www.hfsyapi.cn/v1/models') return Response.json({ data: [{ id: 'sd-2-fast-480' }] })
+    if (String(url).endsWith('/video/create')) {
+      const body = JSON.parse(init.body)
+      const published = body.videos[0]
+      const full = await route(new Request(published))
+      assert.equal(full.headers.get('content-type'), 'video/mp4')
+      assert.deepEqual(Buffer.from(await full.arrayBuffer()), video)
+      const part = await route(new Request(published, { headers: { Range: 'bytes=4-7' } }))
+      assert.equal(part.status, 206)
+      assert.equal(part.headers.get('content-range'), 'bytes 4-7/24')
+      assert.equal(await part.text(), 'ftyp')
+      const invalid = await route(new Request(published, { headers: { Range: 'bytes=200-' } }))
+      assert.equal(invalid.status, 416)
+      submitted = true
+      return Response.json({ id: 'task-local-video', status: 'SUCCESS', result_url: 'https://media.aixinai.net/result.mp4' })
+    }
+    if (String(url).includes('result.mp4')) return new Response('video', { headers: { 'content-type': 'video/mp4' } })
+    throw new Error('Unexpected request')
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test-key', model: 'sd-2-fast-480' }
+  const published = await api.publishHfsyVideoReferenceVideo(settings, new Blob([video], { type: 'video/mp4' }))
+  await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 8, size: '1008x480', aspectRatio: '21:9', resolution: '480p', mode: 'all_reference', referenceVideos: [published] })
+  assert.equal(submitted, true)
+})
+
+test('video reference rules catch source dimensions without using the selected output resolution', async () => {
+  const { checkVideoReferences, unreadableVideoReferenceIssue } = await import(asModule(await compile('./videoReference.ts')))
+  const hfsy = 'https://api.hfsyapi.cn/v1'
+  const rules = api.videoReferenceRules(hfsy, 'sd-2-fast-480')
+  const video = (width, height, seconds = 5) => ({
+    name: 'reference.mp4', local: true,
+    metadata: { width, height, seconds, type: 'video/mp4', bytes: 1_000_000 },
+  })
+  assert.match(checkVideoReferences(rules, [video(640, 480)])[0], /640×480.*407,696/)
+  assert.match(checkVideoReferences(rules, [video(1920, 400)])[0], /宽高比 4.80/)
+  assert.deepEqual(checkVideoReferences(rules, [video(1920, 1080), video(720, 1280)]), [])
+  assert.match(checkVideoReferences(rules, [video(1920, 1080, 8), video(1280, 720, 8)])[0], /总时长 16 秒/)
+  assert.match(checkVideoReferences(rules, [{ ...video(720, 1280), metadata: { ...video(720, 1280).metadata, bytes: 25 * 1024 ** 2, type: 'video/webm' } }])[0], /MP4 或 MOV.*24 MB/)
+  assert.match(checkVideoReferences(api.videoReferenceRules(hfsy, 'sd-2-vip'), [video(720, 1280, 2)])[0], /3–10 秒/)
+  assert.equal(api.videoReferenceRules('https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance-2-5-260628').maxCount, 10)
+  assert.equal(api.videoReferenceRules('https://api.apiyi.com/v1', 'wan2.6-r2v'), undefined)
+  assert.equal(api.videoReferenceRules(hfsy, 'minimax-h3').maxCount, 0)
+  assert.match(unreadableVideoReferenceIssue([{ name: 'broken.mp4', local: true }]), /broken.mp4/)
+  assert.equal(unreadableVideoReferenceIssue([{ name: 'remote.mp4', local: false }]), undefined)
+})

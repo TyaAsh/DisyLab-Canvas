@@ -1,4 +1,4 @@
-export type SkillKind = 'text' | 'image' | 'video' | 'storyboard_comic' | 'composite'
+export type SkillKind = 'text' | 'image' | 'video' | 'composite'
 export type SkillExecutionMode = 'instant' | 'configured'
 export type SkillPortType = 'text' | 'image' | 'video'
 

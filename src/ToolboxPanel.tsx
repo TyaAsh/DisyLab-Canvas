@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { PDFDocument } from 'pdf-lib'
 import { Check, ChevronLeft, ChevronRight, Combine, Download, FileArchive, FileImage, Film, GripVertical, LoaderCircle, PackageOpen, ScanLine, Trash2, X } from 'lucide-react'
-import { compressPdf } from './pdfCompressor'
 import { ToolboxDropZone } from './ToolboxDropZone'
 import { WatermarkTool, WATERMARK_IMAGE_ACCEPT, WATERMARK_VIDEO_ACCEPT } from './VideoWatermarkTool'
 import './toolbox.css'
@@ -29,35 +27,78 @@ const iconButtonClass = 'grid size-[30px] place-items-center rounded-[9px] borde
 const glassCardClass = 'border border-white/10 bg-[linear-gradient(145deg,rgba(255,255,255,.065),rgba(255,255,255,.018))] shadow-[inset_0_1px_rgba(255,255,255,.07)] backdrop-blur-[14px]'
 
 async function compressImage(file: File, quality: number, maxEdge: number) {
-  const bitmap = await createImageBitmap(file)
-  const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height))
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale))
-  canvas.getContext('2d', { alpha: file.type === 'image/png' })?.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-  bitmap.close()
   const extension = file.name.split('.').pop()?.toLowerCase() || 'jpg'
   const type = file.type || ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', avif: 'image/avif' } as Record<string, string>)[extension]
   if (!type) throw new Error(`暂不支持 ${extension.toUpperCase()} 原格式编码`)
-  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('图片编码失败')), type, quality))
+
+  const bitmap = await createImageBitmap(file)
+  const canvas = document.createElement('canvas')
+  try {
+    const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height))
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    const context = canvas.getContext('2d', { alpha: type !== 'image/jpeg' })
+    if (!context) throw new Error('无法创建图片压缩画布')
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+  } finally {
+    bitmap.close()
+  }
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((value) => value ? resolve(value) : reject(new Error('图片编码失败')), type, quality)
+  })
   if (blob.type !== type) throw new Error(`当前浏览器不能输出 ${extension.toUpperCase()}，已停止处理以保持原格式`)
   return { blob, name: outputName(file.name, 'compressed', extension) }
 }
 
 async function compressVideo(file: File, quality: number) {
-  const video = document.createElement('video'); video.src = URL.createObjectURL(file); video.muted = true; video.playsInline = true
-  await new Promise<void>((resolve, reject) => { video.onloadedmetadata = () => resolve(); video.onerror = () => reject(new Error('无法读取视频')) })
+  const video = document.createElement('video')
   const capture = (video as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream
-  if (!capture || typeof MediaRecorder === 'undefined') { URL.revokeObjectURL(video.src); throw new Error('当前浏览器不支持本地视频压缩') }
-  const stream = capture.call(video)
-  const sourceExtension = file.name.split('.').pop()?.toLowerCase() || 'webm'
-  const sameContainer = file.type && MediaRecorder.isTypeSupported(file.type) ? file.type : ''
-  const mimeType = sameContainer || (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' : 'video/webm')
-  const chunks: BlobPart[] = []; const bitrate = Math.round(400_000 + quality * 3_600_000)
-  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: bitrate })
-  const result = new Promise<Blob>((resolve, reject) => { recorder.ondataavailable = (event) => event.data.size && chunks.push(event.data); recorder.onerror = () => reject(new Error('视频编码失败')); recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType.split(';')[0] })) })
-  video.onended = () => recorder.state !== 'inactive' && recorder.stop(); recorder.start(500); await video.play(); const blob = await result
-  stream.getTracks().forEach((track) => track.stop()); URL.revokeObjectURL(video.src)
-  return { blob, name: outputName(file.name, 'compressed', sameContainer ? sourceExtension : 'webm'), converted: !sameContainer }
+  if (!capture || typeof MediaRecorder === 'undefined') throw new Error('当前浏览器不支持本地视频压缩')
+
+  const url = URL.createObjectURL(file)
+  let stream: MediaStream | undefined
+  let recorder: MediaRecorder | undefined
+  try {
+    video.muted = true
+    video.playsInline = true
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve()
+      video.onerror = () => reject(new Error('无法读取视频'))
+      video.src = url
+    })
+
+    stream = capture.call(video)
+    const sourceExtension = file.name.split('.').pop()?.toLowerCase() || 'webm'
+    const sameContainer = file.type && MediaRecorder.isTypeSupported(file.type) ? file.type : ''
+    const mimeType = sameContainer || ['video/webm;codecs=vp9,opus', 'video/webm'].find((type) => MediaRecorder.isTypeSupported(type))
+    if (!mimeType) throw new Error('当前浏览器没有可用的视频编码格式')
+
+    const chunks: BlobPart[] = []
+    const encoder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: Math.round(400_000 + quality * 3_600_000) })
+    recorder = encoder
+    const result = new Promise<Blob>((resolve, reject) => {
+      encoder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data) }
+      encoder.onerror = () => reject(new Error('视频编码失败'))
+      encoder.onstop = () => {
+        if (!chunks.length) reject(new Error('视频编码未生成数据'))
+        else resolve(new Blob(chunks, { type: mimeType.split(';')[0] }))
+      }
+      video.onended = () => { if (encoder.state !== 'inactive') encoder.stop() }
+      video.onerror = () => reject(new Error('视频播放中断'))
+      encoder.start(500)
+    })
+    const [blob] = await Promise.all([result, video.play()])
+    return { blob, name: outputName(file.name, 'compressed', sameContainer ? sourceExtension : 'webm'), converted: !sameContainer }
+  } finally {
+    video.onended = video.onerror = video.onloadedmetadata = null
+    if (recorder && recorder.state !== 'inactive') recorder.stop()
+    stream?.getTracks().forEach((track) => track.stop())
+    video.pause()
+    video.removeAttribute('src')
+    video.load()
+    URL.revokeObjectURL(url)
+  }
 }
 
 export function ToolboxPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -92,10 +133,12 @@ export function ToolboxPanel({ open, onClose }: { open: boolean; onClose: () => 
       } else if (active === 'video') {
         const result = await compressVideo(files[0].file, quality / 100); downloadBlob(result.blob, result.name); if (result.converted) setStatus('处理完成 · 当前浏览器以 WebM 输出')
       } else if (active === 'pdf-merge') {
+        const { PDFDocument } = await import('pdf-lib')
         const merged = await PDFDocument.create()
         for (const item of files) { const source = await PDFDocument.load(await item.file.arrayBuffer()); const pages = await merged.copyPages(source, source.getPageIndices()); pages.forEach((page) => merged.addPage(page)) }
         downloadBlob(pdfBlob(await merged.save({ useObjectStreams: true })), 'disy-merged.pdf')
       } else {
+        const { compressPdf } = await import('./pdfCompressor')
         let savedBytes = 0
         let originalBytes = 0
         let downloaded = 0

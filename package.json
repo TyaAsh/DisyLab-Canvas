@@ -24,7 +24,7 @@
     "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library",
     "test:toolbox": "node --disable-warning=ExperimentalWarning --test src/watermark.test.mjs",
     "test:relay": "node --test functions/relay.test.mjs",
-    "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/storyboard.test.mjs src/agentRuntime.test.mjs src/museWeb.test.mjs",
+    "test:providers": "node --test src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/agentRuntime.test.mjs src/museWeb.test.mjs",
     "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs"
   },
   "dependencies": {

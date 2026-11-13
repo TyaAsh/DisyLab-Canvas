@@ -18,15 +18,14 @@ const canvasToJpeg = (canvas: HTMLCanvasElement, quality: number) => new Promise
 export async function compressPdf(file: File, quality: number, maxEdge: number): Promise<PdfCompressionResult> {
   const sourceBytes = new Uint8Array(await file.arrayBuffer())
   const loadingTask = getDocument({ data: sourceBytes })
-  const source = await loadingTask.promise
-  const output = await PDFDocument.create()
-
   try {
+    const source = await loadingTask.promise
+    const output = await PDFDocument.create()
     for (let pageNumber = 1; pageNumber <= source.numPages; pageNumber += 1) {
       const page = await source.getPage(pageNumber)
       const baseViewport = page.getViewport({ scale: 1 })
       const scale = Math.min(2.5, maxEdge / Math.max(baseViewport.width, baseViewport.height))
-      const viewport = page.getViewport({ scale: Math.max(1, scale) })
+      const viewport = page.getViewport({ scale })
       const canvas = document.createElement('canvas')
       canvas.width = Math.max(1, Math.round(viewport.width))
       canvas.height = Math.max(1, Math.round(viewport.height))
@@ -48,6 +47,6 @@ export async function compressPdf(file: File, quality: number, maxEdge: number):
     const blob = new Blob([Uint8Array.from(bytes).buffer], { type: 'application/pdf' })
     return { blob, originalSize: file.size, compressedSize: blob.size, pageCount: source.numPages }
   } finally {
-    await source.destroy()
+    await loadingTask.destroy()
   }
 }

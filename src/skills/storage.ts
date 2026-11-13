@@ -17,7 +17,7 @@ export function subscribeToSkillDeletion(listener: (key: string) => void) {
 
 export async function listUserSkillManifests(): Promise<SkillManifest[]> {
   const rows = await (await dbPromise).getAll('skill_manifests') as Array<{ key: string; manifest: SkillManifest }>
-  return rows.map((row) => row.manifest).filter((skill) => skill.source === 'user')
+  return rows.map((row) => row.manifest).filter((skill) => skill.source === 'user' && (skill.kind as string) !== 'storyboard_comic')
 }
 
 export async function saveUserSkillManifest(manifest: SkillManifest) {

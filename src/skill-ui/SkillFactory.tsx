@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
-import { ArrowLeft, ArrowUpRight, Check, ChevronDown, CircleHelp, Copy, FileText, FileUp, Film, FolderUp, Grid3X3, Image, LayoutGrid, MessageCircle, Pencil, Play, Plus, Route, Search, Settings2, Sparkles, Star, Trash2, Type, X, Zap } from 'lucide-react'
+import { ArrowLeft, ArrowUpRight, Check, ChevronDown, CircleHelp, Copy, FileText, FileUp, Film, FolderUp, Image, LayoutGrid, MessageCircle, Pencil, Play, Plus, Route, Search, Settings2, Sparkles, Star, Trash2, Type, X, Zap } from 'lucide-react'
 import { listSkills, officialSkills } from '../skills/registry'
 import { importSkillFile, isSkillImportFile } from '../skills/importExport'
 import { deleteUserSkillManifest, saveUserSkillManifest, subscribeToSkillDeletion } from '../skills/storage'
@@ -26,8 +26,8 @@ description: 将零散的创意整理成可执行的项目需求。
 根据用户给出的素材，整理项目目标、目标受众和核心卖点。
 最后列出建议的交付物和需要用户确认的信息。`
 const exampleManifest = `{"id":"user.product-poster","slug":"product-poster","version":"1.0.0","name":"产品海报","description":"将产品卖点整理成海报提示词。","kind":"image","execution":"configured","source":"user","enabled":true,"parameters":[],"inputs":[],"output":{"name":"image","type":"image"},"template":{"prompt":"设计海报：{{subject}}"},"capability":{"supportedModes":["image_generation"],"allowedModelCapabilities":["image"]},"createdAt":0,"updatedAt":0}`
-const categoryIcon = (c: SkillCategory) => c.id === 'all' ? Sparkles : c.kind === 'composite' ? Route : c.kind === 'storyboard_comic' ? Grid3X3 : c.kind === 'image' ? Image : c.kind === 'video' ? Film : c.kind === 'text' ? Type : LayoutGrid
-const kindLabel = (kind: SkillKind) => kind === 'composite' ? '复合 Skill' : kind === 'storyboard_comic' ? '多阶段工作流' : kind === 'image' ? '图像 Skill' : kind === 'video' ? '视频 Skill' : '文本 Skill'
+const categoryIcon = (c: SkillCategory) => c.id === 'all' ? Sparkles : c.kind === 'composite' ? Route : c.kind === 'image' ? Image : c.kind === 'video' ? Film : c.kind === 'text' ? Type : LayoutGrid
+const kindLabel = (kind: SkillKind) => kind === 'composite' ? '复合 Skill' : kind === 'image' ? '图像 Skill' : kind === 'video' ? '视频 Skill' : '文本 Skill'
 
 export function SkillFactory({ open, initialView = 'browse', initialSkillSlug = '', onClose, onLaunch }: Props) {
   const fileRef = useRef<HTMLInputElement>(null)
