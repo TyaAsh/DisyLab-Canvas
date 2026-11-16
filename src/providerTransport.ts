@@ -52,8 +52,6 @@ export function resolveDesktopProviderRequest(input: string | URL, init?: Reques
   } else if (path.startsWith('/visionary/')) {
     const base = trustedBase(headers.get('x-disylab-visionary-base'), 'https://api.visionary.beer/v1', VISIONARY_HOSTS)
     target = new URL(base.origin + base.pathname.replace(/\/$/, '') + path.slice('/visionary'.length) + url.search)
-  } else if (path.startsWith('/evolink/')) {
-    target = new URL('https://api.evolink.ai/v1' + path.slice('/evolink'.length) + url.search)
   } else {
     return undefined
   }

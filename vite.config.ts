@@ -215,31 +215,6 @@ const apiYiMediaRelayPlugin: Plugin = {
         response.end(JSON.stringify({ error: { message: `HFSY 上游连接失败：${error instanceof Error ? error.message : String(error)}` } }))
       }
     })
-    server.middlewares.use('/evolink', async (request, response, next) => {
-      if (!['GET', 'POST', 'HEAD'].includes(request.method ?? '')) return next()
-      try {
-        const upstreamPath = (request.url || '/').replace(/^\/evolink\/?/, '').replace(/^\/+/, '')
-        const target = new URL(upstreamPath, 'https://api.evolink.ai/v1/')
-        const headers = new Headers()
-        for (const [name, value] of Object.entries(request.headers)) {
-          if (['host', 'content-length', 'connection', 'x-disylab-evolink-base'].includes(name.toLowerCase())) continue
-          if (Array.isArray(value)) headers.set(name, value.join(', '))
-          else if (value) headers.set(name, value)
-        }
-        headers.set('Accept-Encoding', 'identity')
-        const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await readBody(request)
-        const upstream = await fetch(target, { method: request.method, headers, body })
-        const output = Buffer.from(await upstream.arrayBuffer())
-        response.statusCode = upstream.status
-        response.setHeader('content-type', upstream.headers.get('content-type') || 'application/json')
-        response.setHeader('content-length', output.length)
-        response.end(output)
-      } catch {
-        response.statusCode = 502
-        response.setHeader('content-type', 'application/json')
-        response.end(JSON.stringify({ error: { message: 'Evolink 上游连接失败' } }))
-      }
-    })
     server.middlewares.use('/visionary', async (request, response, next) => {
       if (!['GET', 'POST', 'HEAD'].includes(request.method ?? '')) return next()
       try {
@@ -297,7 +272,7 @@ const apiYiMediaRelayPlugin: Plugin = {
         const mediaHostAllowed = (url: URL) => url.protocol === 'https:'
           && !url.username && !url.password && !url.port
           && (/(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
-            || url.hostname === 'vidgen.x.ai'
+            || ['vidgen.x.ai', 'veo-video.gptkey.asia'].includes(url.hostname)
             || (url.hostname === '8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com' && url.pathname.startsWith('/video/')))
         if (!mediaHostAllowed(targetUrl)) {
           response.statusCode = 403

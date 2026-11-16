@@ -30,3 +30,11 @@ test('missing upstream text never leaks an internal node token', () => {
   assert.equal(result.prompt, '使用 完成任务')
   assert.equal(result.guide, '')
 })
+
+test('confirmed video frame slots keep their order when one source is also connected to the canvas', () => {
+  const first = { id: 'first', mediaId: 'local-a' }
+  const last = { id: 'last', url: 'https://example.test/b.png' }
+  const connected = [{ ...last, id: 'connection-b' }, { id: 'connection-c', url: 'https://example.test/c.png' }]
+  assert.deepEqual(references.resolveVideoFrameSources([first, last], connected).slice(0, 2), [first, last])
+  assert.deepEqual(references.resolveVideoFrameSources([{ id: 'first' }, last], connected).slice(0, 2), [connected[1], last])
+})

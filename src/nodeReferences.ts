@@ -37,3 +37,11 @@ export function expandConnectedTextReferences(prompt: string, references: Connec
     : ''
   return { prompt: expandedPrompt, guide }
 }
+
+export function resolveVideoFrameSources<T extends { url?: string; mediaId?: string }>(slots: readonly T[], connected: readonly T[]) {
+  const hasSource = (entry: T) => Boolean(entry.url || entry.mediaId)
+  const filled = slots.filter(hasSource)
+  const candidates = connected.filter((entry) => hasSource(entry) && !filled.some((slot) =>
+    Boolean(entry.mediaId && entry.mediaId === slot.mediaId || entry.url && entry.url === slot.url)))
+  return [...slots.map((entry) => hasSource(entry) ? entry : candidates.shift()).filter((entry): entry is T => Boolean(entry)), ...candidates]
+}

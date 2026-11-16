@@ -427,3 +427,99 @@ test('explicit video frame and image counts describe different deliverables', as
   assert.equal(agent.requestedAgentImageCount('生成六张视频关键帧'), 6)
   assert.equal(agent.requestedAgentImageCount('一共要十张独立图'), 10)
 })
+
+test('media brief carries earlier user specs and reads only answers from a guided clarification', () => {
+  const request = '帮我生成两条咖啡短片，每条 8 秒，横屏 16:9，1080p'
+  const refs = [{ nodeId: 'coffee', name: '咖啡参考', url: 'https://example.test/coffee.png' }]
+  const history = [
+    { id: 'user', role: 'user', content: request, references: refs },
+    { id: 'ask', role: 'assistant', content: '选一个方向', mediaBrief: { requests: [request], replaces: 'old' }, questions: [{ prompt: '沿用 16:9 还是改成 9:16？', options: [] }] },
+  ]
+  const followup = agent.resolveAgentMediaContinuation(history, '沿用 16:9 还是改成 9:16？\n9:16')
+  assert.deepEqual(followup.requests, [request, '9:16'])
+  assert.deepEqual(followup.lastUser.references, refs)
+  assert.equal(followup.replaces, 'old')
+  assert.deepEqual(agent.agentMediaSpecs(followup.requests, 'video'), { aspectRatio: '9:16', resolution: '1080p', duration: 8, count: 2 })
+  assert.equal(agent.resolveAgentMediaContinuation(history, '换个话题，帮我做张海报'), undefined)
+  const mediaPrompt = '这轮有素材，是用素材还是只用文字？'
+  const mediaHistory = [history[0], { ...history[1], questions: [{ prompt: mediaPrompt, options: ['使用现有参考素材', '只用文字'] }] }]
+  const mediaChoice = agent.resolveAgentMediaContinuation(mediaHistory, `${mediaPrompt}\n使用现有参考素材`)
+  assert.deepEqual(agent.continueAgentMediaReferences(mediaChoice.lastUser.references, [], mediaChoice.requests.at(-1)), refs)
+})
+
+test('media revisions keep untouched values and a new brief stays independent', () => {
+  const request = '做三张 4:5 海报，2K'
+  const history = [{ id: 'card', role: 'assistant', mediaBrief: { requests: [request] } }]
+  const revised = agent.resolveAgentMediaContinuation(history, '把比例改成 3:4，其他不变')
+  assert.equal(revised.replaces, 'card')
+  assert.deepEqual(agent.agentMediaSpecs(revised.requests, 'image'), { aspectRatio: '3:4', resolution: '2K', count: 3 })
+  assert.equal(agent.resolveAgentMediaContinuation(history, '整理一下我们聊的重点'), undefined)
+  assert.equal(agent.agentMediaSpecs(['小红书 4:5，故事版 9:16'], 'image').aspectRatio, undefined)
+})
+
+test('automatic video mode uses attached media and respects explicit frame roles', () => {
+  assert.equal(agent.resolveAgentVideoMode({}, 'text', 1, 0), 'image')
+  assert.equal(agent.resolveAgentVideoMode({}, 'text', 2, 0), 'reference')
+  assert.equal(agent.resolveAgentVideoMode({}, 'image', 1, 1), 'omni')
+  const explicit = agent.agentMediaSpecs(['用图 1 做首帧，图 2 做尾帧，生成一段 5 秒视频'], 'video')
+  assert.equal(explicit.generationMode, 'frames')
+  assert.equal(agent.resolveAgentVideoMode(explicit, undefined, 2, 0), 'frames')
+})
+
+test('answering a storyboard clarification retains the first frame when adding the last frame', () => {
+  const first = { nodeId: 'first', name: '开场', url: 'https://example.test/first.png' }
+  const last = { nodeId: 'last', name: '结尾', url: 'https://example.test/last.png' }
+  const history = [
+    { id: 'user', role: 'user', content: '用 @开场 当首帧生成一条 5 秒视频', references: [first] },
+    { id: 'ask', role: 'assistant', questions: [{ prompt: '尾帧用哪张？', options: [] }],
+      mediaBrief: { requests: ['用当首帧生成一条 5 秒视频'], referenceRequests: ['用 @开场 当首帧生成一条 5 秒视频'] } },
+  ]
+  const continuation = agent.resolveAgentMediaContinuation(history, '尾帧用哪张？\n用新图作尾帧', '尾帧用哪张？\n用 @结尾 作尾帧')
+  assert.deepEqual(continuation.referenceRequests, ['用 @开场 当首帧生成一条 5 秒视频', '用 @结尾 作尾帧'])
+  assert.deepEqual(agent.continueAgentMediaReferences(continuation.lastUser.references, [last], '再用这张作尾帧'), [first, last])
+  assert.deepEqual(agent.continueAgentMediaReferences(continuation.lastUser.references, [last], '只用这张新图'), [last])
+})
+
+test('revisions in conversational language keep brief and previously confirmed reference names', () => {
+  const history = [{ id: 'plan', role: 'assistant', mediaBrief: { requests: ['做两条视频，8 秒，16:9'] } }]
+  const followup = agent.resolveAgentMediaContinuation(history, '请把比例改成 4:5，其他不变')
+  assert.equal(followup.replaces, 'plan')
+  assert.deepEqual(agent.agentMediaSpecs(followup.requests, 'video'), { count: 2, aspectRatio: '4:5', duration: 8 })
+  assert.equal(agent.resolveAgentMediaContinuation(history, '那就把时长改到 10 秒').replaces, 'plan')
+})
+
+test('frame binding follows stated order, and text-only follow-ups clear earlier media', () => {
+  const refs = [
+    { nodeId: 'a', name: '原图A', url: 'https://example.test/a.png' },
+    { nodeId: 'b', name: '原图B', url: 'https://example.test/b.png' },
+  ]
+  assert.deepEqual(agent.bindAgentVideoFrames(refs, ['用 @原图B 做首帧，图1 做尾帧']).references.map(({ nodeId }) => nodeId), ['b', 'a'])
+  assert.deepEqual(agent.bindAgentVideoFrames(refs, ['第二张图作为首帧，第一张图作为尾帧']).references.map(({ nodeId }) => nodeId), ['b', 'a'])
+  assert.deepEqual(agent.bindAgentVideoFrames(refs, ['图二做首帧，图一做尾帧']).references.map(({ nodeId }) => nodeId), ['b', 'a'])
+  assert.deepEqual(agent.bindAgentVideoFrames(refs, ['首帧是原图B，尾帧是原图A']).references.map(({ nodeId }) => nodeId), ['b', 'a'])
+  assert.match(agent.bindAgentVideoFrames(refs, ['首帧用图3']).issue, /图3/)
+  assert.deepEqual(agent.continueAgentMediaReferences(refs, [], '只用文字'), [])
+  assert.equal(agent.agentMediaSpecs(['文生视频', '使用现有参考素材'], 'video').generationMode, undefined)
+})
+
+test('distinct image and video briefs keep their own specs and two groups retain separate durations', () => {
+  const mixed = ['做2张海报4:5，2K，再做3条短片16:9，每条8秒，4K']
+  assert.deepEqual(agent.agentMediaSpecs(mixed, 'image'), { aspectRatio: '4:5', count: 2, resolution: '2K' })
+  assert.deepEqual(agent.agentMediaSpecs(mixed, 'video'), { aspectRatio: '16:9', count: 3, duration: 8, resolution: '4k' })
+  assert.deepEqual(agent.agentVideoDeliverables(['先做一个8秒短片，再做两个5秒短片']), [
+    { count: 1, duration: 8 }, { count: 2, duration: 5 },
+  ])
+  assert.equal(agent.agentMediaSpecs(['视频8秒，最后改成5秒'], 'video').duration, 5)
+  assert.deepEqual(agent.agentRatioSequence(['一张 4:5 的海报，一张 3:2 的横幅', '用自然光']), ['4:5', '3:2'])
+})
+
+test('video groups can each bind a different pair of frames from the same brief', () => {
+  const requests = ['做一条8秒短片，用图2做首帧，图1做尾帧；再做一条5秒短片，用图4做首帧，图3做尾帧']
+  const refs = ['a', 'b', 'c', 'd'].map((id) => ({ nodeId: id, name: `素材${id}`, url: `https://example.test/${id}.png` }))
+  const deliverables = agent.agentVideoDeliverables(requests)
+  const groups = agent.agentVideoFrameRequests(requests, deliverables.length)
+  assert.deepEqual(groups.map((group) => agent.bindAgentVideoFrames(refs, group, true).references.map(({ nodeId }) => nodeId)), [
+    ['b', 'a'], ['d', 'c'],
+  ])
+  assert.match(agent.bindAgentVideoFrames(refs, ['首帧用图2'], true).issue, /这条视频对应/)
+})

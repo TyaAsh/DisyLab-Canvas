@@ -24,7 +24,6 @@
   <a href="https://disylab.pages.dev">線上體驗</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/">專案官網</a> ·
   <a href="#快速開始">快速開始</a> ·
-  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.3/DisyLab_2.0.3_x64.exe">下載 Windows 版</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/#roadmap">發展路線</a>
 </p>
 
@@ -81,7 +80,7 @@ npm run build
 
 ## 目前範圍
 
-DisyLab 2.0 提供網頁版與 Windows x64 桌面版。桌面版支援即夢官方 CLI 授權與獨立的 Muse 網頁登入工作階段。macOS 版稍後推出。專案儲存在本機，可用 `.disy` 專案包移轉。[2.0.3 發布頁](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.3)提供直接執行版及校驗檔案。
+Windows 桌面版暫停公開下載，目前可使用[網頁版](https://disylab.pages.dev/)。macOS 版稍後推出。專案儲存在本機，可用 `.disy` 專案包移轉。
 
 ## 授權
 

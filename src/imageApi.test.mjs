@@ -16,7 +16,9 @@ const providers = asModule(await compile('./apiProviders.ts'))
 const jimeng = asModule((await compile('./jimengCli.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
 const museWeb = asModule((await compile('./museWeb.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
 const { resolveDesktopProviderRequest } = await import(transport)
+const referenceMediaModule = asModule(await compile('./referenceMediaValidation.ts'))
 const api = await import(asModule((await compile('./imageApi.ts'))
+  .replace("'./referenceMediaValidation'", JSON.stringify(referenceMediaModule))
   .replace("'./providerLifecycle'", JSON.stringify(lifecycle))
   .replace("'./providerTransport'", JSON.stringify(transport))
   .replace("'./apiProviders'", JSON.stringify(providers))
@@ -50,7 +52,6 @@ test('desktop translates browser relay paths without depending on the dev server
     ['/hfsy/__root__/api/pricing', { 'x-disylab-hfsy-base': 'https://www.hfsyapi.cn/v1' }, 'https://www.hfsyapi.cn/api/pricing'],
     ['/apiyi/seedance/v1/contents/generations/tasks', { 'x-disylab-apiyi-origin': 'https://vip.apiyi.com' }, 'https://vip.apiyi.com/v1/contents/generations/tasks'],
     ['/visionary/tasks/job_1', {}, 'https://api.visionary.beer/v1/tasks/job_1'],
-    ['/evolink/tasks/job_1', {}, 'https://api.evolink.ai/v1/tasks/job_1'],
   ]
   for (const [path, headers, target] of cases) {
     const request = resolveDesktopProviderRequest(path, { headers: { ...headers, Authorization: 'Bearer test' } })
@@ -459,7 +460,7 @@ test('HFSY can read a local reference through KV and the link expires automatica
     throw new Error('Unexpected request')
   })
   const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test-key', model: 'sd-2-fast-720' }
-  const url = await api.publishHfsyVideoReferenceImage(settings, new Blob([png], { type: 'image/png' }))
+  const url = await api.publishHfsyReferenceImage(settings, new Blob([png], { type: 'image/png' }))
   assert.equal(objects.size, 1)
   await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 6, size: '1280x720', mode: 'image2video', firstFrame: url })
   assert.equal(submittedUrl, url)
@@ -931,23 +932,367 @@ test('HFSY publishes a local MP4 before creating an omni video task and serves b
   assert.equal(submitted, true)
 })
 
-test('video reference rules catch source dimensions without using the selected output resolution', async () => {
-  const { checkVideoReferences, unreadableVideoReferenceIssue } = await import(asModule(await compile('./videoReference.ts')))
-  const hfsy = 'https://api.hfsyapi.cn/v1'
-  const rules = api.videoReferenceRules(hfsy, 'sd-2-fast-480')
-  const video = (width, height, seconds = 5) => ({
-    name: 'reference.mp4', local: true,
-    metadata: { width, height, seconds, type: 'video/mp4', bytes: 1_000_000 },
+test('HFSY local video preflight enforces the relay format and upload size', async () => {
+  const { referenceMediaIssue } = await import(asModule(await compile('./referenceMediaValidation.ts')))
+  const rules = api.videoReferenceRules('https://api.hfsyapi.cn/v1', 'sd-2-fast-480')
+  const local = rules.media({ kind: 'video', mediaId: 'local-clip' })
+  assert.equal(local.publicOnly, false)
+  assert.equal(local.requireReadable, true)
+  assert.match(referenceMediaIssue({ type:'video/webm' }, local), /MP4、MOV/)
+  assert.match(referenceMediaIssue({ type:'video/mp4', bytes:25 * 1024 ** 2 }, local), /24 MB/)
+  assert.equal(referenceMediaIssue({ type:'video/mp4', bytes:4 * 1024 ** 2, duration:5 }, local), undefined)
+  const remote = rules.media({ kind: 'video', publicUrl:'https://example.test/video.mp4' })
+  assert.equal(referenceMediaIssue({ type:'video/mp4', bytes:25 * 1024 ** 2, duration:5 }, remote), undefined)
+})
+
+test('reference rules report model limits with the actual image or video dimensions', async () => {
+  const { referenceMediaIssue } = await import(asModule(await compile('./referenceMediaValidation.ts')))
+  const ark = api.videoReferenceRules('https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance-2.0')
+  assert.match(referenceMediaIssue({ width: 2700, height: 900 }, ark.media({ kind: 'image' })), /宽高比须在 0.4 到 2.5/)
+  assert.equal(referenceMediaIssue({ width: 1200, height: 900 }, ark.media({ kind: 'image' })), undefined)
+  assert.match(referenceMediaIssue({ width: 640, height: 480, duration: 5 }, ark.media({ kind: 'video' })), /总像素数须在 407,696 到 8,295,044/)
+  const hfsy = api.videoReferenceRules('https://www.hfsyapi.cn/v1', 'minimax-h3')
+  assert.equal(hfsy.videos, 0)
+  assert.equal(hfsy.minImages, 1)
+  assert.match(referenceMediaIssue({ width: 900, height: 900, bytes: 21 * 1024 ** 2 }, hfsy.media({ kind: 'image' })), /不能超过 20 MB/)
+  assert.equal(api.videoReferenceRules('https://grsaiapi.com/v1', 'minimax-h3').frames, false)
+  assert.equal(api.videoReferenceRules('https://api.x.ai/v1', 'grok-imagine-video-1.5').videos, 0)
+})
+
+test('HFSY Seedream 5.5 exposes 2K and six references and sends a native image request', async (t) => {
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'seedream-5.5' }
+  const caps = api.getHfsyImageCapabilities(settings.baseUrl, settings.model)
+  assert.deepEqual(caps.resolutions, ['2K'])
+  assert.equal(caps.images, 6)
+  assert.equal(api.imageReferenceRules(settings.baseUrl, settings.model).totals.maxImageBytes, 25 * 1024 ** 2)
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push([String(url), JSON.parse(init.body)])
+    return Response.json({ status: 'completed', images: [{ url: 'https://example.test/output.png' }] })
   })
-  assert.match(checkVideoReferences(rules, [video(640, 480)])[0], /640×480.*407,696/)
-  assert.match(checkVideoReferences(rules, [video(1920, 400)])[0], /宽高比 4.80/)
-  assert.deepEqual(checkVideoReferences(rules, [video(1920, 1080), video(720, 1280)]), [])
-  assert.match(checkVideoReferences(rules, [video(1920, 1080, 8), video(1280, 720, 8)])[0], /总时长 16 秒/)
-  assert.match(checkVideoReferences(rules, [{ ...video(720, 1280), metadata: { ...video(720, 1280).metadata, bytes: 25 * 1024 ** 2, type: 'video/webm' } }])[0], /MP4 或 MOV.*24 MB/)
-  assert.match(checkVideoReferences(api.videoReferenceRules(hfsy, 'sd-2-vip'), [video(720, 1280, 2)])[0], /3–10 秒/)
-  assert.equal(api.videoReferenceRules('https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance-2-5-260628').maxCount, 10)
-  assert.equal(api.videoReferenceRules('https://api.apiyi.com/v1', 'wan2.6-r2v'), undefined)
-  assert.equal(api.videoReferenceRules(hfsy, 'minimax-h3').maxCount, 0)
-  assert.match(unreadableVideoReferenceIssue([{ name: 'broken.mp4', local: true }]), /broken.mp4/)
-  assert.equal(unreadableVideoReferenceIssue([{ name: 'remote.mp4', local: false }]), undefined)
+  const options = { prompt: 'draw', count: 1, aspectRatio: '16:9', resolution: '2K', referenceImages: ['https://example.test/reference.png'] }
+  await assert.rejects(() => api.generateRemoteImages(settings, { ...options, referenceImages: Array(7).fill(options.referenceImages[0]) }), { detail: /最多支持 6 张参考图/ })
+  assert.equal(requests.length, 0)
+  assert.deepEqual((await api.generateRemoteImages(settings, options)).map(({ url }) => url), ['https://example.test/output.png'])
+  assert.deepEqual(requests, [[
+    'https://www.hfsyapi.cn/v1/image/create',
+    { model: settings.model, prompt: 'draw', size: '2048x1152', reference_images: options.referenceImages },
+  ]])
+})
+
+
+test('HFSY H3 preflight and relay accept JPEG bytes from old records with missing or incorrect MIME', async (t) => {
+  const { checkReferenceMedia, imageMimeFromBytes } = await import(referenceMediaModule)
+  const baseUrl = 'https://www.hfsyapi.cn/v1'
+  const model = 'minimax-h3'
+  const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0])
+  const media = { kind: 'image', mediaId: 'old-image' }
+  const uploaded = 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets?id=test'
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    assert.equal(new URL(url).pathname, '/hfsy/reference-assets')
+    assert.equal(new Headers(init.headers).get('Content-Type'), 'image/jpeg')
+    assert.deepEqual(new Uint8Array(await init.body.arrayBuffer()), bytes)
+    return Response.json({ url: uploaded }, { status: 201 })
+  })
+  for (const type of ['', 'application/octet-stream', 'image/jpg', 'image/png']) {
+    const stored = new Blob([bytes], { type })
+    assert.equal(await imageMimeFromBytes(stored), 'image/jpeg')
+    assert.equal(await checkReferenceMedia([media], api.videoReferenceRules(baseUrl, model).media, async () => stored, new AbortController().signal), undefined)
+    assert.equal(await api.publishHfsyReferenceImage({ baseUrl, apiKey: 'mock' }, stored), uploaded)
+  }
+})
+
+test('preflight skips unavailable remote measurements and keeps relay rules separate from Ark', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 403 }))
+  const { checkReferenceMedia } = await import(referenceMediaModule)
+  const ark = api.videoReferenceRules('https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance-2.0')
+  const remote = { kind: 'image', url: 'https://example.test/preview', publicUrl: 'https://example.test/source' }
+  assert.equal(await checkReferenceMedia([remote], ark.media, async () => undefined, new AbortController().signal), undefined)
+  const hfsy = api.videoReferenceRules('https://www.hfsyapi.cn/v1', 'doubao-seedance-2.0')
+  assert.equal(hfsy.media({ kind: 'image' }).ratio, undefined)
+  assert.equal(hfsy.media({ kind: 'video' }).pixels, undefined)
+  const apiYi = api.videoReferenceRules('https://api.apiyi.com/v1', 'doubao-seedance-2.0')
+  assert.equal(apiYi.media({ kind: 'video' }).pixels, undefined)
+  const hfsy25 = api.videoReferenceRules('https://www.hfsyapi.cn/v1', 'sd-2.5-720')
+  assert.deepEqual(hfsy25.media({ kind: 'image' }).ratio, [0.4, 2.5])
+  assert.deepEqual(hfsy25.media({ kind: 'image' }).side, [300, 6000])
+  assert.equal(hfsy25.media({ kind: 'video' }).pixels, undefined)
+  const officialH3 = api.videoReferenceRules('https://api.minimaxi.com/v1', 'MiniMax-H3')
+  assert.deepEqual(officialH3.media({ kind: 'image' }).side, [256, 5760])
+  assert.equal(api.videoReferenceRules('https://www.hfsyapi.cn/v1', 'minimax-h3').media({ kind: 'image' }).side, undefined)
+  assert.equal(api.videoReferenceRules('https://api.apiyi.com/v1', 'wan2.7-r2v').maxAssets, 5)
+  const custom = api.videoReferenceRules('https://example.test/v1', 'provider-specific-model')
+  assert.equal(custom.images, undefined)
+  assert.equal(custom.videos, undefined)
+})
+
+test('APIYI Veo sends both frames under input_reference and recovers binary or linked videos', async (t) => {
+  const baseUrl = 'https://api.apiyi.com/v1'
+  const settings = { baseUrl, model: 'veo-3.1-landscape-fl', apiKey: 'apiyi-key' }
+  const firstFrame = 'https://media.example.test/first'
+  const lastFrame = 'https://media.example.test/last'
+  const video = 'https://veo-video.gptkey.asia/assets/flow/clip.mp4'
+  const calls = []
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout: (callback) => setTimeout(callback, 0), clearTimeout })
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    url = String(url)
+    const headers = new Headers(init.headers)
+    calls.push([url, init.method ?? 'GET', headers.get('authorization')])
+    if (url === firstFrame) return new Response(Buffer.from([0xff, 0xd8, 0xff, 0xe0]), { headers: { 'Content-Type': 'image/png' } })
+    if (url === lastFrame) return new Response(Buffer.from('89504e470d0a1a0a', 'hex'))
+    if (url === '/apiyi/veo/v1/videos') {
+      assert.equal(headers.get('content-type'), null)
+      assert.deepEqual(init.body.getAll('input_reference').map(({ name, type }) => [name, type]), [
+        ['frame-1.jpg', 'image/jpeg'], ['frame-2.png', 'image/png'],
+      ])
+      return Response.json({ id: 'veo-one', status: 'queued' })
+    }
+    if (url.endsWith('/videos/veo-one')) return Response.json({ status: 'completed' })
+    if (url.endsWith('/veo-one/content')) return Response.json({ url: video })
+    if (url.endsWith('/veo-two/content') || url === `/apiyi/media?url=${encodeURIComponent(video)}`) {
+      assert.equal(headers.has('authorization'), url.endsWith('/content'))
+      return new Response('mp4 bytes', { headers: { 'Content-Type': 'video/mp4' } })
+    }
+    throw new Error(`Unexpected URL ${url}`)
+  })
+  const taskIds = []
+  const options = { prompt: 'test', seconds: 8, size: '1280x720', mode: 'first_last_frame', firstFrame, lastFrame }
+  const generated = await api.generateRemoteVideo(settings, { ...options, onTaskId: (id) => taskIds.push(id) })
+  assert.deepEqual(taskIds, ['veo-one'])
+  assert.equal(generated.sourceUrl, video)
+  assert.equal(await generated.blob.text(), 'mp4 bytes')
+  assert.equal(await (await api.recoverGeneratedVideoTask(settings, 'veo-two')).blob.text(), 'mp4 bytes')
+  await assert.rejects(() => api.generateRemoteVideo({ ...settings, model: 'veo-3.1' }, options), /模式不匹配/)
+  assert.equal(calls.filter(([, method]) => method === 'POST').length, 1)
+  assert.equal(api.videoReferenceRules(baseUrl, settings.model).framesOnly, true)
+  assert.equal(api.videoReferenceRules(baseUrl, 'veo-3.1').textOnly, true)
+})
+
+test('constant-rate MP4 metadata enforces the documented FPS without trusting stale MIME', async (t) => {
+  const { checkReferenceMedia, readIsoVideoFrameRate, referenceMediaIssue } = await import(referenceMediaModule)
+  const box = (type, ...children) => {
+    const data = Buffer.concat(children)
+    const header = Buffer.alloc(8)
+    header.writeUInt32BE(data.byteLength + 8)
+    header.write(type, 4, 'ascii')
+    return Buffer.concat([header, data])
+  }
+  const video = (ticks, entries = 1) => {
+    const timescale = Buffer.alloc(24)
+    timescale.writeUInt32BE(30_000, 12)
+    const handler = Buffer.alloc(24)
+    handler.write('vide', 8, 'ascii')
+    const timing = Buffer.alloc(8 + entries * 8)
+    timing.writeUInt32BE(entries, 4)
+    timing.writeUInt32BE(45, 8)
+    timing.writeUInt32BE(ticks, 12)
+    return Buffer.concat([box('ftyp', Buffer.from('isom0000')), box('moov', box('trak',
+      box('mdia', box('hdlr', handler), box('mdhd', timescale), box('minf', box('stbl', box('stts', timing)))),
+    ))])
+  }
+  assert.equal(await readIsoVideoFrameRate(new Blob([video(1_200)])), 25)
+  assert.equal(await readIsoVideoFrameRate(new Blob([video(2_000, 2)])), undefined)
+  const bytes = video(2_000)
+  const url = 'https://media.example.test/input.mp4'
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    assert.equal(new Headers(init.headers).get('Range'), 'bytes=0-262143')
+    return new Response(bytes, { status: 206, headers: { 'Content-Range': `bytes 0-${bytes.length - 1}/${bytes.length}`, 'Content-Type': 'application/octet-stream' } })
+  })
+  const rules = api.videoReferenceRules('https://ark.cn-beijing.volces.com/api/v3', 'doubao-seedance-2-0-260128')
+  assert.match(await checkReferenceMedia([{ kind: 'video', url, publicUrl: url }], rules.media, async () => undefined, new AbortController().signal), /24 到 60 FPS.*15 FPS/)
+  assert.match(referenceMediaIssue({ width: 420, height: 720 }, rules.media({ kind: 'video' })), /407,696 到 8,295,044/)
+})
+
+test('Google Omni uploads the reference to Google Files and resumes the Interaction without another POST', async (t) => {
+  const origin = 'https://generativelanguage.googleapis.com'
+  const settings = { baseUrl: `${origin}/v1beta/openai`, model: 'gemini-omni-1.2-flash', apiKey: 'gemini-key' }
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout: (callback) => setTimeout(callback, 0), clearTimeout })
+  const source = 'blob:http://localhost/omni-reference'
+  const upload = `${origin}/upload/v1beta/files?upload_id=mock`
+  const interaction = `${origin}/v1beta/interactions`
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (input, init = {}) => {
+    const url = String(input)
+    const headers = new Headers(init.headers)
+    calls.push([url, init.method ?? 'GET', headers.get('x-goog-api-key')])
+    if (url === source) return new Response('input bytes', { headers: { 'content-type': 'video/mp4' } })
+    if (url === `${origin}/upload/v1beta/files`) {
+      assert.equal(headers.get('x-goog-upload-header-content-type'), 'video/mp4')
+      return new Response('{}', { headers: { 'x-goog-upload-url': upload } })
+    }
+    if (url === upload) {
+      assert.equal(headers.get('x-goog-api-key'), null)
+      assert.equal(headers.get('x-goog-upload-command'), 'upload, finalize')
+      assert.equal(await init.body.text(), 'input bytes')
+      return Response.json({ file: { name: 'files/source-video', state: 'PROCESSING' } })
+    }
+    if (url === `${origin}/v1beta/files/source-video`) return Response.json({ state: 'ACTIVE' })
+    if (url === interaction) {
+      const { input, response_format, generation_config, background, store } = JSON.parse(init.body)
+      assert.deepEqual(input, [
+        { type: 'video', mime_type: 'video/mp4', uri: `${origin}/v1beta/files/source-video` },
+        { type: 'text', text: 'test' },
+      ])
+      assert.deepEqual(response_format, { type: 'video', aspect_ratio: '9:16', duration: '9s', resolution: '1080p', delivery: 'uri' })
+      assert.equal(generation_config.video_config.task, 'reference_to_video')
+      assert.equal(background && store, true)
+      return Response.json({ id: 'v1_omni', status: 'in_progress' })
+    }
+    if (url === `${interaction}/v1_omni`) return Response.json({
+      id: 'v1_omni', status: 'completed', steps: [{ type: 'model_output', content: [{
+        type: 'video', mime_type: 'video/mp4', data: Buffer.from('output bytes').toString('base64'),
+      }] }],
+    })
+    if (url === `${interaction}/v1_uri`) return Response.json({
+      id: 'v1_uri', status: 'completed', output_video: { uri: `${origin}/v1beta/files/result-video:download?alt=media` },
+    })
+    if (url === `${origin}/v1beta/files/result-video`) return Response.json({ state: 'ACTIVE' })
+    if (url === `${origin}/v1beta/files/result-video:download?alt=media`) return new Response('result bytes', { headers: { 'content-type': 'video/mp4' } })
+    throw new Error(`Unexpected URL ${url}`)
+  })
+  assert.equal(api.inferModelCapability(settings.model), 'video')
+  assert.equal(api.isModelAutoEnabled({ ...settings, id: settings.model, name: 'Omni', capability: 'video' }), true)
+  assert.match(api.videoReferenceSettingsIssue(settings.baseUrl, settings.model, 'first_last_frame', 12, 0), /3 到 10 秒/)
+  assert.match(api.videoReferenceSettingsIssue(settings.baseUrl, settings.model, 'all_reference', 12, 2), /最多可用 1 个/)
+  assert.deepEqual(api.videoReferenceRules(settings.baseUrl, settings.model).media({ kind: 'video' }).seconds, [0, 3])
+  const tasks = []
+  const result = await api.generateRemoteVideo(settings, {
+    prompt: 'test', seconds: 9, size: '1080x1920', aspectRatio: '9:16', resolution: '1080p',
+    mode: 'all_reference', referenceVideos: [source], onTaskId: (id) => tasks.push(id),
+  })
+  assert.deepEqual(tasks, ['v1_omni'])
+  assert.equal(await result.blob.text(), 'output bytes')
+  const before = calls.length
+  assert.equal(await (await api.recoverGeneratedVideoTask(settings, result.taskId)).blob.text(), 'output bytes')
+  assert.equal(await (await api.recoverGeneratedVideoTask(settings, 'v1_uri')).blob.text(), 'result bytes')
+  assert.ok(calls.slice(before).every(([, method]) => method === 'GET'))
+  assert.ok(calls.filter(([, , key]) => key).every(([url]) => url.startsWith(origin + '/')))
+})
+
+test('xAI video editing accepts local MP4 and uses only the documented edit fields', async (t) => {
+  const source = 'blob:http://localhost/xai-reference'
+  const clip = Buffer.from('000000146674797069736f6d0000000069736f6d', 'hex')
+  const expected = `data:video/mp4;base64,${clip.toString('base64')}`
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout: (callback) => setTimeout(callback, 0), clearTimeout })
+  browserGlobal(t, 'FileReader', class {
+    readAsDataURL(blob) {
+      void blob.arrayBuffer().then((bytes) => {
+        this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString('base64')}`
+        this.onload()
+      })
+    }
+  })
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (url === source) return new Response(clip, { headers: { 'Content-Type': 'application/octet-stream' } })
+    if (url === '/provider/xai/v1/videos/edits') {
+      assert.deepEqual(JSON.parse(init.body), { model: 'grok-imagine-video', prompt: 'test', video: { url: expected } })
+      return Response.json({ request_id: 'edit-one' })
+    }
+    if (url === '/provider/xai/v1/videos/edit-one') return Response.json({ status: 'done', video: { url: 'https://vidgen.x.ai/result.mp4' } })
+    return new Response('edited bytes', { headers: { 'Content-Type': 'video/mp4' } })
+  })
+  const settings = { baseUrl: 'https://api.x.ai/v1', model: 'grok-imagine-video', apiKey: 'xai-key' }
+  const rules = api.videoReferenceRules(settings.baseUrl, settings.model)
+  assert.equal(rules.media({ kind: 'video' }).publicOnly, undefined)
+  const result = await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 5, size: '16:9', mode: 'all_reference', referenceVideos: [source] })
+  assert.equal(await result.blob.text(), 'edited bytes')
+})
+
+test('APIMart uploads the local first frame, saves the task ID and archives the returned video URL', async (t) => {
+  const settings = { baseUrl: 'https://api.apimart.ai/v1', model: 'apimart-zoe', apiKey: 'apimart-key' }
+  const image = 'blob:http://localhost/apimart-reference'
+  const hosted = 'https://media.example.test/first.png'
+  const video = 'https://media.example.test/result.mp4'
+  const calls = []
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout: (callback) => setTimeout(callback, 0), clearTimeout })
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    calls.push([url, init.method ?? 'GET'])
+    if (url === image) return new Response(Buffer.from('89504e470d0a1a0a', 'hex'), { headers: { 'Content-Type': 'image/png' } })
+    if (url === '/provider/apimart/v1/uploads/images?retention_days=3') {
+      assert.equal(init.body.get('file').type, 'image/png')
+      return Response.json({ data: { url: hosted } })
+    }
+    if (url === '/provider/apimart/v1/videos/generations') {
+      assert.deepEqual(JSON.parse(init.body), {
+        model: 'apimart-zoe', prompt: 'test', duration: 8, size: 'adaptive', resolution: '720p',
+        image_with_roles: [{ url: hosted, role: 'first_frame' }],
+      })
+      return Response.json({ code: 200, data: [{ status: 'submitted', task_id: 'task_zoe' }] })
+    }
+    if (url === '/provider/apimart/v1/tasks/task_zoe') return Response.json({ code: 200, data: { status: 'completed', result: { videos: [{ url: [video] }] } } })
+    if (url === `/apiyi/media?url=${encodeURIComponent(video)}`) {
+      assert.equal(new Headers(init.headers).get('authorization'), null)
+      return new Response('archived video', { headers: { 'Content-Type': 'video/mp4' } })
+    }
+    throw new Error(`Unexpected URL ${url}`)
+  })
+  const taskIds = []
+  const result = await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 8, size: '1280x720', mode: 'image2video', firstFrame: image, onTaskId: (id) => taskIds.push(id) })
+  assert.deepEqual(taskIds, ['task_zoe'])
+  assert.equal(await result.blob.text(), 'archived video')
+  assert.equal(await (await api.recoverGeneratedVideoTask(settings, result.taskId)).blob.text(), 'archived video')
+  assert.equal(calls.filter(([, method]) => method === 'POST').length, 2)
+  assert.deepEqual(api.videoReferenceRules(settings.baseUrl, settings.model).media({ kind: 'video' }).pixels, [409600, 8295044])
+})
+
+test('Google Nano Banana preflight and native edit use the documented interactions image fields', async (t) => {
+  const settings = { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-nano-banana-2.1', apiKey: 'gemini-key' }
+  const image = 'blob:http://localhost/google-image'
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]).toString('base64')
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout, clearTimeout })
+  browserGlobal(t, 'FileReader', class {
+    readAsDataURL(blob) {
+      void blob.arrayBuffer().then((bytes) => {
+        this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString('base64')}`
+        this.onload()
+      })
+    }
+  })
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (url === image) return new Response(Buffer.from(jpeg, 'base64'), { headers: { 'content-type': 'image/png' } })
+    assert.equal(url, 'https://generativelanguage.googleapis.com/v1beta/interactions')
+    assert.equal(new Headers(init.headers).get('x-goog-api-key'), 'gemini-key')
+    assert.deepEqual(JSON.parse(init.body), {
+      model: settings.model,
+      input: [{ type: 'text', text: 'edit' }, { type: 'image', mime_type: 'image/jpeg', data: jpeg }],
+      response_format: { type: 'image', mime_type: 'image/png', image_size: '2K', aspect_ratio: '4:3' },
+    })
+    return Response.json({ status: 'completed', output_image: { type: 'image', mime_type: 'image/png', data: 'bW9jaw==' } })
+  })
+  assert.equal(api.imageReferenceRules(settings.baseUrl, settings.model).count, 14)
+  const result = await api.generateRemoteImages(settings, { prompt: 'edit', count: 1, referenceImages: [image], resolution: '2K', aspectRatio: '4:3' })
+  assert.deepEqual(result, [{ url: 'data:image/png;base64,bW9jaw==' }])
+})
+
+test('APIMart uploads a local reference clip before requesting Kling 4 Flash', async (t) => {
+  const settings = { baseUrl: 'https://api.apimart.ai/v1', model: 'kling-v4-flash', apiKey: 'apimart-key' }
+  const local = 'blob:http://localhost/kling-clip'
+  const uploaded = 'https://media.example.test/clip.mp4'
+  const resultUrl = 'https://media.example.test/result.mp4'
+  const clip = Buffer.from('000000146674797069736f6d0000000069736f6d', 'hex')
+  browserGlobal(t, 'window', { location: { href: 'http://localhost/' }, setTimeout: (callback) => setTimeout(callback, 0), clearTimeout })
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (url === local) return new Response(clip, { headers: { 'Content-Type': 'application/octet-stream' } })
+    if (url === '/provider/apimart/v1/uploads/videos?retention_days=3') {
+      assert.equal(init.body.get('file').type, 'video/mp4')
+      assert.deepEqual(Buffer.from(await init.body.get('file').arrayBuffer()), clip)
+      return Response.json({ url: uploaded })
+    }
+    if (url === '/provider/apimart/v1/videos/generations') {
+      const { video_urls, omni_reference_task_type } = JSON.parse(init.body)
+      assert.deepEqual(video_urls, [uploaded])
+      assert.equal(omni_reference_task_type, 'reference')
+      return Response.json({ code: 200, data: [{ status: 'submitted', task_id: 'task_kling' }] })
+    }
+    if (url === '/provider/apimart/v1/tasks/task_kling') return Response.json({ data: { status: 'completed', result: { videos: [{ url: [resultUrl] }] } } })
+    if (url === `/apiyi/media?url=${encodeURIComponent(resultUrl)}`) return new Response('ready video', { headers: { 'Content-Type': 'video/mp4' } })
+    throw new Error(`Unexpected URL ${url}`)
+  })
+  const rules = api.videoReferenceRules(settings.baseUrl, settings.model)
+  assert.equal(rules.frames, false)
+  assert.equal(rules.totals.maxVideoSeconds, 20)
+  assert.equal(rules.media({ kind: 'video', url: local }).maxMB, 50)
+  assert.equal(rules.media({ kind: 'video', url: uploaded }).maxMB, undefined)
+  const result = await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 5, size: '16:9', mode: 'all_reference', referenceVideos: [local] })
+  assert.equal(await result.blob.text(), 'ready video')
 })

@@ -3,7 +3,6 @@
   "include": [
     "/apiyi/*",
     "/visionary/*",
-    "/evolink/*",
     "/hfsy/*",
     "/provider/*",
     "/toolbox/media"

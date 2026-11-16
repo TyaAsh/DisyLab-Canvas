@@ -14,7 +14,6 @@
 <p align="center">
   <a href="https://disylab.pages.dev/">在线体验</a> ·
   <a href="https://tyaash.github.io/DisyLab-Canvas/">项目介绍</a> ·
-  <a href="https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.3/DisyLab_2.0.3_x64.exe">下载 Windows 版</a> ·
   <a href="#本地运行">本地运行</a> ·
   <a href="#部署">部署</a> ·
   <a href="README.en.md">English</a> ·
@@ -79,7 +78,7 @@ DisyLab 将文本、参考图、生成图片、生成视频、资产和 Agent �
 
 ### Windows 桌面版
 
-- [下载 Windows x64 直运行版](https://github.com/TyaAsh/DisyLab-Canvas/releases/download/v2.0.3/DisyLab_2.0.3_x64.exe)，下载后双击打开。发布说明与 SHA-256 校验文件见 [2.0.3 发布页](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.3)。
+- Windows 桌面版暂时停止公开下载。可使用[网页版](https://disylab.pages.dev/)。
 - 即梦账号通过官方 CLI 授权。Muse 账号在独立的桌面网页会话中登录，可用模型取决于账号权限。
 - macOS 版稍后推出。
 
@@ -186,7 +185,7 @@ npx wrangler pages deploy dist --project-name disylab --branch main
 
 ## 当前边界
 
-2.0 提供网页版和 Windows 桌面版，项目数据保存在当前设备。跨设备可通过 `.disy` 项目包迁移。macOS、简易视频剪辑台和剧本工厂列在项目介绍页的路线图中。
+当前提供网页版，项目数据保存在当前设备。跨设备可通过 `.disy` 项目包迁移。macOS、简易视频剪辑台和剧本工厂列在项目介绍页的路线图中。
 
 ## 文档与反馈
 

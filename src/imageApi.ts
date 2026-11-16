@@ -7,10 +7,10 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
+import { HFSY_UPLOAD_IMAGE_TYPES, imageMimeFromBytes, videoMimeFromBytes, type MediaLimits, type ReferenceMedia } from './referenceMediaValidation'
 import { isDesktopApp, providerFetch } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
-import type { VideoReferenceRules } from './videoReference'
 import { parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
 import { apiProviderForBase } from './apiProviders'
 import { checkMuseWebAccount, isMuseWebBase, listMuseWebModels, runMuseWebTask } from './museWeb'
@@ -169,10 +169,7 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) 
 }
 
 export async function normalizeOriginalImageBlob(blob: Blob): Promise<Blob> {
-  const bytes = new Uint8Array(await blob.slice(0, 8).arrayBuffer())
-  const signature = String.fromCharCode(...bytes.subarray(0, 6))
-  const isPng = [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte)
-  let mime = signature === 'GIF87a' || signature === 'GIF89a' ? 'image/gif' : isPng ? 'image/png' : blob.type
+  let mime = await imageMimeFromBytes(blob) ?? blob.type
   if (!mime || /^(?:application\/(?:octet-stream|xml)|text\/(?:plain|xml))$/.test(mime)) {
     const header = await blob.slice(0, 1024).text()
     if (/^\s*(?:<\?xml[^?]*\?>\s*)?<svg(?:\s|\/?>)/i.test(header)) mime = 'image/svg+xml'
@@ -423,8 +420,6 @@ function normalizedApiBaseUrl(baseUrl: string) {
           ? '/v1'
         : host === 'api.visionary.beer'
           ? '/v1'
-        : host === 'api.evolink.ai'
-          ? '/v1'
         : /^(?:grsaiapi\.com|grsai\.dakka\.com\.cn)$/i.test(host)
           ? '/v1'
           : ''
@@ -449,15 +444,13 @@ function endpoint(baseUrl: string, path: string) {
   if (typeof window !== 'undefined' && isVisionaryBaseUrl(baseUrl)) {
     return `/visionary/${path.replace(/^\//, '')}`
   }
-  if (typeof window !== 'undefined' && isEvolinkBaseUrl(baseUrl)) {
-    return `/evolink/${path.replace(/^\//, '')}`
-  }
   const url = new URL(normalizedApiBaseUrl(baseUrl))
   const [pathname, query] = path.split('?')
   url.pathname = pathname.startsWith('/') ? pathname : `${url.pathname.replace(/\/$/, '')}/${pathname}`
   if (query) url.search = query
   const provider = apiProviderForBase(url.href)
-  if (typeof window !== 'undefined' && !isDesktopApp() && provider && ['relayon', 'minimax', 'xai', 'ark', 'muse'].includes(provider.id)
+  if (typeof window !== 'undefined' && !isDesktopApp() && provider && (['relayon', 'minimax', 'xai', 'ark', 'muse'].includes(provider.id)
+    || provider.id === 'apimart' && /^(?:videos\/generations|uploads\/(?:images|videos)|tasks\/)/.test(path))
     && url.origin === new URL(provider.baseUrl).origin) return `/provider/${provider.id}${url.pathname}${url.search}`
   return url.toString()
 }
@@ -580,15 +573,17 @@ export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
   const pro = model === 'gpt-image-2pro' || model === 'gpt-image-2pro-4k'
   const gemini = /^(?:gemini-3-pro-image-preview|gemini-3\.1-flash-image-preview|nano-banana-(?:2(?:\.1)?|pro))$/.test(model)
   const seedream = model === 'seedream-5.0-pro'
+  const seedream55 = model === 'seedream-5.5'
   const midjourney = /^(?:mj_imagine|mj_blend)$/.test(model)
-  if (!transparent && !standard && !pro && !gemini && !seedream && !midjourney) return undefined
-  const resolutions: readonly ImageResolution[] = standard || seedream ? ['1K'] : midjourney ? []
+  if (!transparent && !standard && !pro && !gemini && !seedream && !seedream55 && !midjourney) return undefined
+  const resolutions: readonly ImageResolution[] = standard || seedream ? ['1K'] : seedream55 ? ['2K'] : midjourney ? []
     : pro ? (model.endsWith('-4k') ? ['2K', '4K'] : ['2K']) : ['1K', '2K', '4K']
-  const ratios = seedream ? Object.keys(HFSY_SEEDREAM_SIZES) : transparent
+  const ratios = seedream ? Object.keys(HFSY_SEEDREAM_SIZES)
+    : seedream55 ? ['1:1', '3:2', '9:16', '16:9', '4:3', '4:5', '2:3'] : transparent
     ? ['1:1', '5:4', '9:16', '16:9', '4:3', '3:1', '3:2', '3:4']
     : Object.keys(HFSY_IMAGE_SIZES).filter((ratio) => ratio !== '3:1')
   const outputs: readonly ImageOutput[] = transparent ? ['png', 'transparent-png'] : ['png']
-  const images = transparent ? 16 : standard ? 6 : seedream ? 10
+  const images = transparent ? 16 : standard || seedream55 ? 6 : seedream ? 10
     : /^(?:nano-banana-pro|gemini-3-pro-image-preview|mj_)/.test(model) ? 7 : 4
   return { ratios, resolutions, outputs, images, qualities: [] as readonly ImageQuality[], customRatio: midjourney }
 }
@@ -607,6 +602,10 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
     resolutions: ['1K', '2K'] as readonly ImageResolution[], images: /2\.0/.test(model) ? 5 : 1,
     qualities: (/2\.0/.test(model) ? ['low', 'medium', 'high'] : []) as readonly ImageQuality[],
   }
+  if (provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(model)) return {
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '4:5', '5:4', '21:9'],
+    resolutions: ['1K', '2K', '4K'] as readonly ImageResolution[], images: 14, qualities: [] as readonly ImageQuality[],
+  }
   if (provider === 'muse') return {
     ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
     resolutions: [] as readonly ImageResolution[], images: 4, qualities: [] as readonly ImageQuality[],
@@ -614,7 +613,7 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
   if (provider === 'ark') return {
     ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'],
     resolutions: (/5[-.]0[-.]pro/.test(model) ? ['1K', '2K'] : /5[-.]0/.test(model) ? ['2K'] : ['2K', '4K']) as readonly ImageResolution[],
-    images: /4[-.]0/.test(model) ? 10 : 14, qualities: [] as readonly ImageQuality[],
+    images: /(?:4[-.]0|5[-.]5|5[-.]0[-.](?:pro|flash))/.test(model) ? 10 : 14, qualities: [] as readonly ImageQuality[],
   }
   return undefined
 }
@@ -668,17 +667,10 @@ function isVisionaryBaseUrl(baseUrl: string) {
   }
 }
 
-function isEvolinkBaseUrl(baseUrl: string) {
-  try { return new URL(normalizedApiBaseUrl(baseUrl)).hostname.toLowerCase() === 'api.evolink.ai' } catch { return false }
-}
-
 function providerRelayHeaders(settings: Pick<ApiRequestSettings, 'baseUrl'>, init?: HeadersInit) {
   const headers = apiYiRelayHeaders(settings, init)
   if (typeof window !== 'undefined' && isVisionaryBaseUrl(settings.baseUrl)) {
     headers.set('X-DisyLab-Visionary-Base', normalizedApiBaseUrl(settings.baseUrl))
-  }
-  if (typeof window !== 'undefined' && isEvolinkBaseUrl(settings.baseUrl)) {
-    headers.set('X-DisyLab-Evolink-Base', normalizedApiBaseUrl(settings.baseUrl))
   }
   return headers
 }
@@ -724,7 +716,6 @@ export function shouldAppendReferenceGuide(opts: { modelId: string; baseUrl: str
 export function resolveProviderLabel(baseUrl: string) {
   const normalized = normalizedApiBaseUrl(baseUrl).toLowerCase()
   if (/grsaiapi\.com|grsai\.dakka\.com\.cn/.test(normalized)) return 'GRS AI'
-  if (/api\.evolink\.ai/.test(normalized)) return 'Evolink'
   if (/(?:api\.)?visionary\.beer/.test(normalized)) return 'Visionary'
   if (/api\.apiyi\.com|apiyi\.com/.test(normalized)) return 'APIYI'
   if (/(?:www\.|api\.|apigo\.)?hfsyapi\.cn/.test(normalized)) return 'HFSY'
@@ -821,8 +812,7 @@ function videoTaskStatus(payload: unknown, fallback = 'queued') {
 }
 
 async function nativeImageSource(source: string, signal?: AbortSignal) {
-  if (/^(?:https:\/\/|data:image\/)/i.test(source)) return source
-  return mediaSourceForApiYi(source, signal)
+  return publicImageSourceUrl(source) ?? await blobToDataUrl(await readImageSourceBlob(source, signal, '参考图'))
 }
 
 async function prepareJimengInputs(references: string[], signal?: AbortSignal) {
@@ -894,10 +884,19 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
   if (!options.prompt.trim()) invalid('请填写视频提示词')
   if (provider === 'xai' && audios.length) invalid('Grok 视频只接受官方预设音色，不支持此处的音频素材')
   if (provider === 'xai' && videos.length && (videos.length > 1 || first || last || images.length)) invalid('Grok 视频编辑仅接受一个视频素材，请移除其他参考')
+  if (provider === 'xai' && videos.length && settings.model.toLowerCase() !== 'grok-imagine-video') invalid('请选择 Grok Imagine Video 编辑参考视频')
+  if (h3 && (first || last) && (images.length || videos.length || audios.length)) invalid('MiniMax H3 的首尾帧模式不能与其他参考素材混用')
   if (provider === 'minimax' && !h3 && (last || videos.length || audios.length || images.length > 1)) invalid('此海螺模型仅支持一张首帧图，多素材请使用 H3')
   if (provider === 'xai' && last && !/video-1\.5/i.test(settings.model)) invalid('尾帧需要 Grok Imagine Video 1.5')
   const firstSource = first ? await nativeImageSource(first, options.signal) : undefined
   const lastSource = last ? await nativeImageSource(last, options.signal) : undefined
+  let editSource = videos[0]
+  if (provider === 'xai' && editSource && !/^(?:https?:\/\/|data:video\/mp4;)/i.test(editSource)) {
+    const clip = await downloadGeneratedVideoBlob(editSource, { signal: options.signal })
+    const detected = await videoMimeFromBytes(clip)
+    if (detected && detected !== 'video/mp4') invalid('Grok 视频编辑的参考视频须为 MP4')
+    editSource = await blobToDataUrl(clip.slice(0, clip.size, 'video/mp4'))
+  }
   const references = await Promise.all(images.map((url) => nativeImageSource(url, options.signal)))
   const content = [
     { type: 'text', text: options.prompt },
@@ -917,11 +916,11 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
     generate_audio: options.generateAudio, watermark: false,
   } : provider === 'xai' ? {
     model, prompt: options.prompt,
-    ...(videos.length ? { video: { url: videos[0] } } : {
-      duration: options.seconds, aspect_ratio: ratio, resolution, generate_audio: options.generateAudio,
+    ...(editSource ? { video: { url: editSource } } : {
+      duration: options.seconds, aspect_ratio: firstSource ? undefined : ratio, resolution, generate_audio: options.generateAudio,
       ...(firstSource ? { image: { url: firstSource } } : {}),
       ...(lastSource ? { last_frame: { url: lastSource } } : {}),
-      ...(references.length ? { reference_images: references.map((url) => ({ url })) } : {}),
+      ...(references.length ? { reference_images: references.map((url) => ({ type: 'image_url', url })) } : {}),
     }),
   } : h3 ? {
     model, content, duration: options.seconds, resolution: /^720p$/i.test(resolution ?? '') ? '768P' : (resolution ?? '768P').toUpperCase(),
@@ -1153,11 +1152,14 @@ function validGeneratedVideoType(contentType: string) {
 
 async function readCompleteVideoResponse(response: Response) {
   if (!response.ok) throw await createApiError(response)
+  let expectedBytes: number | undefined
   if (response.status === 206) {
     const range = /^bytes 0-(\d+)\/(\d+)$/i.exec(response.headers.get('content-range') ?? '')
     if (!range || Number(range[1]) + 1 !== Number(range[2])) throw new Error('partial-video')
+    expectedBytes = Number(range[2])
   }
   const blob = await response.blob()
+  if (expectedBytes !== undefined && blob.size !== expectedBytes) throw new Error('partial-video')
   const contentType = blob.type || response.headers.get('content-type') || ''
   if (!blob.size || !validGeneratedVideoType(contentType)) throw new Error(!blob.size ? 'empty' : contentType || 'invalid-type')
   const prefix = await blob.slice(0, 96).text().catch(() => '')
@@ -1206,24 +1208,57 @@ function videoResolutionFromSize(size: string) {
   return height >= 2160 ? '4k' : height >= 1080 ? '1080p' : height <= 480 ? '480p' : '720p'
 }
 
-async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
-  if (options.mode !== 'text2video') {
-    throw new GenerationRequestError('api', 'Veo 图生视频需要专用上传接口', '当前已适配 APIYI Veo 3.1 文生视频端点；图生视频请先使用文本模式，避免把参考图静默丢弃。')
+async function readApiYiVeoContent(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal): Promise<GeneratedVideo> {
+  const content = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), {
+    signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }),
+  })
+  if (!content.ok) throw await createApiError(content)
+  if (/json/i.test(content.headers.get('content-type') ?? '')) {
+    const sourceUrl = publicImageSourceUrl(videoResultUrl(await content.json()))
+    if (!sourceUrl) throw new Error('Veo 未返回可下载的视频链接')
+    return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal }), taskId, progress: 100, sourceUrl }
   }
-  const resolution = videoResolutionFromSize(options.size)
-  const requestedSeconds = [4, 6, 8].reduce((best, current) => Math.abs(current - options.seconds) < Math.abs(best - options.seconds) ? current : best, 4)
-  const seconds = resolution === '1080p' || resolution === '4k' ? 8 : requestedSeconds
+  return { blob: await readCompleteVideoResponse(content), taskId, progress: 100 }
+}
+
+async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  // APIYI Veo async frame requests repeat input_reference in a multipart form.
+  const frameModel = /-fl$/i.test(settings.model)
+  const mode = options.mode ?? 'text2video'
+  const framed = mode === 'image2video' || mode === 'first_last_frame'
+  if (frameModel ? !framed : mode !== 'text2video') {
+    const detail = frameModel ? '此型号需要首帧图，可选尾帧图。' : '此型号仅支持文生视频；使用图片请选 -fl 型号。'
+    throw new GenerationRequestError('platform', 'Veo 型号与生成模式不匹配', detail)
+  }
+  if (options.referenceVideo || options.referenceVideos?.length || options.referenceAudios?.length || options.referenceImages?.length
+    || (!framed && (options.firstFrame || options.referenceImage || options.lastFrame)) || (mode === 'image2video' && options.lastFrame)) {
+    throw new GenerationRequestError('platform', 'Veo 当前模式不接收这些参考素材', '请移除多余素材或切换生成模式。')
+  }
+  const headers = apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` })
+  let body: string | FormData
+  if (framed) {
+    const first = options.firstFrame ?? options.referenceImage
+    if (!first || (mode === 'first_last_frame' && !options.lastFrame)) {
+      throw new GenerationRequestError('platform', 'Veo 缺少参考帧', mode === 'first_last_frame' ? '请添加首帧和尾帧。' : '请添加一张首帧图。')
+    }
+    const form = new FormData()
+    form.set('model', settings.model)
+    form.set('prompt', options.prompt)
+    const frames = mode === 'first_last_frame' ? [first, options.lastFrame!] : [first]
+    for (const [index, src] of frames.entries()) {
+      const image = await readImageSourceBlob(src, options.signal, index ? 'Veo 尾帧' : 'Veo 首帧')
+      if (image.type !== 'image/jpeg' && image.type !== 'image/png') {
+        throw new GenerationRequestError('platform', 'Veo 参考帧须为 JPEG 或 PNG', index ? '请更换尾帧图片。' : '请更换首帧图片。')
+      }
+      form.append('input_reference', image, `frame-${index + 1}.${image.type === 'image/png' ? 'png' : 'jpg'}`)
+    }
+    body = form
+  } else {
+    headers['Content-Type'] = 'application/json'
+    body = JSON.stringify({ model: settings.model, prompt: options.prompt })
+  }
   const response = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', '/v1/videos'), {
-    method: 'POST',
-    signal: options.signal,
-    headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
-    body: JSON.stringify({
-      model: settings.model,
-      prompt: options.prompt,
-      seconds: String(seconds),
-      size: options.size,
-      metadata: { resolution, aspectRatio: apiYiVideoRatio(options.size) },
-    }),
+    method: 'POST', signal: options.signal, headers, body,
   })
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
@@ -1244,18 +1279,21 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
     if (status === 'failed') throw new GenerationRequestError('api', 'Veo 视频生成失败', sanitizeAdminLogJson(job), { requestId: taskId })
     if (status === 'cancelled' || status === 'canceled') throw new GenerationRequestError('api', 'Veo 视频生成已取消', sanitizeAdminLogJson(job), { requestId: taskId })
   }
-  await waitForDelay(4_000, options.signal)
-  let lastError: GenerationRequestError | null = null
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const content = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}/content`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
-    if (content.ok) {
-      try { return { blob: await readCompleteVideoResponse(content), taskId, progress: 100 } }
-      catch (error) { if (options.signal?.aborted) throw error }
-    }
-    if (!content.ok) lastError = await createApiError(content)
-    if (attempt < 3) await waitForDelay(4_000, options.signal)
+  if (['failed', 'cancelled', 'canceled'].includes(status)) {
+    throw new GenerationRequestError('api', 'Veo 视频生成失败', sanitizeAdminLogJson(created), { requestId: taskId })
   }
-  throw new GenerationRequestError('network', 'Veo 视频已生成但成品文件暂不可读', lastError?.message ?? `任务 ${taskId}`, { requestId: taskId })
+  let lastError: unknown
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      return await readApiYiVeoContent(settings, taskId, options.signal)
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      lastError = error
+      if (attempt < 3) await waitForDelay(4_000, options.signal)
+    }
+  }
+  throw new GenerationRequestError('network', 'Veo 视频已生成但成品文件暂不可读',
+    lastError instanceof GenerationRequestError ? lastError.detail : `任务 ${taskId}`, { requestId: taskId })
 }
 
 async function generateApiYiWanVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
@@ -1551,6 +1589,372 @@ export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'base
   return parseRemoteModelCatalog(await response.json() as unknown)
 }
 
+function apiMartVideoFamily(baseUrl: string, model: string) {
+  if (apiProviderForBase(baseUrl)?.id !== 'apimart') return
+  if (/^kling-v3$/i.test(model)) return 'kling-v3'
+  if (/^kling-v4$/i.test(model)) return 'kling-v4'
+  if (/^kling-v4-flash$/i.test(model)) return 'kling-v4-flash'
+  if (/^apimart-zoe$/i.test(model)) return 'zoe'
+  if (/^(?:doubao-)?seedance-2[.-]5-flash$/i.test(model)) return 'seedance25-flash'
+  if (/^(?:doubao-)?seedance-2[.-]5$/i.test(model)) return 'seedance25'
+  if (/^(?:doubao-)?seedance-2[.-]0(?:-(?:fast|mini))?$/i.test(model)) return 'seedance20'
+}
+
+async function uploadApiMartReference(settings: ApiRequestSettings, kind: 'image' | 'video', source: string, signal?: AbortSignal) {
+  const url = publicImageSourceUrl(source)
+  if (url) return url
+  if (/^asset:\/\/[\w.-]+$/i.test(source)) return source
+  const blob = kind === 'image' ? await readImageSourceBlob(source, signal, 'APIMart 参考图')
+    : await downloadGeneratedVideoBlob(source, { signal })
+  const type = kind === 'image' ? blob.type : await videoMimeFromBytes(blob) ?? blob.type
+  const types = kind === 'image' ? HFSY_UPLOAD_IMAGE_TYPES : [...REFERENCE_VIDEO_TYPES, 'video/webm']
+  const maxMB = kind === 'image' ? 30 : 50
+  const label = kind === 'image' ? 'APIMart 本地参考图' : 'APIMart 本地参考视频'
+  if (!types.includes(type)) {
+    const formats = kind === 'image' ? 'JPEG、PNG、GIF 或 WebP' : 'MP4、MOV 或 WebM'
+    throw new GenerationRequestError('platform', `${label}须为 ${formats}`, '请换用支持的格式，或用模型接受的公网链接。')
+  }
+  if (blob.size > maxMB * 1024 ** 2) throw new GenerationRequestError('platform', `${label}不能超过 ${maxMB} MB`, '请缩小文件或改用公网素材链接。')
+  const extension = type.split('/')[1].replace('jpeg', 'jpg').replace('quicktime', 'mov')
+  const body = new FormData()
+  body.set('file', blob.slice(0, blob.size, type), `reference.${extension}`)
+  const response = await providerFetch(endpoint(settings.baseUrl, `uploads/${kind}s?retention_days=3`), {
+    method: 'POST', headers: compatibleApiHeaders(settings), body, signal,
+  })
+  if (!response.ok) throw await createApiError(response)
+  const payload = await response.json()
+  const uploadedUrl = publicImageSourceUrl(videoResultUrl(payload))
+  if (!uploadedUrl) throw new GenerationRequestError('platform', 'APIMart 未返回素材上传地址', sanitizeAdminLogJson(payload))
+  return uploadedUrl
+}
+
+type ApiMartTask = {
+  status?: string
+  progress?: number
+  error?: { message?: string }
+  result?: { videos?: Array<{ url?: string | string[] }> }
+}
+
+async function readApiMartVideoTask(settings: ApiRequestSettings, id: string, signal?: AbortSignal) {
+  const response = await providerFetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(id)}`), {
+    headers: compatibleApiHeaders(settings), signal,
+  })
+  if (!response.ok) throw await createApiError(response)
+  const { code, data, message } = await response.json() as { code?: number; data?: ApiMartTask; message?: string }
+  if ((code && code !== 200) || !data) {
+    throw new GenerationRequestError('api', 'APIMart 视频查询失败', message ?? '', { requestId: id })
+  }
+  return data
+}
+
+async function finishApiMartVideo(task: ApiMartTask, taskId: string, signal?: AbortSignal): Promise<GeneratedVideo> {
+  if (videoTaskStatus(task) !== 'completed') {
+    throw new GenerationRequestError('api', 'APIMart 视频暂不可取回', task.error?.message ?? task.status ?? '', { requestId: taskId })
+  }
+  const result = task.result?.videos?.[0]?.url
+  const sourceUrl = (Array.isArray(result) ? result : [result]).map(publicImageSourceUrl).find(Boolean)
+  if (!sourceUrl) throw new GenerationRequestError('platform', 'APIMart 暂未返回成品链接', '可稍后取回原任务。', { requestId: taskId })
+  try {
+    return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal }), taskId, sourceUrl, progress: 100 }
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw new GenerationRequestError('network', 'APIMart 视频已生成但本地归档失败', error instanceof Error ? error.message : String(error), { requestId: taskId, resultUrls: [sourceUrl] })
+  }
+}
+
+async function generateApiMartVideo(settings: ApiRequestSettings, options: VideoGenerationOptions, family: NonNullable<ReturnType<typeof apiMartVideoFamily>>) {
+  const mode = options.mode ?? 'text2video'
+  const framed = mode === 'image2video' || mode === 'first_last_frame'
+  const images = framed
+    ? [options.firstFrame ?? options.referenceImage, ...(mode === 'first_last_frame' ? [options.lastFrame] : [])]
+    : options.referenceImages ?? []
+  const videos = [...new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((source): source is string => Boolean(source)))]
+  const audios = options.referenceAudios ?? []
+  const rules = videoReferenceRules(settings.baseUrl, settings.model)
+  const invalid = (detail: string) => new GenerationRequestError('platform', 'APIMart 视频素材不符合模型要求', detail)
+  if (images.some((source) => !source)) throw invalid('请添加所需的首帧和尾帧。')
+  if (!framed && images.length > (rules.images ?? Infinity)) throw invalid(`型号最多支持 ${rules.images} 张参考图。`)
+  if (videos.length > (rules.videos ?? Infinity)) throw invalid(rules.videos ? `型号最多支持 ${rules.videos} 个参考视频。` : '型号只接收图像首帧和尾帧。')
+  if (family === 'kling-v4-flash' && mode === 'first_last_frame') throw invalid('Kling 4.0 Flash 只接收一张首帧图。')
+  if (family === 'kling-v3' && ((mode !== 'text2video' && !framed) || audios.length)) throw invalid('请选择文生视频、图生视频或首尾帧模式。')
+  if (audios.some((source) => !publicImageSourceUrl(source) && !/^asset:\/\/[\w.-]+$/i.test(source))) throw invalid('参考音频需要公开可读取的 URL 或素材 ID。')
+  const [imageUrls, videoUrls] = await Promise.all([
+    Promise.all(images.map((source) => uploadApiMartReference(settings, 'image', source!, options.signal))),
+    Promise.all(videos.map((source) => uploadApiMartReference(settings, 'video', source, options.signal))),
+  ])
+  const ratio = options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : 'adaptive'
+  const resolution = options.resolution ?? '720p'
+  const body = family === 'kling-v3' ? {
+    model: settings.model, prompt: options.prompt, duration: options.seconds, aspect_ratio: ratio === 'adaptive' ? '16:9' : ratio,
+    mode: resolution === '4k' ? '4k' : resolution === '1080p' ? 'pro' : 'std', audio: options.generateAudio,
+    ...(imageUrls.length ? { image_urls: imageUrls } : {}),
+  } : family === 'kling-v4' || family === 'kling-v4-flash' ? {
+    model: settings.model, prompt: options.prompt, duration: options.seconds, resolution,
+    ...(!framed ? { aspect_ratio: ratio === 'adaptive' ? (mode === 'text2video' ? '16:9' : 'auto') : ratio } : {}),
+    ...(imageUrls.length ? { image_urls: imageUrls } : {}),
+    ...(videoUrls.length ? { video_urls: videoUrls } : {}),
+    ...(mode === 'image_reference' || mode === 'all_reference' ? { omni_reference_task_type: 'reference' } : {}),
+  } : {
+    model: settings.model, prompt: options.prompt, duration: options.seconds, size: framed ? 'adaptive' : ratio, resolution, generate_audio: options.generateAudio,
+    ...(imageUrls.length && framed ? { image_with_roles: imageUrls.map((url, index) => ({ url, role: index ? 'last_frame' : 'first_frame' })) } : {}),
+    ...(imageUrls.length && !framed ? { image_urls: imageUrls } : {}),
+    ...(videoUrls.length ? { video_urls: videoUrls } : {}),
+    ...(audios.length ? { audio_urls: audios } : {}),
+  }
+  const response = await providerFetch(endpoint(settings.baseUrl, 'videos/generations'), {
+    method: 'POST', signal: options.signal,
+    headers: compatibleApiHeaders(settings, { 'Content-Type': 'application/json' }), body: JSON.stringify(body),
+  })
+  if (!response.ok) throw await createApiError(response)
+  const payload = await response.json()
+  const taskId = extractTaskId(payload)
+  if (!taskId) throw new GenerationRequestError('api', 'APIMart 未返回任务编号', sanitizeAdminLogJson(payload))
+  options.onTaskId?.(taskId)
+  const deadline = Date.now() + 30 * 60_000
+  let failures = 0
+  while (Date.now() < deadline) {
+    await waitForDelay(5_000, options.signal)
+    let task: ApiMartTask
+    try {
+      task = await readApiMartVideoTask(settings, taskId, options.signal)
+      failures = 0
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      if (++failures >= 3) throw new GenerationRequestError('network', 'APIMart 视频任务查询暂时中断', error instanceof Error ? error.message : String(error), { requestId: taskId })
+      continue
+    }
+    const status = videoTaskStatus(task)
+    options.onProgress?.(task.progress ?? 0, status)
+    if (['completed', 'failed', 'cancelled', 'canceled', 'expired'].includes(status)) {
+      return finishApiMartVideo(task, taskId, options.signal)
+    }
+  }
+  throw new GenerationRequestError('network', 'APIMart 视频任务查询暂时中断', '任务可能尚在生成，可稍后取回。', { requestId: taskId })
+}
+
+const GEMINI_API_ORIGIN = 'https://generativelanguage.googleapis.com'
+const GEMINI_INTERACTION_IMAGE = /^gemini-(?:nano-banana-2\.1|3\.1-flash-image|3-pro-image)(?:-preview)?$/i
+const GEMINI_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif']
+const GEMINI_OMNI_MODEL = /^gemini-omni-(?:1\.2-flash|1\.1-flash(?:-preview)?|flash-preview)$/i
+
+function geminiOmniVideo(baseUrl: string, model: string) {
+  return apiProviderForBase(baseUrl)?.id === 'gemini' && GEMINI_OMNI_MODEL.test(model)
+}
+
+function geminiOmniLimits(model: string, mode: string | undefined, seconds: number) {
+  return {
+    maxSeconds: model === 'gemini-omni-1.2-flash' && mode !== 'first_last_frame' ? 15 : 10,
+    maxVideos: seconds > 10 ? 1 : 3,
+    maxImages: 6,
+  }
+}
+
+export function videoReferenceSettingsIssue(baseUrl: string, model: string, mode: VideoGenerationOptions['mode'], duration: number, videoCount: number, resolution?: string) {
+  const provider = apiProviderForBase(baseUrl)?.id
+  if (provider === 'muse') return 'Meta Muse API 目前提供图像生成，视频生成请选择支持视频的连接'
+  if (provider === 'openai' && /^sora-2/i.test(model)) return 'OpenAI Sora 视频 API 已停止服务，请切换模型'
+  if (provider === 'gemini' && /^veo-/i.test(model)) return 'Google Gemini API 的 Veo 型号已停止服务，请切换至 Gemini Omni'
+  if (provider === 'xai' && (mode === 'image_reference' || mode === 'all_reference') && !videoCount) {
+    if (model.toLowerCase() === 'grok-imagine-video' && duration > 10) return 'Grok Imagine Video 的参考图模式最多生成 10 秒'
+    if (/^grok-imagine-video(?:-1\.5)?$/i.test(model) && resolution === '1080p') return 'Grok 的参考图模式最高支持 720p'
+  }
+  if (geminiOmniVideo(baseUrl, model)) {
+    const { maxSeconds, maxVideos } = geminiOmniLimits(model, mode, duration)
+    if (!Number.isInteger(duration) || duration < 3 || duration > maxSeconds) return `当前模式的视频时长须在 3 到 ${maxSeconds} 秒之间`
+    if (videoCount > maxVideos) return `生成 ${duration} 秒视频时最多可用 ${maxVideos} 个参考视频（已选 ${videoCount} 个）`
+  }
+}
+
+type GeminiMediaOutput = { type?: string; data?: string; uri?: string; mime_type?: string }
+type GeminiInteraction = {
+  id?: string
+  status?: string
+  error?: { message?: string }
+  output_video?: GeminiMediaOutput
+  output_image?: GeminiMediaOutput
+  outputs?: GeminiMediaOutput[]
+  steps?: Array<{ type: string; content?: GeminiMediaOutput[] }>
+}
+
+function geminiFileId(uri?: string) {
+  if (!uri) return
+  if (/^files\/[\w-]+$/.test(uri)) return uri.slice(6)
+  const url = new URL(uri)
+  if (url.origin !== GEMINI_API_ORIGIN) return
+  return /^\/v1beta\/files\/([\w-]+)(?::download)?$/.exec(url.pathname)?.[1]
+}
+
+async function geminiJson<T>(path: string, settings: ApiRequestSettings, signal?: AbortSignal, body?: object) {
+  const response = await providerFetch(GEMINI_API_ORIGIN + path, {
+    headers: { 'x-goog-api-key': settings.apiKey, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    signal, method: body ? 'POST' : 'GET', body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!response.ok) throw await createApiError(response)
+  return await response.json() as T
+}
+
+async function waitForGeminiFile(settings: ApiRequestSettings, fileId: string, signal?: AbortSignal) {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const file = await geminiJson<{ state?: string; uri?: string }>(`/v1beta/files/${fileId}`, settings, signal)
+    if (file.state === 'ACTIVE') return file
+    if (file.state === 'FAILED') throw new Error('Google 无法处理此媒体文件')
+    await waitForDelay(3_000, signal)
+  }
+  throw new Error('Google 媒体文件处理超时')
+}
+
+async function uploadGeminiMedia(settings: ApiRequestSettings, blob: Blob, mimeType: string, signal?: AbortSignal) {
+  const start = await providerFetch(`${GEMINI_API_ORIGIN}/upload/v1beta/files`, {
+    method: 'POST', signal, headers: {
+      'x-goog-api-key': settings.apiKey, 'Content-Type': 'application/json',
+      'X-Goog-Upload-Protocol': 'resumable', 'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(blob.size), 'X-Goog-Upload-Header-Content-Type': mimeType,
+    },
+    body: JSON.stringify({ file: { display_name: `DisyLab reference ${mimeType.split('/')[0]}` } }),
+  })
+  if (!start.ok) throw await createApiError(start)
+  const uploadUrl = start.headers.get('X-Goog-Upload-URL')
+  if (!uploadUrl || new URL(uploadUrl).origin !== GEMINI_API_ORIGIN) throw new Error('Google 未返回有效的素材上传地址')
+  const upload = await providerFetch(uploadUrl, {
+    method: 'POST', signal, headers: { 'Content-Type': mimeType, 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
+    body: blob,
+  })
+  if (!upload.ok) throw await createApiError(upload)
+  const result = await upload.json() as { file?: { name?: string; uri?: string; state?: string } }
+  const id = geminiFileId(result.file?.name)
+  if (!id) throw new Error('Google 未返回素材文件编号')
+  if (result.file?.state !== 'ACTIVE') await waitForGeminiFile(settings, id, signal)
+  return `${GEMINI_API_ORIGIN}/v1beta/files/${id}`
+}
+
+async function finishGeminiVideo(settings: ApiRequestSettings, taskId: string, interaction: GeminiInteraction, signal?: AbortSignal): Promise<GeneratedVideo> {
+  if (interaction.status !== 'completed') {
+    const status = interaction.error?.message ?? interaction.status ?? '未知'
+    throw new GenerationRequestError('api', 'Google 视频任务暂不可取回', status, { requestId: taskId })
+  }
+  const output = geminiMediaOutput(interaction, 'video')
+  try {
+    if (output?.data) {
+      const decoded = atob(output.data)
+      const bytes = new Uint8Array(decoded.length)
+      for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index)
+      const blob = await readCompleteVideoResponse(new Response(bytes, { headers: { 'Content-Type': output.mime_type ?? 'video/mp4' } }))
+      return { blob, taskId, progress: 100 }
+    }
+    const id = geminiFileId(output?.uri)
+    if (!id) throw new Error('Google 未返回视频文件')
+    await waitForGeminiFile(settings, id, signal)
+    const response = await providerFetch(`${GEMINI_API_ORIGIN}/v1beta/files/${id}:download?alt=media`, {
+      signal, headers: { 'x-goog-api-key': settings.apiKey }, redirect: 'error',
+    })
+    return { blob: await readCompleteVideoResponse(response), taskId, progress: 100 }
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw new GenerationRequestError('network', 'Google 视频已生成但本地归档失败', error instanceof Error ? error.message : String(error), { requestId: taskId })
+  }
+}
+
+function geminiMediaOutput(interaction: GeminiInteraction, type: 'image' | 'video') {
+  const primary = type === 'image' ? interaction.output_image : interaction.output_video
+  return primary ?? interaction.outputs?.find((item) => item.type === type)
+    ?? interaction.steps?.filter((step) => step.type === 'model_output')
+      .flatMap((step) => step.content ?? []).find((item) => item.type === type)
+}
+
+async function geminiImageInputs(settings: ApiRequestSettings, sources: string[], signal?: AbortSignal) {
+  const images = await Promise.all(sources.map((source, index) => readImageSourceBlob(source, signal, `Gemini 参考图 ${index + 1}`)))
+  const useFiles = images.reduce((total, blob) => total + blob.size, 0) > 14_000_000
+  const inputs: Array<{ type: string; data?: string; mime_type?: string; uri?: string; text?: string }> = []
+  for (const [index, blob] of images.entries()) {
+    if (!GEMINI_IMAGE_TYPES.includes(blob.type)) {
+      throw new GenerationRequestError('platform', `参考图 ${index + 1} 格式不受 Gemini 支持`, '请上传 PNG、JPEG、WebP、HEIC 或 HEIF。')
+    }
+    if (useFiles) inputs.push({ type: 'image', mime_type: blob.type, uri: await uploadGeminiMedia(settings, blob, blob.type, signal) })
+    else inputs.push({ type: 'image', mime_type: blob.type, data: (await blobToDataUrl(blob)).split(',')[1] })
+  }
+  return inputs
+}
+
+async function generateGeminiImages(settings: ApiRequestSettings, options: ImageGenerationOptions) {
+  const references = options.referenceImages ?? []
+  if (references.length > 14) throw new GenerationRequestError('platform', 'Gemini 最多支持 14 张参考图', '请移除超出的参考图。')
+  const imageInputs = await geminiImageInputs(settings, references, options.signal)
+  const input = [{ type: 'text', text: options.prompt }, ...imageInputs]
+  const images: GeneratedImage[] = []
+  for (let index = 0; index < options.count; index++) {
+    const result = await geminiJson<GeminiInteraction>('/v1beta/interactions', settings, options.signal, {
+      model: settings.model, input,
+      response_format: {
+        type: 'image', mime_type: 'image/png', image_size: options.resolution,
+        aspect_ratio: options.aspectRatio === 'auto' ? undefined : options.aspectRatio,
+      },
+    })
+    const image = geminiMediaOutput(result, 'image')
+    if (!image?.data || !/^image\//.test(image.mime_type ?? 'image/png')) {
+      throw new GenerationRequestError('api', 'Gemini 没有返回图像', result.error?.message ?? result.status ?? '')
+    }
+    images.push({ url: `data:${image.mime_type ?? 'image/png'};base64,${image.data}` })
+  }
+  return images
+}
+
+async function generateGeminiOmniVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  const mode = options.mode ?? 'text2video'
+  const firstFrame = options.firstFrame ?? options.referenceImage
+  const imageSources = mode === 'image2video' ? [firstFrame] : mode === 'first_last_frame' ? [firstFrame, options.lastFrame]
+    : [...new Set([...(options.referenceImages ?? []), options.referenceImage].filter(Boolean))]
+  const videos = [...new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((value): value is string => Boolean(value)))]
+  const { maxImages } = geminiOmniLimits(settings.model, mode, options.seconds)
+  const ratio = options.aspectRatio ?? (/portrait|^720x1280$/.test(options.size) ? '9:16' : '16:9')
+  const resolution = options.resolution ?? '720p'
+  const issue = videoReferenceSettingsIssue(settings.baseUrl, settings.model, mode, options.seconds, videos.length)
+    ?? (imageSources.length > maxImages ? `最多支持 ${maxImages} 张参考图` : undefined)
+    ?? (imageSources.some((source) => !source) ? '请添加所需的首帧和尾帧图片' : undefined)
+    ?? (videos.length && mode !== 'all_reference' ? '参考视频须使用全能参考模式' : undefined)
+    ?? (options.referenceAudios?.length ? 'Gemini Omni 暂不接收参考音频' : undefined)
+    ?? (!['16:9', '9:16'].includes(ratio) ? '输出比例须为 16:9 或 9:16' : undefined)
+  if (issue) throw new GenerationRequestError('platform', 'Gemini Omni 视频参数不符合模型要求', issue)
+  const input = await geminiImageInputs(settings, imageSources.filter((source): source is string => Boolean(source)), options.signal)
+  for (const [index, source] of videos.entries()) {
+    let blob: Blob
+    try {
+      blob = await downloadGeneratedVideoBlob(source, { signal: options.signal })
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      throw new GenerationRequestError('platform', `参考视频 ${index + 1} 无法读取`, '请重新添加可读取的视频文件。')
+    }
+    const mimeType = await videoMimeFromBytes(blob) ?? blob.type
+    input.push({ type: 'video', mime_type: mimeType, uri: await uploadGeminiMedia(settings, blob, mimeType, options.signal) })
+  }
+  input.push({ type: 'text', text: options.prompt })
+  const task = mode === 'image2video' || mode === 'first_last_frame' ? 'image_to_video' : mode === 'text2video' ? 'text_to_video' : 'reference_to_video'
+  let interaction = await geminiJson<GeminiInteraction>('/v1beta/interactions', settings, options.signal, {
+    model: settings.model, input, store: true, background: true,
+    response_format: { type: 'video', aspect_ratio: ratio, duration: `${options.seconds}s`, resolution, delivery: 'uri' },
+    generation_config: { video_config: { task } },
+  })
+  const taskId = interaction.id
+  if (!taskId || !/^[\w.:-]{1,256}$/.test(taskId)) throw new Error('Google 未返回有效的视频任务编号')
+  options.onTaskId?.(taskId)
+  const deadline = Date.now() + 30 * 60_000
+  let failures = 0
+  while (interaction.status === 'in_progress' || interaction.status === 'queued' || interaction.status === 'pending') {
+    if (Date.now() > deadline) throw new GenerationRequestError('network', 'Google 视频任务查询暂时中断', '任务可能仍在生成，可稍后取回。', { requestId: taskId })
+    options.onProgress?.(0, interaction.status)
+    await waitForDelay(4_000, options.signal)
+    try {
+      interaction = await geminiJson(`/v1beta/interactions/${encodeURIComponent(taskId)}`, settings, options.signal)
+      failures = 0
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      if (++failures >= 3) throw new GenerationRequestError('network', 'Google 视频任务查询暂时中断', error instanceof Error ? error.message : String(error), { requestId: taskId })
+    }
+  }
+  const result = await finishGeminiVideo(settings, taskId, interaction, options.signal)
+  options.onProgress?.(100, 'completed')
+  return result
+}
+
 /** OpenAI-compatible asynchronous video job. Large media stays as a Blob and is
  * never converted to base64, keeping React state and canvas snapshots small. */
 async function generateRemoteVideoRequest(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
@@ -1583,8 +1987,13 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   if (grsai) return generateGrsaiVideo(settings, options, grsai)
   if (isHfsyBaseUrl(settings.baseUrl)) return generateHfsyVideo(settings, options)
   const provider = apiProviderForBase(settings.baseUrl)?.id
+  const hasVideoReference = Boolean(options.referenceVideo || options.referenceVideos?.length)
+  const availability = videoReferenceSettingsIssue(settings.baseUrl, settings.model, options.mode, options.seconds, Number(hasVideoReference), options.resolution)
+  if (availability) throw new GenerationRequestError('platform', availability, '')
+  if (geminiOmniVideo(settings.baseUrl, settings.model)) return generateGeminiOmniVideo(settings, options)
+  const apiMartFamily = apiMartVideoFamily(settings.baseUrl, settings.model)
+  if (apiMartFamily) return generateApiMartVideo(settings, options, apiMartFamily)
   if (provider === 'xai' || provider === 'ark' || provider === 'minimax') return generateNativeProviderVideo(provider, settings, options)
-  if (isEvolinkBaseUrl(settings.baseUrl)) return generateEvolinkVideo(settings, options)
   if (/api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedance|doubao-seedance/i.test(settings.model)) {
     return generateApiYiSeedanceVideo(settings, options)
   }
@@ -1676,6 +2085,8 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
     if (status === 'failed') throw new GenerationRequestError('api', '视频生成失败', sanitizeAdminLogJson(job), { requestId: taskId })
     if (status === 'cancelled' || status === 'canceled') throw new DOMException('Generation cancelled', 'AbortError')
   }
+  if (status === 'failed') throw new GenerationRequestError('api', '视频生成失败', sanitizeAdminLogJson(lastJob), { requestId: taskId })
+  if (status === 'cancelled' || status === 'canceled') throw new DOMException('Generation cancelled', 'AbortError')
   const completedUrl = videoResultUrl(lastJob)
   if (completedUrl) {
     try {
@@ -1788,24 +2199,54 @@ function requireHfsyPublicMediaUrl(source: string, kind: 'image' | 'video' | 'au
   throw new GenerationRequestError('platform', 'HFSY 仅支持公网素材链接', `请先将本地${label}上传到可公开访问的地址，再把 URL 用作参考素材。视频生成尚未提交。`)
 }
 
-export async function publishHfsyVideoReferenceImage(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob | string, signal?: AbortSignal) {
-  const image = typeof source === 'string' ? await readImageSourceBlob(source, signal, 'HFSY 参考图') : source
-  return publishHfsyReferenceAsset(settings, image, 'image', signal)
+export async function publishHfsyReferenceImage(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob | string, signal?: AbortSignal, kind: 'image' | 'video' = 'video') {
+  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
+  const failure = (detail: string) => new GenerationRequestError('platform', 'HFSY 参考图上传失败', `${detail}。${kind === 'video' ? '视频' : '图像'}生成尚未提交。`)
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考图服务需要 HTTPS 地址')
+  const original = typeof source === 'string' ? await readImageSourceBlob(source, signal, 'HFSY 参考图') : source
+  const format = await imageMimeFromBytes(original)
+  let image: Blob
+  if (format && HFSY_UPLOAD_IMAGE_TYPES.includes(format)) {
+    image = original.type === format ? original : original.slice(0, original.size, format)
+  } else {
+    try {
+      signal?.throwIfAborted()
+      const bitmap = await createImageBitmap(await normalizeOriginalImageBlob(original))
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = bitmap.width
+        canvas.height = bitmap.height
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('无法创建图片画布')
+        context.drawImage(bitmap, 0, 0)
+        image = await canvasToBlob(canvas, 'image/png', 1)
+        if (image.size > 20 * 1024 * 1024) image = await canvasToBlob(canvas, 'image/webp', 0.92)
+      } finally {
+        bitmap.close()
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error
+      throw failure('无法将这张参考图转换为 HFSY 接收的图片格式，请重新添加图片')
+    }
+  }
+  if (image.size > 20 * 1024 * 1024) throw failure('本地参考图上传服务单张最多 20 MB，可换用可公开访问的图片链接')
+  return publishHfsyReferenceAsset(settings, image, endpoint, failure, signal)
 }
+
+const HFSY_LOCAL_VIDEO_LIMIT_MB = 24
 
 export async function publishHfsyVideoReferenceVideo(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, source: Blob, signal?: AbortSignal) {
-  return publishHfsyReferenceAsset(settings, source, 'video', signal)
+  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
+  const failure = (detail: string) => new GenerationRequestError('platform', 'HFSY 参考视频上传失败', `${detail}。视频生成尚未提交。`)
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考素材服务需要 HTTPS 地址')
+  const type = await videoMimeFromBytes(source)
+  if (type !== 'video/mp4' && type !== 'video/quicktime') throw failure('请选择 MP4 或 MOV 视频')
+  if (!source.size || source.size > HFSY_LOCAL_VIDEO_LIMIT_MB * 1024 ** 2) throw failure(`本地参考视频上传上限为 ${HFSY_LOCAL_VIDEO_LIMIT_MB} MB`)
+  const blob = source.type === type ? source : source.slice(0, source.size, type)
+  return publishHfsyReferenceAsset(settings, blob, endpoint, failure, signal)
 }
 
-async function publishHfsyReferenceAsset(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, blob: Blob, kind: 'image' | 'video', signal?: AbortSignal) {
-  const endpoint = new URL(import.meta.env?.VITE_HFSY_REFERENCE_UPLOAD_URL || 'https://disylab-hfsy-media.pages.dev/hfsy/reference-assets')
-  const label = kind === 'video' ? '参考视频' : '参考图'
-  const failure = (detail: string) => new GenerationRequestError('platform', `HFSY ${label}上传失败`, `${detail}。视频生成尚未提交。`)
-  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) throw failure('参考素材服务需要 HTTPS 地址')
-  const types = kind === 'video' ? ['video/mp4', 'video/quicktime'] : ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
-  if (!types.includes(blob.type)) throw failure(kind === 'video' ? '请选择 MP4 或 MOV 视频' : '请选择 PNG、JPEG、WebP 或 GIF 图片')
-  const limit = kind === 'video' ? 24 : 20
-  if (!blob.size || blob.size > limit * 1024 * 1024) throw failure(`${label}须小于或等于 ${limit} MB 且不能为空`)
+async function publishHfsyReferenceAsset(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey'>, blob: Blob, endpoint: URL, failure: (detail: string) => Error, signal?: AbortSignal) {
   let response: Response
   try {
     response = await providerFetch(endpoint, {
@@ -1818,7 +2259,7 @@ async function publishHfsyReferenceAsset(settings: Pick<ApiRequestSettings, 'bas
     })
   } catch (error) {
     if (signal?.aborted) throw error
-    throw failure('无法连接 DisyLab 的参考素材上传服务，请稍后重试')
+    throw failure('无法连接 DisyLab 的参考图上传服务，请稍后重试')
   }
   const result = await response.json().catch(() => null) as { url?: string; error?: { message?: string } } | null
   const url = result?.url && publicImageSourceUrl(result.url)
@@ -1826,10 +2267,7 @@ async function publishHfsyReferenceAsset(settings: Pick<ApiRequestSettings, 'bas
     const published = new URL(url)
     if (published.origin === endpoint.origin && published.pathname === endpoint.pathname) return url
   }
-  if (kind === 'video' && response.status === 415 && result?.error?.message === '参考图须为 PNG、JPEG、WebP 或 GIF') {
-    throw failure('当前临时素材服务尚未启用视频上传，已有公网视频链接仍可使用')
-  }
-  throw failure(result?.error?.message || 'DisyLab 的参考素材上传服务尚未启用或暂时不可用')
+  throw failure(result?.error?.message || 'DisyLab 的参考图上传服务尚未启用或暂时不可用')
 }
 
 function hfsyFailureDetail(payload: unknown) {
@@ -1877,7 +2315,7 @@ export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
     ...HFSY_LEGACY_SEEDANCE,
     prompt: model === 'sd-2' ? 5_000 : /-1080-cheap|-(?:vip|mini)$/.test(model) ? 15_000 : 10_000,
   }
-  if (/^wan-3\.0(?:-(?:480|720|1080))?$/.test(model)) return { minSeconds: 2, maxSeconds: 30, images: 10, videos: 5, audios: 5, prompt: 5000, ratios: model === 'wan-3.0' ? HFSY_VIDEO_RATIOS : HFSY_SEEDANCE_RATIOS }
+  if (/^wan-3\.0(?:-(?:480|720|1080)(?:-tehui)?)?$/.test(model)) return { minSeconds: 2, maxSeconds: 30, images: 10, videos: 5, audios: 5, prompt: 5000, ratios: model === 'wan-3.0' ? HFSY_VIDEO_RATIOS : HFSY_SEEDANCE_RATIOS }
   if (model === 'video-2.5') return { minSeconds: 4, maxSeconds: 12, images: 5, videos: 1, audios: 3, prompt: 10_000, ratios: HFSY_SEEDANCE_RATIOS }
   if (/^muse[-_]video$/.test(model)) return { minSeconds: model === 'muse_video' ? 1 : 4, maxSeconds: 30, images: 10, videos: 10, audios: 10, prompt: 10_000, maxAssets: 10, ratios: HFSY_VERTICAL_RATIOS }
   if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 0, audios: 3, minImages: 1, prompt: 7000, ratios: HFSY_VERTICAL_RATIOS }
@@ -1887,32 +2325,161 @@ export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
   return undefined
 }
 
-export function videoReferenceRules(baseUrl: string, model: string): VideoReferenceRules | undefined {
-  const id = model.trim().toLowerCase()
-  const provider = apiProviderForBase(baseUrl)?.id
+const REFERENCE_IMAGE_TYPES = HFSY_UPLOAD_IMAGE_TYPES
+const REFERENCE_VIDEO_TYPES = ['video/mp4', 'video/quicktime']
+const SEEDANCE_IMAGE_TYPES = [...REFERENCE_IMAGE_TYPES, 'image/bmp', 'image/tiff']
+const SEEDANCE_IMAGE_LIMITS: MediaLimits = {
+  types: SEEDANCE_IMAGE_TYPES,
+  maxMB: 30, ratio: [0.4, 2.5], side: [300, 6000],
+}
+
+export function videoReferenceRules(baseUrl: string, model: string) {
+  model = model.toLowerCase()
   const hfsy = isHfsyBaseUrl(baseUrl)
-  if (isMuseWebBase(baseUrl) || isJimengCliBase(baseUrl) || getGrsaiVideoCapabilities(baseUrl, id)
-    || (provider === 'minimax' && !/^minimax-h3/.test(id))
-    || (/apiyi\.com/i.test(baseUrl) && (/veo/.test(id) || (/wan2\.|happyhorse/.test(id) && !/-r2v$/.test(id))))) return { maxCount: 0 }
-  if (provider === 'xai') return { maxCount: 1 }
-  if ((provider === 'ark' || /apiyi\.com/i.test(baseUrl)) && /seedance(?:[- ]?v)?[- ]?1/.test(id)) return { maxCount: 0 }
-  const nativeSeedance = (hfsy || provider === 'ark' || /apiyi\.com/i.test(baseUrl))
-    && /seedance(?:[- ]?v)?[- ]?2[. -]?[05](?!\d)/.test(id)
-  const gatewaySeedance = hfsy && /^sd-2(?:[.-]|$)/.test(id) && Boolean(hfsyVideoLimits(id))
-  const hfsyLimits = hfsy ? hfsyVideoLimits(id) : undefined
-  const upload = hfsy ? { localMaxBytes: 24 * 1024 ** 2, mp4OrMov: true } : {}
-  if (nativeSeedance || gatewaySeedance) {
-    const extended = /^(?:sd-2\.5|.*seedance(?:[- ]?v)?[- ]?2[. -]?5)(?!\d)/.test(id)
-    // Ark publishes the Seedance input dimensions. HFSY documents a narrower reference duration for VIP.
-    const vip = hfsy && /^sd-2-vip(?:-720)?$/.test(id)
-    return {
-      ...upload, mp4OrMov: true, seedanceDimensions: true, maxBytes: 200_000_000,
-      maxCount: hfsyLimits?.videos ?? (extended ? 10 : 3),
-      minSeconds: vip ? 3 : 2, maxSeconds: vip ? 10 : extended ? 30 : 15,
-      maxTotalSeconds: extended ? 30 : 15,
-    }
+  const omni = geminiOmniVideo(baseUrl, model)
+  const apiMart = apiMartVideoFamily(baseUrl, model)
+  const limits = hfsy ? hfsyVideoLimits(model) : undefined
+  const grsai = getGrsaiVideoCapabilities(baseUrl, model)
+  const provider = apiProviderForBase(baseUrl)?.id
+  const apiYi = /apiyi\.com/i.test(baseUrl)
+  // The same model name can have a different input contract on a relay.
+  // Ark: create-video-generation-task-api. HFSY: /api/docs plus /api/pricing.
+  const arkSeedance = provider === 'ark' && /seedance[-_. ]*[12][.-][05]/.test(model)
+  const seedance = arkSeedance && /seedance[-_. ]*2[.-][05]/.test(model)
+  const hfsySeedance = hfsy && isHfsyNativeSeedance(model)
+  const seedance25 = /seedance[-_. ]*2[.-]5/.test(model)
+  const legacyHfsy = hfsy && /^sd-2(?:[^.]|$)|^sd-2\.0/.test(model)
+  const hfsy25 = hfsy && /^sd-2\.5/.test(model)
+  const hfsyWan = hfsy && /^wan-3\.0/.test(model)
+  const hfsyAgnes = hfsy && model === 'video-2.5'
+  const hfsyMuse = hfsy && /^muse[-_]video$/.test(model)
+  const hfsyWanTehui = hfsyWan && model === 'wan-3.0-480-tehui'
+  const hfsyVideoTimes: readonly [number, number] | undefined = legacyHfsy || hfsyAgnes || hfsyWanTehui ? [3, 10]
+    : hfsy25 ? [2, 30] : hfsyWan ? [1, 15] : hfsySeedance ? [2, 15] : hfsyMuse ? [0, 120] : undefined
+  const h3 = /^minimax-h3(?:-(?:highspeed|lite|max))?$/.test(model)
+  const nativeH3 = provider === 'minimax' && h3
+  const jimeng = isJimengCliBase(baseUrl)
+  const muse = isMuseWebBase(baseUrl)
+  const grok15 = /^grok-imagine-video-1\.5/.test(model)
+  let images = limits?.images ?? grsai?.images
+  let videos = limits?.videos
+  let frames = grsai?.supportsFrames ?? true
+  if (grsai) videos = 0
+  if (apiMart === 'seedance25' || apiMart === 'zoe') { images = 30; videos = 10 }
+  if (apiMart === 'seedance25-flash') { images = 10; videos = 5 }
+  if (apiMart === 'seedance20') { images = 9; videos = 3 }
+  if (apiMart === 'kling-v3') { images = 0; videos = 0 }
+  if (apiMart === 'kling-v4' || apiMart === 'kling-v4-flash') { images = 10; videos = 5; frames = apiMart === 'kling-v4' }
+  if (jimeng) { images = 1; videos = 0; frames = false }
+  if (muse) { images = 8; videos = 0 }
+  if (nativeH3) { images = 9; videos = 3 }
+  if (omni) { const limits = geminiOmniLimits(model, undefined, 3); images = limits.maxImages; videos = limits.maxVideos }
+  if (provider === 'minimax' && !h3) { images = 1; videos = 0; frames = false }
+  const grokVideo = provider === 'xai' && ['grok-imagine-video', 'grok-imagine-video-1.5', 'grok-imagine-video-1.5-lite'].includes(model)
+  if (grokVideo) {
+    images = model.endsWith('-lite') ? 0 : grok15 ? 14 : 7
+    videos = model === 'grok-imagine-video' ? 1 : 0
+    frames = grok15 && !model.endsWith('-lite')
   }
-  if (hfsy) return { ...upload, maxCount: hfsyLimits?.videos }
+  if (seedance || hfsySeedance) {
+    images ??= seedance25 ? (/flash/.test(model) ? 10 : 30) : 9
+    videos ??= seedance25 ? (/flash/.test(model) ? 5 : 10) : 3
+  }
+  const wanSuffix = apiYi ? /-(t2v|i2v|r2v|videoedit)$/.exec(model)?.[1] : undefined
+  const wan27Reference = apiYi && model === 'wan2.7-r2v'
+  if (wan27Reference) { images = 5; videos = 5 }
+  const apiYiVeo = apiYi && /veo-3\.1/.test(model)
+  const apiYiVeoFrames = apiYiVeo && /-fl$/.test(model)
+  if (apiYiVeoFrames) { images = 2; videos = 0 }
+  const textOnly = apiYiVeo && !apiYiVeoFrames
+  if (textOnly || wanSuffix === 't2v') { images = 0; videos = 0; frames = false }
+  if (wanSuffix === 'i2v') { images = 1; videos = 0; frames = false }
+  return {
+    images, videos, frames, textOnly, framesOnly: apiYiVeoFrames, wanSuffix,
+    minImages: limits?.minImages,
+    minReferenceImages: limits?.minReferenceImages,
+    maxAssets: limits?.maxAssets ?? (apiMart === 'kling-v4' || apiMart === 'kling-v4-flash' ? 15 : undefined) ?? (wan27Reference ? 5 : undefined) ?? (hfsy && /^sd-2-vip-(?:480|720)$/.test(model) ? 12 : undefined),
+    totals: {
+      maxImageBytes: muse ? 24_000_000 : jimeng ? 30_000_000 : hfsyWan ? 25 * 1024 ** 2
+        : hfsy && (legacyHfsy || hfsy25 || hfsyAgnes || hfsySeedance || hfsyMuse || model === 'kling-o3') ? 30 * 1024 ** 2 : undefined,
+      maxVideoSeconds: apiMart === 'kling-v4-flash' ? 20 : apiMart === 'kling-v4' || apiMart === 'seedance25' ? 30
+        : legacyHfsy || hfsyAgnes || hfsyWanTehui || nativeH3 || hfsySeedance ? 15 : hfsy25 || (seedance && seedance25) ? 30 : seedance ? 15 : undefined,
+    },
+    exclusiveVideo: grokVideo,
+    media: (entry: ReferenceMedia): MediaLimits => {
+      const apimartLocal = apiMart && !publicImageSourceUrl(entry.publicUrl ?? (entry.mediaId ? undefined : entry.url))
+      if (entry.kind === 'image') {
+        if (apimartLocal) return { ...(apiMart === 'zoe' ? SEEDANCE_IMAGE_LIMITS : {}), types: HFSY_UPLOAD_IMAGE_TYPES, maxMB: 30 }
+        if (omni) return { types: GEMINI_IMAGE_TYPES }
+        if (apiMart === 'zoe') return { ...SEEDANCE_IMAGE_LIMITS, types: [...SEEDANCE_IMAGE_TYPES, 'image/heic', 'image/heif'] }
+        if (apiYiVeoFrames) return { types: ['image/jpeg', 'image/png'] }
+        if (nativeH3) return {
+          types: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
+          maxMB: 30, ratio: [0.4, 2.5], side: [256, 5760],
+        }
+        const modelRules = arkSeedance ? {
+          ...SEEDANCE_IMAGE_LIMITS,
+          types: seedance ? [...SEEDANCE_IMAGE_TYPES, 'image/heic', 'image/heif'] : SEEDANCE_IMAGE_TYPES,
+        }
+          : hfsy25 ? { ...SEEDANCE_IMAGE_LIMITS, types: REFERENCE_IMAGE_TYPES, maxMB: undefined }
+            : hfsy && (legacyHfsy || hfsyWan || hfsyAgnes || h3) ? { types: REFERENCE_IMAGE_TYPES, maxMB: h3 ? 20 : undefined } : {}
+        if (hfsy && !entry.publicUrl) return { ...modelRules, upload: true }
+        return muse ? { types: REFERENCE_IMAGE_TYPES, maxMB: 24_000_000 / 1024 ** 2 } : modelRules
+      }
+      if (omni) return { seconds: [0, 3] }
+      if (apiMart === 'zoe') return {
+        types: REFERENCE_VIDEO_TYPES, maxMB: apimartLocal ? 50 : 200, side: [300, 6000], ratio: [0.4, 2.5],
+        pixels: [409600, 8295044], seconds: [1.8, 15.2], fps: [24, 60], roundFps: true,
+      }
+      if (apimartLocal) return { types: [...REFERENCE_VIDEO_TYPES, 'video/webm'], maxMB: 50 }
+      const hfsyLocal = hfsy && !entry.publicUrl && Boolean(entry.url || entry.mediaId)
+      const hfsyLocalLimits: MediaLimits = hfsyLocal ? { types: REFERENCE_VIDEO_TYPES, maxMB: HFSY_LOCAL_VIDEO_LIMIT_MB, requireReadable: true } : {}
+      if (hfsyVideoTimes) return {
+        publicOnly: !hfsyLocal,
+        types: hfsyMuse ? [...REFERENCE_VIDEO_TYPES, 'video/webm', 'video/3gpp'] : hfsySeedance ? undefined : REFERENCE_VIDEO_TYPES,
+        maxMB: hfsyMuse ? 40 : 200, seconds: hfsyVideoTimes,
+        ...(hfsy25 ? { ratio: [0.4, 2.5], side: [300, 6000] } : {}),
+        fps: hfsy25 || (hfsyWan && !hfsyWanTehui) ? [24, 60] : undefined,
+        ...hfsyLocalLimits,
+      }
+      if (seedance) return {
+        publicOnly: true, types: REFERENCE_VIDEO_TYPES, maxMB: 200, ratio: [0.4, 2.5],
+        side: [300, 6000], pixels: [407696, 8295044], fps: [24, 60], seconds: [2, seedance25 ? 30 : 15],
+      }
+      if (nativeH3) return {
+        publicOnly: true, types: REFERENCE_VIDEO_TYPES, maxMB: 50,
+        ratio: [0.4, 2.5], side: [256, 5760], seconds: [2, 15], fps: [23.976, 60],
+      }
+      if (grokVideo && model === 'grok-imagine-video') return { types: ['video/mp4'], seconds: [0, 8.7] }
+      return { publicOnly: hfsy && !hfsyLocal, ...hfsyLocalLimits }
+    },
+  }
+}
+
+export function imageReferenceRules(baseUrl: string, model: string) {
+  const capabilities = getImageModelCapabilities(baseUrl, model)
+  const muse = isMuseWebBase(baseUrl)
+  const seedream55 = isHfsyBaseUrl(baseUrl) && model.toLowerCase() === 'seedream-5.5'
+  const provider = apiProviderForBase(baseUrl)?.id
+  const arkSeedream = provider === 'ark' && /seedream/i.test(model)
+  const geminiImage = provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(model)
+  const gptImage = provider === 'openai' && /^(?:gpt-image-|chatgpt-image-latest$)/i.test(model)
+  const grokImage2 = provider === 'xai' && /^grok-imagine-image-2\.0(?:-|$)/i.test(model)
+  return {
+    count: muse ? 8 : grokImage2 ? 5 : capabilities && 'images' in capabilities ? capabilities.images : 16,
+    totals: { maxImageBytes: muse ? 24_000_000 : isJimengCliBase(baseUrl) ? 30_000_000 : seedream55 ? 25 * 1024 ** 2 : undefined },
+    media: (entry: ReferenceMedia): MediaLimits => {
+      if (seedream55) return { upload: !entry.publicUrl }
+      if (geminiImage) return { types: GEMINI_IMAGE_TYPES }
+      if (gptImage) return { types: ['image/jpeg', 'image/png', 'image/webp'], maxMB: 50 }
+      if (arkSeedream) return {
+        types: [...SEEDANCE_IMAGE_TYPES, 'image/heic', 'image/heif'],
+        maxMB: 30, ratio: [1 / 16, 16], minSide: 15, pixels: [196, 36_000_000],
+      }
+      if (muse) return { types: REFERENCE_IMAGE_TYPES }
+      return {}
+    },
+  }
 }
 
 async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
@@ -2083,7 +2650,7 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
   throw new GenerationRequestError('network', 'HFSY 视频生成等待超时', `任务 ID：${taskId}。任务可能仍在生成，请在 HFSY 控制台查询。`, { requestId: taskId })
 }
 
-async function waitForEvolinkTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal, onProgress?: (progress: number, status: string) => void) {
+async function waitForCompatibleAudioTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal, onProgress?: (progress: number, status: string) => void) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < 30 * 60_000) {
     await waitForDelay(3_000, signal)
@@ -2096,51 +2663,21 @@ async function waitForEvolinkTask(settings: ApiRequestSettings, taskId: string, 
     const status = extractProviderTaskStatus(payload) || String(payload.status ?? 'processing').toLowerCase()
     const progress = Number(payload.progress ?? 0)
     onProgress?.(Number.isFinite(progress) ? progress : 0, status)
-    if (['failed', 'cancelled', 'canceled', 'expired'].includes(status)) throw new GenerationRequestError('api', 'Evolink 任务失败', sanitizeAdminLogJson(payload), { requestId: taskId })
+    if (['failed', 'cancelled', 'canceled', 'expired'].includes(status)) throw new GenerationRequestError('api', '音频接口 任务失败', sanitizeAdminLogJson(payload), { requestId: taskId })
     if (status === 'completed' || extractProviderImages(payload).length) return payload
   }
-  throw new GenerationRequestError('network', 'Evolink 任务查询超时', `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复提交。`, { requestId: taskId })
-}
-
-async function generateEvolinkVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
-  const imageUrls = Array.from(new Set([
-    ...(options.referenceImages ?? []), options.firstFrame, options.lastFrame, options.referenceImage,
-  ].filter((value): value is string => Boolean(value))))
-  const videoUrls = Array.from(new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter((value): value is string => Boolean(value))))
-  const response = await providerFetch(endpoint(settings.baseUrl, 'videos/generations'), {
-    method: 'POST', signal: options.signal,
-    headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }),
-    body: JSON.stringify({
-      model: settings.model,
-      prompt: options.prompt,
-      duration: Math.max(3, Math.min(15, Math.round(options.seconds))),
-      quality: videoResolutionFromSize(options.size),
-      aspect_ratio: apiYiVideoRatio(options.size),
-      generate_audio: options.generateAudio !== false,
-      ...(imageUrls.length ? { image_urls: imageUrls } : {}),
-      ...(videoUrls.length ? { video_urls: videoUrls } : {}),
-    }),
-  })
-  if (!response.ok) throw await createApiError(response)
-  const created = await response.json() as Record<string, unknown>
-  const taskId = extractTaskId(created)
-  if (!taskId) throw new GenerationRequestError('platform', 'Evolink 没有返回视频任务编号', sanitizeAdminLogJson(created))
-  options.onTaskId?.(taskId)
-  const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
-  const sourceUrl = extractProviderImages(completed)[0]?.url
-  if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 视频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
-  try {
-    return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal: options.signal }), taskId, progress: 100, sourceUrl }
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error
-    throw new GenerationRequestError('network', 'Evolink 视频已生成但本地归档失败', error instanceof GenerationRequestError ? error.detail : String(error), { requestId: taskId, resultUrls: [sourceUrl] })
-  }
+  throw new GenerationRequestError('network', '音频接口 任务查询超时', `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复提交。`, { requestId: taskId })
 }
 
 /** Reopens an existing task using the same provider routes as generation. */
 export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal): Promise<GeneratedVideo> {
   if (!/^[\w.:-]{1,256}$/.test(taskId)) throw new Error('原视频任务编号无效')
   signal?.throwIfAborted()
+  if (geminiOmniVideo(settings.baseUrl, settings.model)) {
+    const interaction = await geminiJson<GeminiInteraction>(`/v1beta/interactions/${encodeURIComponent(taskId)}`, settings, signal)
+    return finishGeminiVideo(settings, taskId, interaction, signal)
+  }
+  if (apiMartVideoFamily(settings.baseUrl, settings.model)) return finishApiMartVideo(await readApiMartVideoTask(settings, taskId, signal), taskId, signal)
   if (isHfsyBaseUrl(settings.baseUrl)) return resumeHfsyVideoTask(settings, taskId, { signal })
   if (isJimengCliBase(settings.baseUrl)) {
     const bytes = await readJimengMedia(taskId, true).catch(async () => {
@@ -2163,7 +2700,6 @@ export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, ta
     if (!sourceUrl) throw new GenerationRequestError('platform', '厂商暂未返回原视频链接', '请在原生成平台查看任务状态。', { requestId: taskId })
     return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal }), taskId, progress: 100, sourceUrl }
   }
-  if (isEvolinkBaseUrl(settings.baseUrl)) return download(extractProviderImages(await waitForEvolinkTask(settings, taskId, signal))[0]?.url ?? '')
   if (getGrsaiVideoCapabilities(settings.baseUrl, settings.model)) {
     const result = await resolveGrsaiMediaResult(settings, { task_id: taskId }, signal, '视频')
     return download(extractGeneratedImages(result).find(({ url }) => /^https?:\/\//i.test(url))?.url ?? '')
@@ -2172,10 +2708,7 @@ export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, ta
   const model = settings.model
   if (/apiyi\.com/i.test(settings.baseUrl) && /seedance|veo-3\.1|wan2\.|happyhorse/i.test(model)) {
     const headers = apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` })
-    if (/veo-3\.1/i.test(model)) {
-      const contentUrl = apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${id}/content`)
-      return { blob: await readCompleteVideoResponse(await read(contentUrl, headers)), taskId, progress: 100 }
-    }
+    if (/veo-3\.1/i.test(model)) return readApiYiVeoContent(settings, taskId, signal)
     const taskUrl = /seedance/i.test(model)
       ? apiYiVideoEndpoint(settings, '/apiyi/seedance', `/seedance/api/v3/contents/generations/tasks/${id}`)
       : apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${id}`)
@@ -2218,9 +2751,7 @@ export async function readRecoverableVideo(options: { sourceUrl?: string; taskId
   throw new Error('找不到可读取的视频文件或原任务连接')
 }
 
-/** Evolink unified asynchronous audio endpoint. Model-specific optional fields
- * are accepted through `extra` so new documented audio models remain usable
- * without weakening the generic OpenAI-compatible request paths. */
+/** Generate audio via MiniMax or a task-based compatible endpoint. */
 export async function generateRemoteAudio(settings: ApiRequestSettings, options: AudioGenerationOptions): Promise<GeneratedAudio> {
   if (apiProviderForBase(settings.baseUrl)?.id === 'minimax') {
     if (!options.voice?.trim()) throw new GenerationRequestError('platform', '请选择 MiniMax 音色', '需要 MiniMax 控制台提供的 voice_id。')
@@ -2260,13 +2791,13 @@ export async function generateRemoteAudio(settings: ApiRequestSettings, options:
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
   const taskId = extractTaskId(created)
-  if (!taskId) throw new GenerationRequestError('platform', 'Evolink 没有返回音频任务编号', sanitizeAdminLogJson(created))
+  if (!taskId) throw new GenerationRequestError('platform', '音频接口 没有返回音频任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
-  const completed = await waitForEvolinkTask(settings, taskId, options.signal, options.onProgress)
+  const completed = await waitForCompatibleAudioTask(settings, taskId, options.signal, options.onProgress)
   const sourceUrl = extractProviderImages(completed)[0]?.url
-  if (!sourceUrl) throw new GenerationRequestError('platform', 'Evolink 音频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
+  if (!sourceUrl) throw new GenerationRequestError('platform', '音频接口 音频任务完成但没有返回媒体地址', sanitizeAdminLogJson(completed), { requestId: taskId })
   const mediaResponse = await providerFetch(sourceUrl, { signal: options.signal })
-  if (!mediaResponse.ok) throw new GenerationRequestError('network', 'Evolink 音频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
+  if (!mediaResponse.ok) throw new GenerationRequestError('network', '音频接口 音频下载失败', `下载失败（${mediaResponse.status}）`, { requestId: taskId, resultUrls: [sourceUrl] })
   return { blob: await mediaResponse.blob(), taskId, progress: 100, sourceUrl, payload: completed }
 }
 
@@ -2436,18 +2967,6 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
   if (isHfsyBaseUrl(normalizedBase)) {
     throw new Error('HFSY 官方公开 API 暂未提供余额查询接口；请在 HFSY 控制台查看余额。')
   }
-  if (isEvolinkBaseUrl(normalizedBase)) {
-    const response = await providerFetch(endpoint(normalizedBase, 'credits'), {
-      headers: providerRelayHeaders(settings, { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' }),
-    })
-    if (!response.ok) throw new Error(await readError(response) || apiErrorSummary(response.status))
-    const payload = await response.json() as { success?: unknown; message?: unknown; data?: { token?: { remaining_credits?: unknown; unlimited_credits?: unknown } } }
-    if (payload.success !== true) throw new Error(typeof payload.message === 'string' && payload.message ? payload.message : '未能读取 Evolink 积分')
-    if (payload.data?.token?.unlimited_credits === true) return { provider: 'Evolink', amount: Number.POSITIVE_INFINITY, unit: '无限积分', updatedAt: new Date().toISOString() }
-    const amount = Number(payload.data?.token?.remaining_credits)
-    if (!Number.isFinite(amount) || amount < 0) throw new Error('Evolink 返回了无效的 Token 积分余额')
-    return { provider: 'Evolink', amount, unit: '积分', updatedAt: new Date().toISOString() }
-  }
   if (/api\.apimart\.ai|apimart\.ai/i.test(normalizedBase)) {
     const response = await providerFetch('https://api.apimart.ai/v1/balance', {
       headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: 'application/json' },
@@ -2606,7 +3125,7 @@ const DEFAULT_IMAGE_PATTERN = /nano(?:-banana)?|seedream|gpt-image/i
 // Video families that should be enabled immediately after a successful model
 // catalog refresh. The match is deliberately based on the provider's returned
 // id/name, so it never creates a model the current key cannot access.
-const DEFAULT_VIDEO_PATTERN = /seedance|veo|wan(?:2\.\d)?|happyhorse/i
+const DEFAULT_VIDEO_PATTERN = /seedance|veo|gemini-omni|wan(?:2\.\d)?|happyhorse/i
 
 export function isModelAutoEnabled(model: { id: string; name: string; capability: ModelCapability }): boolean {
   const haystack = `${model.id} ${model.name}`
@@ -3050,6 +3569,7 @@ export async function generateRemoteImages(
     return images
   }
   const provider = apiProviderForBase(settings.baseUrl)?.id
+  if (provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(settings.model)) return generateGeminiImages(settings, options)
   if (provider === 'xai' || provider === 'ark' || provider === 'muse') {
     const referenceImages = options.referenceImages?.filter(Boolean) ?? []
     const capabilities = getImageModelCapabilities(settings.baseUrl, settings.model)!
@@ -3124,8 +3644,9 @@ export async function generateRemoteImages(
   if (!/gpt-image/i.test(settings.model)) body.response_format = 'url'
   const referenceImages = options.referenceImages?.filter(Boolean) ?? []
   const hfsy = getHfsyImageCapabilities(settings.baseUrl, settings.model)
-  const publicHfsyReferences = hfsy ? referenceImages.map(publicImageSourceUrl) : []
-  const useHfsyNativeImage = Boolean(hfsy && publicHfsyReferences.every(Boolean))
+  const hfsySeedream55 = Boolean(hfsy && settings.model.trim().toLowerCase() === 'seedream-5.5')
+  let publicHfsyReferences = hfsy ? referenceImages.map(publicImageSourceUrl) : []
+  const useHfsyNativeImage = Boolean(hfsy && (hfsySeedream55 || publicHfsyReferences.every(Boolean)))
   if (hfsy) {
     const invalid = (detail: string): never => { throw new GenerationRequestError('platform', 'HFSY 图片参数不符合模型要求', `${detail}。图片生成尚未提交。`) }
     if (!options.prompt.trim() || Array.from(options.prompt).length > 5_000) invalid('提示词须为 1–5000 字符')
@@ -3148,6 +3669,10 @@ export async function generateRemoteImages(
     if (!rows.length) throw new GenerationRequestError('platform', 'HFSY Nano Banana 没有返回图片地址', sanitizeAdminLogJson(payload))
     return rows
   }
+  if (hfsySeedream55) {
+    publicHfsyReferences = await Promise.all(referenceImages.map((source, index) => publicHfsyReferences[index]
+      ?? publishHfsyReferenceImage(settings, source, options.signal, 'image')))
+  }
   const isGrsai = isGrsaiBaseUrl(settings.baseUrl)
   const grsaiPath = isGrsai ? grsaiImageEndpoint(settings.baseUrl) : undefined
   const useGrsaiUnifiedImage = grsaiPath === 'api/generate'
@@ -3167,8 +3692,7 @@ export async function generateRemoteImages(
     throw new GenerationRequestError('platform', '当前模型或接口不支持此输出格式', `${settings.model} 无法输出 ${options.output}，生成尚未提交。`)
   }
   const useVisionaryTaskImage = isVisionaryBaseUrl(settings.baseUrl)
-  const useEvolinkTaskImage = isEvolinkBaseUrl(settings.baseUrl)
-  const useStandardImageEdit = grsaiPath === 'images/edits' || (!isGrsai && !useEvolinkTaskImage && referenceImages.length > 0 && /(?:gpt-image|chatgpt-image)/i.test(settings.model))
+  const useStandardImageEdit = grsaiPath === 'images/edits' || (!isGrsai && referenceImages.length > 0 && /(?:gpt-image|chatgpt-image)/i.test(settings.model))
   const isGrsaiGptImage = /(?:gpt-image|chatgpt-image)/i.test(settings.model)
   const grsaiSize = GRS_GPT_MODELS.test(settings.model)
     ? resolveGrsaiGptSize(settings.model, grsaiOptions.aspectRatio ?? '1:1', grsaiOptions.resolution ?? '1K')
@@ -3218,20 +3742,10 @@ export async function generateRemoteImages(
     ...(options.detail ? { quality: options.detail } : {}),
     client_request_id: clientRequestId,
   }
-  const evolinkRequestBody: Record<string, unknown> = {
-    model: settings.model,
-    prompt: options.prompt,
-    size: options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : 'auto',
-    // Nano Banana 2 Lite currently documents only the 1K quality preset.
-    quality: /gemini-3\.1-flash-lite-image/i.test(settings.model) ? '1K' : (options.resolution ?? '1K'),
-    ...(referenceImages.length ? { image_urls: referenceImages } : {}),
-  }
   const requestForLog: Record<string, unknown> = useHfsyNativeImage
     ? hfsyImageBody
     : useGrsaiUnifiedImage
     ? grsaiRequestBody
-    : useEvolinkTaskImage
-      ? evolinkRequestBody
     : useVisionaryTaskImage
       ? visionaryRequestBody
     : useStandardImageEdit
@@ -3307,7 +3821,7 @@ export async function generateRemoteImages(
         },
         body: JSON.stringify(grsaiRequestBody),
       })
-    } else if (useVisionaryTaskImage || useEvolinkTaskImage) {
+    } else if (useVisionaryTaskImage) {
       response = await providerFetch(endpoint(settings.baseUrl, 'images/generations'), {
         method: 'POST',
         signal: options.signal,
@@ -3315,7 +3829,7 @@ export async function generateRemoteImages(
           'Content-Type': 'application/json',
           ...(useVisionaryTaskImage ? { 'Idempotency-Key': clientRequestId } : {}),
         }),
-        body: JSON.stringify(useEvolinkTaskImage ? evolinkRequestBody : visionaryRequestBody),
+        body: JSON.stringify(visionaryRequestBody),
       })
     } else if (useStandardImageEdit) {
       const form = new FormData()

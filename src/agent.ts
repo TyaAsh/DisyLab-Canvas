@@ -19,6 +19,7 @@ export type AgentMessage = {
   turnOptions?: AgentTurnOptions
   skillUseId?: string
   questions?: AgentQuestion[]
+  mediaBrief?: { requests: string[]; referenceRequests?: string[]; replaces?: string }
   canvasEditDraft?: AgentCanvasEditDraft
   canvasEditTargetQuestion?: boolean
   imageOperation?: AgentImageOperationDraft
@@ -66,9 +67,9 @@ export type AgentTurnOptions = {
 }
 
 export function agentPaceGuide(pace: AgentPace | undefined) {
-  if (pace === 'quick') return '本轮采用快速节奏。脑暴时给少量短方向；目标清楚时直接给精简答案或准备待确认方案。仅为影响交付的缺失信息追问。保留用户指定的数量、规格、模型和素材。'
-  if (pace === 'deep') return '本轮采用深度节奏。复杂任务先在 reply 中列明交付物、关键约束、先后依赖与需审核的节点；简单任务仍直接回答。资料不足时只问会改变结果的问题。用户只要求规划时保持规划范围，任何生成或画布变更仍走确认。'
-  return ''
+  if (pace === 'quick') return '用户希望简洁回复。目标清楚就直接准备方案，只问会影响交付的问题。'
+  if (pace === 'deep') return '用户希望深入推敲。讨论会影响成品的取舍、交付依赖和审核点，按已确认的约束继续。'
+  return '按任务复杂度和用户在对话中的要求决定回复深度。简单需求直接给出方案。复杂合作只说明当前需要决定的创意取舍、推荐方向和下一步，信息足够时准备交付卡。'
 }
 
 export function agentReferencePurposeGuide(references: ReadonlyArray<Pick<AgentImageReference, 'name' | 'purpose' | 'kind'>>) {
@@ -128,6 +129,7 @@ export type AgentImagePlan = {
   aspectRatio: string
   resolution: string
   detail: string
+  requestedDetail?: string
   count: number
   /** Separates cards with confirmed draft settings from older composer defaults. */
   hasDraftImageSpecs?: boolean
@@ -199,6 +201,7 @@ export type AgentVideoPlan = {
   duration: number
   count: number
   generationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
+  firstFrameAspect?: number
   videoConnectionId?: string
   videoModelId?: string
   modelMention?: AgentModelMention
@@ -250,29 +253,17 @@ export type AgentReply = {
 
 export type AgentImagePlanDraft = Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'count' | 'label'>
 
-/** The user's explicit image specs win over the model's suggested settings. */
 export function resolveAgentImageDraftSettings(
   request: string,
   draft: AgentImagePlanDraft,
   defaults: Pick<AgentImagePlanDraft, 'aspectRatio' | 'resolution' | 'detail' | 'count'>,
 ) {
-  const ratio = (text: string) => {
-    const value = text.normalize('NFKC')
-    const specified = /(?:比例|横版|竖版|方形|宽高比|横屏|竖屏)\s*(?:为|用|[:：])?\s*(\d{1,2}(?:\.\d+)?)[ \t]*:[ \t]*(\d{1,2}(?:\.\d+)?)(?![\d.:])/.exec(value)
-    return specified ?? /(?:^|[^\d:])(21|16|9|5|4|3|2|1)[ \t]*:[ \t]*(21|16|9|5|4|3|2|1)(?![\d.:])/.exec(value)
-  }
-  const ratioString = (match: RegExpMatchArray | null) => match && Number(match[1]) > 0 && Number(match[2]) > 0 ? `${Number(match[1])}:${Number(match[2])}` : undefined
-  const normalized = request.normalize('NFKC')
-  const count = normalized.match(/(?:^\s*|(?:数量|张数|生成|出图|做|画|给我|要|每个方案)[：:\s]*)([1-4一二两三四])\s*张/)
-  const countWords: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4 }
-  const quality = normalized.match(/(?:画质|品质|质量|精度)\s*[:：]?\s*(自动|最高|高|中|低)/)
-  const qualityWords: Record<string, string> = { 自动: 'auto', 最高: 'max', 高: 'high', 中: 'medium', 低: 'low' }
-  const suppliedResolution = normalized.match(/(?:^|[^a-z0-9])([124]K)(?![a-z0-9])/i)?.[1].toUpperCase()
+  const specs = agentMediaSpecs([request], 'image')
   return {
-    aspectRatio: ratioString(ratio(normalized)) ?? ratioString(ratio(draft.prompt)) ?? ratioString(ratio(draft.aspectRatio)) ?? defaults.aspectRatio,
-    resolution: suppliedResolution ?? draft.resolution ?? defaults.resolution,
-    detail: (quality && qualityWords[quality[1]]) || draft.detail || defaults.detail,
-    count: count ? (countWords[count[1]] ?? Number(count[1])) : Math.min(4, Math.max(1, Math.round(draft.count || defaults.count))),
+    aspectRatio: specs.aspectRatio ?? agentMediaSpecs([draft.prompt], 'image').aspectRatio ?? (draft.aspectRatio || defaults.aspectRatio),
+    resolution: specs.resolution ?? (draft.resolution || defaults.resolution),
+    detail: specs.detail ?? (draft.detail || defaults.detail),
+    count: specs.count ?? Math.min(4, Math.max(1, Math.round(draft.count || defaults.count))),
   }
 }
 
@@ -281,7 +272,7 @@ export function reconcileAgentImagePlanSpecs(plan: AgentImagePlan): AgentImagePl
   const specs = resolveAgentImageDraftSettings('', plan, plan)
   return { ...plan, aspectRatio: specs.aspectRatio }
 }
-export type AgentVideoPlanDraft = Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'label'>
+export type AgentVideoPlanDraft = Pick<AgentVideoPlan, 'prompt' | 'aspectRatio' | 'resolution' | 'duration' | 'count' | 'label' | 'generationMode'>
 
 export function compactReferenceName(value: string, maxLength = 8) {
   const characters = Array.from(value.trim())
@@ -305,10 +296,184 @@ function parsePlanCountText(value: string) {
   return CHINESE_DIGITS[value] ?? null
 }
 
+const agentNumber = String.raw`(\d{1,2}|[一二两三四五六七八九十]{1,3})`
+const agentImageCount = new RegExp(String.raw`(?:^|生成|输出|制作|做|出图|出|画|给我|要|一共|总共|共|设计|改成|改为|数量|张数)\s*[:：]?\s*(?:是|要)?\s*${agentNumber}\s*(?:张|幅)`, 'i')
+const agentVideoCount = new RegExp(String.raw`(?:^|生成|制作|做|出|输出|给我|要|改成|改为|数量|条数|总共|共)\s*[:：]?\s*${agentNumber}\s*(?:条|段|部|支|个(?![^，。,.\n]{0,8}方案)|份)(?![^，。,.\n]{0,4}(?:方案|方向|创意))`, 'i')
+const agentVideoDuration = new RegExp(String.raw`(?:^|[^\d.:−-])${agentNumber}\s*(?:秒钟?|seconds?|s\b)(?!\s*(?:后|处|到|至))`, 'i')
+
 export function requestedAgentImageCount(content: string) {
-  const text = content.normalize('NFKC')
-  const count = /(?:生成|输出|制作|出|画|给我|要|一共|总共|共|设计)\s*(?:是|要)?\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:张|幅)/.exec(text)?.[1]
+  const count = agentImageCount.exec(content.normalize('NFKC').trim())?.[1]
   return count ? parsePlanCountText(count) : null
+}
+
+export type AgentMediaSpecs = {
+  aspectRatio?: string
+  resolution?: string
+  count?: number
+  duration?: number
+  detail?: string
+  generationMode?: AgentVideoPlan['generationMode']
+}
+
+function mediaRequestClauses(value: string) {
+  return value.normalize('NFKC').split(/[;。\n]|,\s*(?=(?:再(?:做|生成|制作|出)|然后|接着|另外|最后改|改成|改为|(?:\d+|[一二两三四五六七八九十]+)\s*(?:张|幅|条|段|部|支)[^,;]{0,16}(?:海报|横幅|封面|图片|视频|短片)))/)
+    .map((clause) => clause.trim()).filter(Boolean)
+}
+
+function clauseMediaKind(clause: string) {
+  if (messageExpectsVideoPlans(clause) || /(?:条|段|部|支)(?:.{0,18})(?:视频|短片|广告片)/.test(clause)) return 'video'
+  if (messageExpectsImagePlans(clause) || /(?:张|幅)(?:.{0,18})(?:图|海报|横幅|封面)/.test(clause)) return 'image'
+}
+
+export function agentVideoDeliverables(requests: readonly string[]) {
+  const groups = mediaRequestClauses(requests[0] ?? '').filter((clause) => clauseMediaKind(clause) === 'video')
+  if (groups.length < 2) return []
+  const requested = groups.map((clause) => agentMediaSpecs([clause], 'video'))
+  if (requested.some((group) => !group.count || !group.duration)) return []
+  const revisions = agentMediaSpecs(requests.slice(1), 'video')
+  return requested.map((group) => ({ ...group, ...revisions, count: group.count }))
+}
+
+export function agentVideoFrameRequests(requests: readonly string[], deliverables: number): readonly (readonly string[])[] {
+  const groups = mediaRequestClauses(requests[0] ?? '').filter((clause) => clauseMediaKind(clause) === 'video')
+  return deliverables > 1 && groups.length === deliverables && groups.some((group) => /首帧|尾帧/.test(group))
+    ? groups.map((group) => [group, ...requests.slice(1)])
+    : []
+}
+
+export function agentRatioSequence(requests: readonly string[]) {
+  const numbers = /(?:^|[^\d:])(\d{1,3}(?:\.\d+)?)\s*:\s*(\d{1,3}(?:\.\d+)?)(?![\d.:])/g
+  for (const request of [...requests].reverse()) {
+    const ratios = [...request.normalize('NFKC').matchAll(numbers)]
+      .filter((match) => Number(match[1]) > 0 && Number(match[2]) > 0)
+      .map((match) => `${Number(match[1])}:${Number(match[2])}`)
+    if (ratios.length) return ratios
+  }
+  return []
+}
+
+export function agentMediaSpecs(requests: readonly string[], kind: 'image' | 'video'): AgentMediaSpecs {
+  const specs: AgentMediaSpecs = {}
+  const scoped = requests.flatMap((request) => {
+    const clauses = mediaRequestClauses(request)
+    const kinds = clauses.map(clauseMediaKind)
+    if (kinds.includes('image') && kinds.includes('video')) return clauses.filter((_, index) => kinds[index] === kind)
+    return clauses.some((clause) => /^(?:最后)?(?:改成|改为)/.test(clause)) ? clauses : [request]
+  })
+  for (const request of scoped) {
+    const text = request.normalize('NFKC').trim().replace(/@\[node:[^\]]+\]/g, '')
+    const distinct = new Set(agentRatioSequence([text]))
+    if (/画幅跟随首帧|比例跟随首帧/.test(text)) specs.aspectRatio = 'auto'
+    else if (distinct.size === 1) specs.aspectRatio = [...distinct][0]
+    else if (distinct.size > 1) delete specs.aspectRatio
+    else if (/竖屏|竖版|竖幅|\bportrait\b/i.test(text) && !/横屏|横版|横幅|\blandscape\b/i.test(text)) specs.aspectRatio = '9:16'
+    else if (/横屏|横版|横幅|\blandscape\b/i.test(text) && !/竖屏|竖版|竖幅|\bportrait\b/i.test(text)) specs.aspectRatio = '16:9'
+    else if (/正方形|方形画幅|\bsquare\b/i.test(text)) specs.aspectRatio = '1:1'
+    const resolution = (kind === 'video' ? /\b(360p|480p|720p|768p|1080p|2k|4k)\b/i : /\b([124]k)\b/i).exec(text)?.[1]
+    if (resolution) specs.resolution = kind === 'video' ? resolution.toLowerCase() : resolution.toUpperCase()
+    const countWord = (kind === 'video' ? agentVideoCount : agentImageCount).exec(text)?.[1]
+      ?? (kind === 'video' ? /\b(\d{1,2})\s+(?:videos|clips)\b/i : /\b(\d{1,2})\s+(?:images|photos|pictures)\b/i).exec(text)?.[1]
+    const count = countWord && parsePlanCountText(countWord)
+    if (count) specs.count = count
+    if (kind === 'video') {
+      const durationWord = agentVideoDuration.exec(text)?.[1]
+      const duration = durationWord && parsePlanCountText(durationWord)
+      if (duration) specs.duration = duration
+      if (/使用现有参考素材|恢复参考素材/.test(text)) delete specs.generationMode
+      else if (/首尾帧|首[、和与]尾帧|首帧[^。；;]{0,60}尾帧|(?:作(?:为)?|当|做)尾帧|first and last frames/i.test(text)) specs.generationMode = 'frames'
+      else if (/图生视频|(?:让|把).{0,18}(?:图|画面).{0,10}动起来|作为首帧|首帧图|animate (?:this|the) image/i.test(text)) specs.generationMode = 'image'
+      else if (/全能参考|参考视频|视频参考/.test(text)) specs.generationMode = 'omni'
+      else if (/图片参考|参考图生视频/.test(text)) specs.generationMode = 'reference'
+      else if (/文生视频|只(?:用|按)文字|不(?:用|使用)(?:参考|素材)/.test(text)) specs.generationMode = 'text'
+    } else {
+      const quality = /(?:画质|品质|质量|精度)\s*(?:为|用|[:：])?\s*(自动|最高|高|中|低)/.exec(text)?.[1]
+      const qualities: Record<string, string> = { 自动: 'auto', 最高: 'max', 高: 'high', 中: 'medium', 低: 'low' }
+      if (quality) specs.detail = qualities[quality]
+    }
+  }
+  return specs
+}
+
+export function resolveAgentMediaContinuation(history: readonly AgentMessage[], request: string, displayRequest = request) {
+  const previous = history.at(-1)
+  if (previous?.role !== 'assistant' || !previous.mediaBrief) return
+  const text = request.trim().replace(/^(?:(?:好的?|可以|麻烦|请|那就|那|我想|能不能|可以帮我|帮我)[，,、\s]*)+/, '')
+  if (/^(?:换个话题|另一个任务|新任务|另外(?:帮我|做|生成|设计)|再(?:另外|做|生成|制作|设计)一)/.test(text)) return
+  if (!/^(?:改成|改做|做成|转成|用这)/.test(text)) {
+    const prior = previous.mediaBrief.requests.join('\n')
+    if (messageExpectsVideoPlans(text) && messageExpectsImagePlans(prior) && !messageExpectsVideoPlans(prior)) return
+    if (messageExpectsImagePlans(text) && messageExpectsVideoPlans(prior) && !messageExpectsImagePlans(prior)) return
+  }
+  if (!previous.questions?.length
+    && previous.decision?.mode !== 'clarify'
+    && !/(?:其他|其余)不变/.test(text)
+    && !/^(?:改成|改为|把.{0,12}(?:改|换)|还是用|其余不变|其他不变|保持其他|按这个|就按|选第|用第|(?:比例|时长|画幅|数量|背景|配色|风格|构图).{0,9}(?:改|调|换|增加|减少|一点))|^(?:比例|画幅|时长|数量|清晰度|画质)\s*[:：]|^\d{1,3}\s*:\s*\d{1,3}\s*[。！!]?$/.test(text)) return
+  const questionPrompts = new Set(previous.questions?.map(({ prompt }) => prompt))
+  const answersOnly = (value: string) => value.split('\n').filter((line) => !questionPrompts.has(line.trim())).join('\n').trim()
+  const answer = answersOnly(text)
+  const lastUser = [...history].reverse().find((message) => message.role === 'user')
+  return {
+    requests: [...previous.mediaBrief.requests, answer].filter(Boolean),
+    referenceRequests: [...(previous.mediaBrief.referenceRequests ?? previous.mediaBrief.requests), answersOnly(displayRequest)].filter(Boolean),
+    replaces: previous.questions?.length || previous.decision?.mode === 'clarify' ? previous.mediaBrief.replaces : previous.id,
+    lastUser,
+  }
+}
+
+export function continueAgentMediaReferences(prior: readonly AgentImageReference[], added: readonly AgentImageReference[], request: string) {
+  if (/只(?:用|按)文字|不(?:用|使用|需要)(?:参考|素材)/.test(request)) return []
+  if (/(?:只(?:用|保留)(?:这|新)|(?:移除|不用|去掉|替换)(?:原来|前面|之前|原先|已有|所有|全部)(?:的)?(?:图|视频|参考|素材))/.test(request)) return [...added]
+  return [...new Map([...prior, ...added].map((reference) => [reference.nodeId, reference])).values()]
+}
+
+export function bindAgentVideoFrames(references: readonly AgentImageReference[], requests: readonly string[], requireExplicitPair = false) {
+  const images = references.filter(({ kind }) => kind !== 'video')
+  const slots: Array<AgentImageReference | undefined> = [undefined, undefined]
+  const issues: Array<string | undefined> = [undefined, undefined]
+  for (const request of requests) {
+    for (const clause of request.normalize('NFKC').split(/[,;。\n、]/)) {
+      const roles = [...clause.matchAll(/(?:首帧|起始帧|尾帧|结束帧)/g)]
+      if (!roles.length) continue
+      const mentioned = images.filter(({ name }) => name.length > 1 && clause.includes(name)).sort((a, b) => b.name.length - a.name.length)
+      const number = /(?:参考图|图片|图)\s*(\d+|[一二两三四五六七八九十]+)(?!\s*[张幅])/.exec(clause)?.[1]
+        ?? /第\s*(\d+|[一二两三四五六七八九十]+)\s*(?:张|幅)/.exec(clause)?.[1]
+      if (roles.length > 1) {
+        if (number || mentioned.length || clause.includes('@')) {
+          issues[0] = '请分别说明首帧和尾帧对应的素材。'
+          issues[1] = issues[0]
+        }
+        continue
+      }
+      const index = /首|起/.test(roles[0][0]) ? 0 : 1
+      const ordinal = number ? parsePlanCountText(number) : undefined
+      const match = mentioned[0] ?? (ordinal ? images[ordinal - 1] : undefined)
+      if (match) {
+        slots[index] = match
+        issues[index] = undefined
+      } else if (number || clause.includes('@')) {
+        issues[index] = `找不到作为${index ? '尾帧' : '首帧'}的${number ? `图${number}` : '素材'}，请确认对应素材。`
+      }
+    }
+  }
+  const issue = issues.find(Boolean)
+  if (issue) return { issue, references: images }
+  if (slots[0]?.nodeId && slots[0].nodeId === slots[1]?.nodeId) {
+    return { issue: '首帧和尾帧指向同一份素材，请明确两个帧位。', references: images }
+  }
+  if (requireExplicitPair && images.length > 2) {
+    if (!slots[0] || !slots[1]) return { issue: '请说明这条视频对应的首帧和尾帧。', references: images }
+    return { references: [slots[0], slots[1]] }
+  }
+  const remaining = images.filter(({ nodeId }) => !slots.some((reference) => reference?.nodeId === nodeId))
+  return { references: [slots[0] ?? remaining.shift(), slots[1] ?? remaining.shift(), ...remaining].filter((reference): reference is AgentImageReference => Boolean(reference)) }
+}
+
+export function resolveAgentVideoMode(specs: AgentMediaSpecs, suggested: AgentVideoPlan['generationMode'], imageCount: number, videoCount: number) {
+  if (specs.generationMode) return specs.generationMode
+  if (videoCount) return 'omni'
+  if (!imageCount) return 'text'
+  if (imageCount >= 2 && suggested === 'frames') return 'frames'
+  return imageCount === 1 && suggested !== 'reference' ? 'image' : 'reference'
 }
 
 export function getRequestedAgentPlanCount(content: string) {
@@ -336,17 +501,12 @@ export function resolveAgentVideoDraftSettings(
   draft: AgentVideoPlanDraft,
   defaults: Pick<AgentVideoPlanDraft, 'aspectRatio' | 'resolution' | 'duration' | 'count'>,
 ) {
-  const text = request.normalize('NFKC')
-  const aspect = /(?:^|[^\d:])(21|16|9|5|4|3|2|1)\s*:\s*(21|16|9|5|4|3|2|1)(?![\d.:])/.exec(text)
-  const duration = /(?:时长\s*(?:为|用|[:：])?\s*|(?:做|生成|制作|要)(?:一个|一段|成)?\s*|^)(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:秒|seconds?)/i.exec(text)
-    ?? /(?:^|[^\d-])(\d{1,2})\s*秒(?:钟)?(?:的)?(?:视频|短片|动画)/.exec(text)
-  const count = /(?:生成|制作|做|输出|数量\s*[:：]?)\s*([1-4一二两三四])\s*(?:条|段|个|份)/.exec(text)
-  const resolution = /(?:^|[^a-z0-9])(480p|720p|768p|1080p|2k|4k)(?![a-z0-9])/i.exec(text)
+  const specs = agentMediaSpecs([request], 'video')
   return {
-    aspectRatio: aspect ? `${aspect[1]}:${aspect[2]}` : /竖版|竖屏/.test(text) ? '9:16' : /横版|横屏/.test(text) ? '16:9' : draft.aspectRatio || defaults.aspectRatio,
-    resolution: resolution?.[1].toLowerCase() || draft.resolution.toLowerCase() || defaults.resolution,
-    duration: (duration && parsePlanCountText(duration[1])) || draft.duration || defaults.duration,
-    count: Math.min(4, Math.max(1, (count && parsePlanCountText(count[1])) || Math.round(draft.count || defaults.count))),
+    aspectRatio: specs.aspectRatio ?? (draft.aspectRatio || defaults.aspectRatio),
+    resolution: specs.resolution ?? (draft.resolution?.toLowerCase() || defaults.resolution),
+    duration: specs.duration ?? (draft.duration || defaults.duration),
+    count: specs.count ?? Math.min(4, Math.max(1, Math.round(draft.count || defaults.count))),
   }
 }
 
@@ -529,9 +689,9 @@ export function parseAgentReply(raw: string): AgentReply {
         return {
           label: typeof candidate.label === 'string' && candidate.label.trim() ? candidate.label.trim() : `方案${index + 1}`,
           prompt,
-          aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '1:1',
-          resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '1K',
-          detail: typeof candidate.detail === 'string' ? candidate.detail : 'medium',
+          aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '',
+          resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '',
+          detail: typeof candidate.detail === 'string' ? candidate.detail : '',
           count: Math.min(4, Math.max(1, Number(candidate.count) || 1)),
         }
       })
@@ -548,9 +708,10 @@ export function parseAgentReply(raw: string): AgentReply {
         return {
           label: typeof candidate.label === 'string' && candidate.label.trim() ? candidate.label.trim() : `视频方案${index + 1}`,
           prompt,
-          aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '16:9',
-          resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '720p',
-          duration: Math.min(30, Math.max(1, Number(candidate.duration) || 4)),
+          aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '',
+          resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '',
+          duration: Number.isFinite(Number(candidate.duration)) ? Math.min(30, Math.max(0, Number(candidate.duration))) : 0,
+          generationMode: (['text', 'image', 'frames', 'reference', 'omni'] as const).find((mode) => mode === candidate.generationMode),
           count: Math.min(4, Math.max(1, Number(candidate.count) || 1)),
         }
       })

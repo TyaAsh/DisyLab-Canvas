@@ -1,4 +1,5 @@
 const routes = {
+  apimart: { host: 'api.apimart.ai', get: /^\/v1\/(?:models|tasks\/[\w.-]+)$/, post: /^\/v1\/(?:chat\/completions|images\/(?:generations|edits)|videos\/generations|uploads\/(?:images|videos))$/ },
   relayon: { host: 'relayonapi.com', get: /^(?:\/api\/pricing|\/v1\/(?:models|videos\/[\w.-]+(?:\/content)?))$/, post: /^\/v1\/(?:chat\/completions|messages|responses|images\/(?:generations|edits)|videos)$/ },
   xai: { host: 'api.x.ai', get: /^\/v1\/(?:models|(?:image-|video-|language-)models|videos\/[\w.-]+)$/, post: /^\/v1\/(?:chat\/completions|images\/(?:generations|edits)|videos\/(?:generations|edits))$/ },
   ark: { host: 'ark.cn-beijing.volces.com', get: /^\/api\/v3\/(?:models|contents\/generations\/tasks(?:\/[\w.-]+)?)$/, post: /^\/api\/v3\/(?:chat\/completions|images\/generations|contents\/generations\/tasks)$/ },

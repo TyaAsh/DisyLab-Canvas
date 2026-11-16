@@ -3,6 +3,7 @@ import { Check, ChevronDown, MessageCircle } from 'lucide-react'
 
 type ModelBrand = 'openai' | 'gemini' | 'claude' | 'doubao' | 'jimeng' | 'kimi' | 'grok' | 'deepseek' | 'qwen' | 'glm' | 'minimax' | 'google' | 'generic'
 export type SelectOption = { value: string; label: string; detail?: string; brand?: ModelBrand }
+type SelectGroup = { label: string; options: SelectOption[] }
 
 const brandMeta: Record<ModelBrand, { label: string; glyph: string; color: string; background: string }> = {
   openai: { label: 'OpenAI', glyph: '◎', color: '#e8f3ef', background: 'rgba(90, 145, 128, .2)' },
@@ -63,11 +64,12 @@ function ModelBrandMark({ brand }: { brand: ModelBrand }) {
   )
 }
 
-export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onChange, className = '', variant = 'default', disabled = false, minMenuWidth = 0 }: {
+export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [], icon, onChange, className = '', variant = 'default', disabled = false, minMenuWidth = 0 }: {
   ariaLabel: string
   value: string
   placeholder: string
   options: SelectOption[]
+  groups?: SelectGroup[]
   icon: ReactNode
   onChange: (value: string) => void
   className?: string
@@ -80,7 +82,8 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
   const menuRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuId = useId()
-  const selected = options.find((option) => option.value === value)
+  const availableOptions = [...options, ...groups.flatMap((group) => group.options)]
+  const selected = availableOptions.find((option) => option.value === value)
 
   useLayoutEffect(() => {
     if (!open || disabled || variant !== 'floating') return
@@ -121,9 +124,10 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
 
   useEffect(() => {
     if (!open) return
-    const optionButtons = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]')
-    const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value))
-    window.requestAnimationFrame(() => optionButtons?.[selectedIndex]?.focus())
+    const menu = menuRef.current
+    const initialOption = menu?.querySelector<HTMLButtonElement>('[role="option"][aria-selected="true"]')
+      ?? menu?.querySelector<HTMLButtonElement>('[role="option"]')
+    window.requestAnimationFrame(() => initialOption?.focus())
   }, [open, value])
 
   const moveOptionFocus = (direction: 1 | -1) => {
@@ -134,6 +138,27 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
   }
 
   const selectedBrand = selected?.brand
+  const renderOption = (option: SelectOption) => (
+    <button
+      type="button"
+      role="option"
+      aria-selected={option.value === value}
+      className={option.value === value ? 'is-selected' : ''}
+      key={option.value}
+      onClick={() => {
+        onChange(option.value)
+        setOpen(false)
+        window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.agent-select-trigger')?.focus())
+      }}
+    >
+      <span className="agent-select-option-main">
+        {option.brand && <ModelBrandMark brand={option.brand} />}
+        {variant === 'conversation' && <MessageCircle size={15} aria-hidden="true" />}
+        <span className="agent-select-option-text"><strong>{option.label}</strong>{option.detail && <small>{option.detail}</small>}</span>
+      </span>
+      {option.value === value && <Check size={14} />}
+    </button>
+  )
 
   return (
     <div ref={rootRef} className={`agent-custom-select ${className} ${open ? 'is-open' : ''}`}>
@@ -188,27 +213,14 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, icon, onCh
           }}
         >
           {variant === 'conversation' && <div className="agent-select-menu-heading" aria-hidden="true">对话记录</div>}
-          {options.length ? options.map((option) => (
-            <button
-              type="button"
-              role="option"
-              aria-selected={option.value === value}
-              className={option.value === value ? 'is-selected' : ''}
-              key={option.value}
-              onClick={() => {
-                onChange(option.value)
-                setOpen(false)
-                window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.agent-select-trigger')?.focus())
-              }}
-            >
-              <span className="agent-select-option-main">
-                {option.brand && <ModelBrandMark brand={option.brand} />}
-                {variant === 'conversation' && <MessageCircle size={15} aria-hidden="true" />}
-                <span className="agent-select-option-text"><strong>{option.label}</strong>{option.detail && <small>{option.detail}</small>}</span>
-              </span>
-              {option.value === value && <Check size={14} />}
-            </button>
-          )) : <p>暂无可用选项</p>}
+          {options.map(renderOption)}
+          {groups.filter((group) => group.options.length).map((group) => (
+            <div key={group.label} className="agent-select-menu-group" role="group" aria-label={group.label}>
+              <div className="agent-select-menu-heading" aria-hidden="true">{group.label}</div>
+              {group.options.map(renderOption)}
+            </div>
+          ))}
+          {!availableOptions.length && <p>暂无可用选项</p>}
         </div>
     </div>
   )

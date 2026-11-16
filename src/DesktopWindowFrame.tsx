@@ -42,7 +42,7 @@ export function DesktopWindowFrame({ children }: { children: ReactNode }) {
         event.preventDefault()
         run(event.detail === 2 ? current.toggleMaximize() : current.startDragging())
       }}>
-        <img src="/disy-logo.png" alt="" draggable={false} />
+        <img src="/disy-logo-ui.png" alt="" draggable={false} />
         <span>DisyLab Canvas</span>
       </div>
       {windowError && <span className="desktop-window-error" role="status">{windowError}</span>}
