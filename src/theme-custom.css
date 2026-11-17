@@ -74,6 +74,12 @@ select {
   font-size: 16px !important;
 }
 
+.disy-shell .video-parameter-menu :is(.video-mode-section > h3, .video-reference-audio-heading > h3) {
+  font-size: 12px !important;
+  font-weight: 650;
+  color: var(--muted);
+}
+
 .disy-shell :where(.brand-word, .project-settings-header strong, .node-heading, .empty-canvas-heading) {
   font-size: 14px !important;
 }

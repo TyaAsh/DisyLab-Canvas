@@ -1,5 +1,31 @@
 export type CanvasLayerMove = { sourceId: string; targetId: string; placement: 'before' | 'after' }
 
+export function canvasLayerChildren<Node extends { id: string; parentId?: string }>(nodes: readonly Node[]) {
+  const ids = new Set(nodes.map(({ id }) => id))
+  const children = new Map<string | undefined, Node[]>()
+  for (const node of [...nodes].reverse()) {
+    const parent = node.parentId && ids.has(node.parentId) ? node.parentId : undefined
+    const siblings = children.get(parent) ?? []
+    siblings.push(node)
+    children.set(parent, siblings)
+  }
+  return children
+}
+
+export function* frontToBackCanvasLayers<Node extends { id: string; parentId?: string }>(nodes: readonly Node[]): Generator<Node> {
+  const children = canvasLayerChildren(nodes)
+  const seen = new Set<string>()
+  function* walk(parent?: string): Generator<Node> {
+    for (const node of children.get(parent) ?? []) {
+      if (seen.has(node.id)) continue
+      seen.add(node.id)
+      yield node
+      yield* walk(node.id)
+    }
+  }
+  yield* walk()
+}
+
 export function moveCanvasLayer<Node extends { id: string; parentId?: string }>(nodes: Node[], move: CanvasLayerMove): Node[] {
   const { sourceId, targetId, placement } = move
   if (sourceId === targetId) return nodes

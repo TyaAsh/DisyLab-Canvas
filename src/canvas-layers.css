@@ -85,7 +85,16 @@
 }
 .canvas-layers-search input:focus-visible { outline: 0; }
 .canvas-layers-actions { display: flex; align-items: center; justify-content: space-between; gap: 2px; }
-.canvas-layers-list { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 6px 8px; }
+.canvas-layers-list { position: relative; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 6px 8px; }
+.canvas-layers-list.is-selecting { cursor: crosshair; }
+.canvas-layer-marquee {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
 .canvas-layer-row {
   position: relative;
   display: flex;
@@ -98,8 +107,21 @@
 }
 .canvas-layer-row:hover { background: var(--surface-soft); }
 .canvas-layer-row.is-selected { border-color: var(--accent-border); background: var(--accent-soft); }
-.canvas-layer-row[data-sortable="true"] { user-select: none; }
-.canvas-layer-row[data-sortable="true"] .canvas-layer-name { cursor: grab; }
+.canvas-layer-row { user-select: none; }
+.canvas-layer-row input { user-select: text; }
+.canvas-layer-grip {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  align-self: stretch;
+  flex: none;
+  color: var(--muted);
+  cursor: grab;
+  opacity: .42;
+}
+.canvas-layer-row:hover .canvas-layer-grip,
+.canvas-layer-row:focus-within .canvas-layer-grip { opacity: 1; }
+.canvas-layer-grip:active { cursor: grabbing; }
 .canvas-layer-row.is-dragging { opacity: .42; }
 .canvas-layer-row[data-drop]::after {
   position: absolute;
@@ -134,6 +156,7 @@
 .canvas-layer-name svg { flex: none; color: var(--muted); }
 .canvas-layer-row.is-selected .canvas-layer-name svg { color: var(--accent); }
 .canvas-layer-name img { width: 24px; height: 24px; flex: none; object-fit: cover; border-radius: 5px; }
+.canvas-layer-name .video-reference-preview { width: 24px; height: 24px; border-radius: 5px; pointer-events: none; }
 .canvas-layer-name input { min-width: 0; width: 100%; padding: 4px 6px; border: 1px solid var(--accent-border); border-radius: 5px; color: var(--ink); background: var(--surface); font: inherit; }
 .canvas-layers-empty { display: grid; min-height: 130px; place-content: center; justify-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .canvas-layers-footer {

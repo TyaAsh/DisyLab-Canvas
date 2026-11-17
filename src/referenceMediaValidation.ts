@@ -57,7 +57,7 @@ export function referenceMediaIssue(metadata: MediaMetadata, limits: MediaLimits
   if (limits.pixels && (width * height < limits.pixels[0] || width * height > limits.pixels[1])) return `总像素数须在 ${range(limits.pixels)} 之间（当前 ${format.format(width * height)} 像素）`
 }
 
-async function readMetadata(kind: ReferenceMedia['kind'], url: string, blob: Blob | undefined, signal: AbortSignal) {
+export async function readReferenceMediaMetadata(kind: ReferenceMedia['kind'], url: string, blob: Blob | undefined, signal: AbortSignal) {
   signal.throwIfAborted()
   const image = kind === 'image' ? new Image() : undefined
   const video = kind === 'video' ? document.createElement('video') : undefined
@@ -271,7 +271,7 @@ export async function checkReferenceMedia(
     if (issueFromBytes) return `${label}的${issueFromBytes}`
     const needsMetadata = limits.requireReadable || limits.ratio || limits.side || limits.minSide || limits.pixels || limits.seconds
       || (entry.kind === 'video' && totals?.maxVideoSeconds)
-    const metadata: MediaMetadata = needsMetadata && (url || blob) ? await readMetadata(entry.kind, url, decodedBlob, signal).catch(() => {
+    const metadata: MediaMetadata = needsMetadata && (url || blob) ? await readReferenceMediaMetadata(entry.kind, url, decodedBlob, signal).catch(() => {
       signal.throwIfAborted()
       return {}
     }) : {}

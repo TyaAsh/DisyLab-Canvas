@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
-import { ChevronRight, Copy, Film, Focus, Folder, FolderOpen, Group, Image, Layers3, PanelLeft, Pencil, Search, Trash2, Type, Ungroup, X } from 'lucide-react'
+import { ChevronRight, Copy, Film, Focus, Folder, FolderOpen, GripVertical, Group, Image, Layers3, PanelLeft, Pencil, Search, Trash2, Type, Ungroup, X } from 'lucide-react'
 import './canvas-layers.css'
-import type { CanvasLayerMove } from './canvasLayers'
+import { canvasLayerChildren, type CanvasLayerMove } from './canvasLayers'
+import { VideoReferenceThumbnail } from './VideoReferenceThumbnail'
 
 export type CanvasLayer = {
   id: string
@@ -10,6 +11,8 @@ export type CanvasLayer = {
   name: string
   kind: 'group' | 'text' | 'image' | 'upload' | 'video'
   thumbnail?: string
+  videoUrl?: string
+  videoMediaId?: string
 }
 
 type Props = {
@@ -56,6 +59,14 @@ type LayerDrag = {
   drop: CanvasLayerMove | null
 }
 
+type LayerMarquee = {
+  pointerId: number
+  startX: number
+  startY: number
+  baseIds: string[]
+  moving: boolean
+}
+
 export function CanvasLayersPanel({
   layers, selectedIds, docked, canGroup, canUngroup, onDock, onClose, onSelect,
   onRename, onGroup, onUngroup, onDuplicate, onDelete, onLocate, onMove,
@@ -66,15 +77,18 @@ export function CanvasLayersPanel({
   const [rename, setRename] = useState<{ id: string; draft: string } | null>(null)
   const [draggedId, setDraggedId] = useState('')
   const [drop, setDrop] = useState<CanvasLayerMove | null>(null)
+  const [marquee, setMarquee] = useState<{ left: number; top: number; width: number; height: number; ids: Set<string> }>()
   const anchor = useRef('')
   const panelRef = useRef<HTMLElement>(null)
   const drag = useRef<PanelDrag | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const layerDrag = useRef<LayerDrag | null>(null)
+  const marqueeDrag = useRef<LayerMarquee | null>(null)
   const layerScrollFrame = useRef(0)
   const suppressLayerClick = useRef(false)
   const byId = useMemo(() => new Map(layers.map((layer) => [layer.id, layer])), [layers])
   const selected = useMemo(() => new Set(selectedIds), [selectedIds])
+  const displayedSelection = marquee?.ids ?? selected
   const single = selectedIds.length === 1 ? byId.get(selectedIds[0]) : undefined
   const term = query.trim().toLocaleLowerCase()
 
@@ -95,13 +109,7 @@ export function CanvasLayersPanel({
   }, [selectedIds, byId])
 
   const rows = useMemo(() => {
-    const children = new Map<string | undefined, CanvasLayer[]>()
-    for (const layer of [...layers].reverse()) {
-      const parent = layer.parentId && byId.has(layer.parentId) ? layer.parentId : undefined
-      const siblings = children.get(parent) ?? []
-      siblings.push(layer)
-      children.set(parent, siblings)
-    }
+    const children = canvasLayerChildren(layers)
     const shown = new Set<string>()
     if (term) {
       for (const layer of layers) {
@@ -254,6 +262,61 @@ export function CanvasLayersPanel({
     setDrop(null)
   }
 
+  const startMarquee = (event: PointerEvent<HTMLDivElement>) => {
+    suppressLayerClick.current = false
+    if (!rows.length || rename || layerDrag.current || marqueeDrag.current || !event.isPrimary
+      || event.pointerType === 'touch' || event.button !== 0
+      || (event.target as Element).closest('.canvas-layer-toggle, input')) return
+    const list = event.currentTarget
+    if (event.clientX >= list.getBoundingClientRect().left + list.clientWidth) return
+    marqueeDrag.current = {
+      pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, moving: false,
+      baseIds: event.ctrlKey || event.metaKey || event.shiftKey ? selectedIds : [],
+    }
+  }
+
+  const measureMarquee = (list: HTMLDivElement, current: LayerMarquee, x: number, y: number) => {
+    const rect = list.getBoundingClientRect()
+    const rightEdge = rect.left + list.clientWidth
+    const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+    const left = clamp(Math.min(current.startX, x), rect.left, rightEdge)
+    const right = clamp(Math.max(current.startX, x), rect.left, rightEdge)
+    const top = clamp(Math.min(current.startY, y), rect.top, rect.bottom)
+    const bottom = clamp(Math.max(current.startY, y), rect.top, rect.bottom)
+    const ids = new Set(current.baseIds)
+    for (const row of list.querySelectorAll<HTMLElement>('[data-layer-id]')) {
+      const bounds = row.getBoundingClientRect()
+      if (row.dataset.layerId && bounds.right >= left && bounds.left <= right && bounds.bottom >= top && bounds.top <= bottom) {
+        ids.add(row.dataset.layerId)
+      }
+    }
+    return { left: left - rect.left + list.scrollLeft, top: top - rect.top + list.scrollTop,
+      width: Math.max(1, right - left), height: Math.max(1, bottom - top), ids }
+  }
+
+  const moveMarquee = (event: PointerEvent<HTMLDivElement>) => {
+    const current = marqueeDrag.current
+    if (!current || current.pointerId !== event.pointerId) return
+    if (!current.moving) {
+      if (Math.hypot(event.clientX - current.startX, event.clientY - current.startY) < 5) return
+      current.moving = true
+      suppressLayerClick.current = true
+      event.currentTarget.setPointerCapture(event.pointerId)
+    }
+    setMarquee(measureMarquee(event.currentTarget, current, event.clientX, event.clientY))
+  }
+
+  const finishMarquee = (event: PointerEvent<HTMLDivElement>, commit = false) => {
+    const current = marqueeDrag.current
+    if (!current || current.pointerId !== event.pointerId) return
+    marqueeDrag.current = null
+    setMarquee(undefined)
+    if (!commit || !current.moving) return
+    const { ids } = measureMarquee(event.currentTarget, current, event.clientX, event.clientY)
+    anchor.current = [...ids].at(-1) ?? ''
+    onSelect([...ids])
+  }
+
   return <motion.aside id="canvas-layers-panel" ref={panelRef} className={`canvas-layers ${docked ? 'is-docked' : 'is-floating'}`}
     initial={reduceMotion ? false : { opacity: 0, x: docked ? -14 : -8, y: docked ? 0 : 7, scale: docked ? 1 : .985 }}
     animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
@@ -295,12 +358,16 @@ export function CanvasLayersPanel({
         <button type="button" title="删除所选图层" aria-label="删除所选图层" disabled={!selectedIds.length} onClick={onDelete}><Trash2 size={15} /></button>
       </div>
     </div>
-    <div className="canvas-layers-list" ref={listRef}
-      onPointerMove={moveLayerDrag}
-      onPointerUp={(event) => finishLayerDrag(event, true)}
-      onPointerCancel={(event) => finishLayerDrag(event)}
-      onLostPointerCapture={(event) => finishLayerDrag(event)}
-      onPointerLeave={(event) => { if (!layerDrag.current?.moving) finishLayerDrag(event) }}
+    <div className={`canvas-layers-list ${marquee ? 'is-selecting' : ''}`} ref={listRef}
+      onPointerDown={startMarquee}
+      onPointerMove={(event) => { moveLayerDrag(event); moveMarquee(event) }}
+      onPointerUp={(event) => { finishLayerDrag(event, true); finishMarquee(event, true) }}
+      onPointerCancel={(event) => { finishLayerDrag(event); finishMarquee(event) }}
+      onLostPointerCapture={(event) => { finishLayerDrag(event); finishMarquee(event) }}
+      onPointerLeave={(event) => {
+        if (!layerDrag.current?.moving) finishLayerDrag(event)
+        if (!marqueeDrag.current?.moving) finishMarquee(event)
+      }}
       onClickCapture={(event) => {
         if (!suppressLayerClick.current || !event.detail) return
         event.preventDefault()
@@ -309,14 +376,14 @@ export function CanvasLayersPanel({
       }}>
       {rows.map(({ layer, depth, hasChildren, open }) => {
         const Icon = layer.kind === 'group' ? open ? FolderOpen : Folder : layer.kind === 'text' ? Type : layer.kind === 'video' ? Film : Image
-        return <div key={layer.id} className={`canvas-layer-row ${selected.has(layer.id) ? 'is-selected' : ''} ${draggedId === layer.id ? 'is-dragging' : ''}`}
+        return <div key={layer.id} className={`canvas-layer-row ${displayedSelection.has(layer.id) ? 'is-selected' : ''} ${draggedId === layer.id ? 'is-dragging' : ''}`}
           data-drop={drop?.targetId === layer.id ? drop.placement : undefined}
           style={{ '--layer-indent': `${Math.min(depth, 8) * 15}px` } as CSSProperties}
           data-layer-id={layer.id}
-          data-sortable={!term && !rename}
           onPointerDown={(event) => {
             suppressLayerClick.current = false
-            if (term || rename || event.pointerType === 'touch' || event.button !== 0 || (event.target as HTMLElement).closest('.canvas-layer-toggle')) return
+            if (term || rename || !event.isPrimary || event.pointerType === 'touch' || event.button !== 0
+              || !(event.target as Element).closest('.canvas-layer-grip')) return
             const { clientX, clientY, pointerId } = event
             layerDrag.current = { sourceId: layer.id, pointerId, startX: clientX, startY: clientY, x: clientX, y: clientY, moving: false, drop: null }
           }}>
@@ -338,13 +405,18 @@ export function CanvasLayersPanel({
               }} />
           </label> : <button type="button" className="canvas-layer-name" title={layer.name} aria-pressed={selected.has(layer.id)}
             onClick={(event) => select(layer.id, event)} onDoubleClick={() => setRename({ id: layer.id, draft: layer.name })}>
-            {layer.thumbnail ? <img src={layer.thumbnail} alt="" loading="lazy" draggable={false} /> : <Icon size={17} aria-hidden="true" />}
+            {layer.videoUrl || layer.videoMediaId
+              ? <VideoReferenceThumbnail reference={{ url: layer.videoUrl, mediaId: layer.videoMediaId }} lazy />
+              : layer.thumbnail ? <img src={layer.thumbnail} alt="" loading="lazy" draggable={false} /> : <Icon size={17} aria-hidden="true" />}
             <span>{layer.name}</span>
           </button>}
+          {!term && !rename && <span className="canvas-layer-grip" title="拖动调整图层顺序" aria-hidden="true"><GripVertical size={14} /></span>}
         </div>
       })}
       {!rows.length && <div className="canvas-layers-empty"><Layers3 size={22} /><span>{term ? '没有匹配的图层' : '画布还没有图层'}</span></div>}
+      {marquee && <span aria-hidden="true" className="canvas-layer-marquee"
+        style={{ left: marquee.left, top: marquee.top, width: marquee.width, height: marquee.height }} />}
     </div>
-    <footer className="canvas-layers-footer"><span title="Shift 连选 · Ctrl/⌘ 多选">{selectedIds.length ? `已选 ${selectedIds.length} 项` : '拖动调整同级顺序'}</span><span>共 {layers.length} 个节点</span></footer>
+    <footer className="canvas-layers-footer"><span title="拖框多选 · Shift 连选 · Ctrl/⌘ 追加">{displayedSelection.size ? `已选 ${displayedSelection.size} 项` : '拖动框选图层'}</span><span>共 {layers.length} 个节点</span></footer>
   </motion.aside>
 }

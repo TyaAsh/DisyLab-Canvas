@@ -97,12 +97,13 @@ export type TextGenerationOptions = {
 
 export type ImageOutput = 'png' | 'transparent-png' | 'gif' | 'svg'
 export type ImageQuality = 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-type ImageResolution = '1K' | '2K' | '4K'
+export type ImageResolution = 'auto' | '1K' | '1.5K' | '2K' | '4K'
 
 export type ImageGenerationOptions = {
   prompt: string
   count: number
   referenceImages?: string[]
+  editMask?: Blob
   aspectRatio?: string
   resolution?: ImageResolution
   detail?: ImageQuality
@@ -588,6 +589,16 @@ export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
   return { ratios, resolutions, outputs, images, qualities: [] as readonly ImageQuality[], customRatio: midjourney }
 }
 
+const arkSeedreamFlexibleSize = /^doubao-seedream-(?:5-5|5-0-(?:pro|flash))(?:-|$)/i
+const openAiGptImage = /^(?:gpt-image-|chatgpt-image-latest$)/i
+const openAiPremiumImage = /^gpt-image-2\.[56]-(?:flare|sunburst)(?:-|$)/i
+const openAiFlexibleImage = /^gpt-image-2(?:-|$)/i
+
+export function supportsImageEditMask(baseUrl: string, model: string) {
+  return apiProviderForBase(baseUrl)?.id === 'openai'
+    && /^(?:gpt-image-(?:1\.5|1-mini|2(?:\.[56]-(?:flare|sunburst))?)(?:-|$)|chatgpt-image-latest$)/i.test(model)
+}
+
 export function getImageModelCapabilities(baseUrl: string, model: string) {
   const known = getGrsaiImageCapabilities(baseUrl, model) ?? getHfsyImageCapabilities(baseUrl, model)
   if (known) return known
@@ -597,10 +608,29 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
     ...common, ratios: jimengImageRatios, resolutions: jimengImageResolutions(model),
     images: /^3\./.test(model) ? 0 : 10, qualities: [] as readonly ImageQuality[],
   }
-  if (provider === 'xai') return {
-    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
-    resolutions: ['1K', '2K'] as readonly ImageResolution[], images: /2\.0/.test(model) ? 5 : 1,
-    qualities: (/2\.0/.test(model) ? ['low', 'medium', 'high'] : []) as readonly ImageQuality[],
+  if (provider === 'openai' && openAiGptImage.test(model)) {
+    const premium = openAiPremiumImage.test(model)
+    const flexible = premium || openAiFlexibleImage.test(model)
+    return {
+      ...common, customRatio: flexible,
+      ratios: flexible ? ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9', '3:1'] : ['auto', '1:1', '3:2', '2:3'],
+      resolutions: (flexible ? ['1K', '2K', '4K'] : ['1K']) as readonly ImageResolution[],
+      images: 16,
+      qualities: (premium ? ['auto', 'low', 'medium', 'high', 'xhigh', 'max'] : ['auto', 'low', 'medium', 'high']) as readonly ImageQuality[],
+    }
+  }
+  if (provider === 'xai') {
+    const imagine2 = /^grok-imagine-image-2\.0(?:-|$)/i.test(model)
+    return {
+      ...common,
+      // https://docs.x.ai/developers/model-capabilities/images/generation
+      ratios: imagine2
+        ? ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '2:1', '1:2', '19.5:9', '9:19.5', '20:9', '9:20', '21:9', '5:2']
+        : ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+      resolutions: ['1K', '2K'] as readonly ImageResolution[],
+      images: imagine2 ? 5 : 1,
+      qualities: (imagine2 ? ['auto', 'low', 'medium'] : []) as readonly ImageQuality[],
+    }
   }
   if (provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(model)) return {
     ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '4:5', '5:4', '21:9'],
@@ -611,8 +641,8 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
     resolutions: [] as readonly ImageResolution[], images: 4, qualities: [] as readonly ImageQuality[],
   }
   if (provider === 'ark') return {
-    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'],
-    resolutions: (/5[-.]0[-.]pro/.test(model) ? ['1K', '2K'] : /5[-.]0/.test(model) ? ['2K'] : ['2K', '4K']) as readonly ImageResolution[],
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9', ...(arkSeedreamFlexibleSize.test(model) ? ['auto'] : [])],
+    resolutions: (arkSeedreamFlexibleSize.test(model) ? ['2K', '1.5K', '1K'] : /5[-.]0[-.]pro/.test(model) ? ['1K', '2K'] : /5[-.]0/.test(model) ? ['2K'] : ['2K', '4K']) as readonly ImageResolution[],
     images: /(?:4[-.]0|5[-.]5|5[-.]0[-.](?:pro|flash))/.test(model) ? 10 : 14, qualities: [] as readonly ImageQuality[],
   }
   return undefined
@@ -871,6 +901,14 @@ function nativeVideoTaskPath(provider: string, id: string, h3: boolean) {
     : provider === 'xai' ? `videos/${id}` : h3 ? `/v2/query/video_generation/${id}` : `query/video_generation?task_id=${id}`
 }
 
+export function isSeedance25VideoModel(model: string) {
+  return /^(?:(?:(?:doubao|dreamina)[-_. ])?seedance[-_. ]*v?[-_. ]*|sd-)2[._-]5(?:[-_. ]|$)/i.test(model.trim())
+}
+
+export function seedance25FollowsFirstFrame(model: string, mode: VideoGenerationOptions['mode']) {
+  return (mode === 'image2video' || mode === 'first_last_frame') && isSeedance25VideoModel(model)
+}
+
 async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
   const h3 = provider === 'minimax' && /^minimax-h3/i.test(settings.model)
   const first = options.firstFrame ?? (options.mode === 'image2video' ? options.referenceImage : undefined)
@@ -880,14 +918,25 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
   const audios = options.referenceAudios ?? []
   const ratio = options.aspectRatio === 'auto' ? undefined : options.aspectRatio
     ?? (options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1' : /^\d+:\d+$/.test(options.size) ? options.size : '16:9')
+  const followsFirstFrame = Boolean(first) && seedance25FollowsFirstFrame(
+    settings.model, last ? 'first_last_frame' : 'image2video',
+  )
   const invalid = (message: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', message) }
   if (!options.prompt.trim()) invalid('请填写视频提示词')
+  if (followsFirstFrame && (images.length || videos.length || audios.length)) {
+    invalid('Seedance 2.5 首帧和首尾帧模式不能与全模态参考素材混用')
+  }
   if (provider === 'xai' && audios.length) invalid('Grok 视频只接受官方预设音色，不支持此处的音频素材')
   if (provider === 'xai' && videos.length && (videos.length > 1 || first || last || images.length)) invalid('Grok 视频编辑仅接受一个视频素材，请移除其他参考')
   if (provider === 'xai' && videos.length && settings.model.toLowerCase() !== 'grok-imagine-video') invalid('请选择 Grok Imagine Video 编辑参考视频')
   if (h3 && (first || last) && (images.length || videos.length || audios.length)) invalid('MiniMax H3 的首尾帧模式不能与其他参考素材混用')
   if (provider === 'minimax' && !h3 && (last || videos.length || audios.length || images.length > 1)) invalid('此海螺模型仅支持一张首帧图，多素材请使用 H3')
-  if (provider === 'xai' && last && !/video-1\.5/i.test(settings.model)) invalid('尾帧需要 Grok Imagine Video 1.5')
+  if (provider === 'xai' && last && !/^grok-imagine-video-1\.5$/i.test(settings.model)) invalid('尾帧需要 Grok Imagine Video 1.5')
+  if (provider === 'xai' && images.length) {
+    const maxImages = videoReferenceRules(settings.baseUrl, settings.model).images
+    if (maxImages === 0) invalid('此 Grok 模型支持首帧图，参考图模式需要切换模型')
+    if (maxImages !== undefined && images.length > maxImages) invalid(`当前 Grok 模型最多支持 ${maxImages} 张参考图`)
+  }
   const firstSource = first ? await nativeImageSource(first, options.signal) : undefined
   const lastSource = last ? await nativeImageSource(last, options.signal) : undefined
   let editSource = videos[0]
@@ -912,7 +961,7 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
     : provider === 'xai' ? (videos.length ? 'videos/edits' : 'videos/generations')
       : h3 ? '/v2/video_generation' : 'video_generation'
   const body = provider === 'ark' ? {
-    model, content, duration: options.seconds, ratio: ratio ?? 'adaptive', resolution,
+    model, content, duration: options.seconds, ratio: followsFirstFrame ? 'adaptive' : ratio ?? 'adaptive', resolution,
     generate_audio: options.generateAudio, watermark: false,
   } : provider === 'xai' ? {
     model, prompt: options.prompt,
@@ -1063,7 +1112,11 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
     : options.mode === 'image2video'
       ? [options.firstFrame ?? options.referenceImage]
       : options.referenceImages ?? []
-  const imageRoles = options.mode === 'first_last_frame' ? ['first_frame', 'last_frame'] : imageSources.map(() => options.mode === 'image2video' ? undefined : 'reference_image')
+  const followsFirstFrame = seedance25FollowsFirstFrame(settings.model, options.mode)
+  const ratioOverride = isSeedance25VideoModel(settings.model) ? options.aspectRatio : undefined
+  const ratio = followsFirstFrame || ratioOverride === 'auto' ? 'adaptive' : ratioOverride ?? apiYiVideoRatio(options.size)
+  const imageRoles = options.mode === 'first_last_frame' ? ['first_frame', 'last_frame']
+    : imageSources.map(() => options.mode === 'image2video' ? (followsFirstFrame ? 'first_frame' : undefined) : 'reference_image')
   for (const [index, source] of imageSources.entries()) {
     if (!source) continue
     content.push({ type: 'image_url', image_url: { url: await mediaSourceForApiYi(source, options.signal) }, ...(imageRoles[index] ? { role: imageRoles[index] } : {}) })
@@ -1092,7 +1145,7 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
         model: settings.model,
         content,
         resolution: requestedResolution,
-        ratio: apiYiVideoRatio(options.size),
+        ratio,
         duration: requestedDuration,
         ...(defaults.defaultGenerateAudio ? { generate_audio: options.generateAudio !== false } : {}),
       }),
@@ -1749,14 +1802,29 @@ function geminiOmniLimits(model: string, mode: string | undefined, seconds: numb
   }
 }
 
+export function videoModeLimits(baseUrl: string, model: string, mode: VideoGenerationOptions['mode'], videoCount = 0) {
+  const provider = apiProviderForBase(baseUrl)?.id
+  if (provider === 'xai' && (mode === 'image_reference' || mode === 'all_reference' && !videoCount)) {
+    if (/^grok-imagine-video-1\.5-lite$/i.test(model)) return { unsupported: 'Grok Imagine Video 1.5 Lite 支持文生视频和图生视频' }
+    if (/^grok-imagine-video(?:-1\.5)?$/i.test(model)) return {
+      maxSeconds: /^grok-imagine-video$/i.test(model) ? 10 : 15,
+      resolutions: ['480p', '720p'] as const,
+    }
+  }
+  if (geminiOmniVideo(baseUrl, model)) return { maxSeconds: geminiOmniLimits(model, mode, 0).maxSeconds }
+  return {}
+}
+
 export function videoReferenceSettingsIssue(baseUrl: string, model: string, mode: VideoGenerationOptions['mode'], duration: number, videoCount: number, resolution?: string) {
   const provider = apiProviderForBase(baseUrl)?.id
   if (provider === 'muse') return 'Meta Muse API 目前提供图像生成，视频生成请选择支持视频的连接'
   if (provider === 'openai' && /^sora-2/i.test(model)) return 'OpenAI Sora 视频 API 已停止服务，请切换模型'
   if (provider === 'gemini' && /^veo-/i.test(model)) return 'Google Gemini API 的 Veo 型号已停止服务，请切换至 Gemini Omni'
-  if (provider === 'xai' && (mode === 'image_reference' || mode === 'all_reference') && !videoCount) {
-    if (model.toLowerCase() === 'grok-imagine-video' && duration > 10) return 'Grok Imagine Video 的参考图模式最多生成 10 秒'
-    if (/^grok-imagine-video(?:-1\.5)?$/i.test(model) && resolution === '1080p') return 'Grok 的参考图模式最高支持 720p'
+  const limits = videoModeLimits(baseUrl, model, mode, videoCount)
+  if (limits.unsupported) return limits.unsupported
+  if (limits.resolutions) {
+    if (duration > limits.maxSeconds) return `Grok 的参考图模式最多生成 ${limits.maxSeconds} 秒`
+    if (resolution && !limits.resolutions.some((value) => value === resolution)) return 'Grok 的参考图模式最高支持 720p'
   }
   if (geminiOmniVideo(baseUrl, model)) {
     const { maxSeconds, maxVideos } = geminiOmniLimits(model, mode, duration)
@@ -1976,7 +2044,8 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
       throw new GenerationRequestError('platform', '当前即梦连接支持文生视频和单图首帧', '请保留一张首帧，或改用支持首尾帧和全能参考的连接。')
     }
     const inputs = await prepareJimengInputs(frames, options.signal)
-    const ratio = options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : undefined
+    const followsFirstFrame = frames.length > 0 && seedance25FollowsFirstFrame(settings.model, 'image2video')
+    const ratio = !followsFirstFrame && options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio : undefined
     const { bytes, taskId } = await generateJimengMedia('video', {
       model: settings.model, prompt: options.prompt, ratio, inputs,
       resolution: options.resolution ?? '720p', duration: options.seconds,
@@ -2007,7 +2076,9 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   form.set('model', settings.model)
   form.set('prompt', options.prompt)
   form.set('seconds', String(options.seconds))
-  form.set('size', options.size)
+  const seedance25Adaptive = seedance25FollowsFirstFrame(settings.model, options.mode)
+    || isSeedance25VideoModel(settings.model) && options.aspectRatio === 'auto'
+  form.set('size', seedance25Adaptive ? 'adaptive' : options.size)
   if (options.mode) form.set('mode', options.mode)
   if (typeof options.generateAudio === 'boolean') form.set('generate_audio', String(options.generateAudio))
   for (const [index, image] of (options.referenceImages ?? []).entries()) {
@@ -2301,7 +2372,7 @@ export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
   model = model.trim().toLowerCase()
   if (/^sd-2\.5(?:-(?:480|720|1080))?(?:-v2)?$/.test(model)) return {
     minSeconds: 4, maxSeconds: 30, images: 30, videos: 10, audios: 10,
-    prompt: model.endsWith('-v2') || model === 'sd-2.5' ? 15_000 : 10_000, ratios: HFSY_VIDEO_RATIOS,
+    prompt: model.endsWith('-v2') || model === 'sd-2.5' ? 15_000 : 10_000, ratios: [...HFSY_SEEDANCE_RATIOS, 'auto'],
   }
   if (/^sd-2\.0(?:-(?:(?:mini|fast)(?:-(?:480|720))?|480|720))?$/.test(model)) return {
     ...HFSY_LEGACY_SEEDANCE,
@@ -2483,7 +2554,10 @@ export function imageReferenceRules(baseUrl: string, model: string) {
 }
 
 async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
-  const ratio = options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio
+  const seedance25 = isSeedance25VideoModel(settings.model)
+  const followsFirstFrame = seedance25FollowsFirstFrame(settings.model, options.mode)
+  const ratio = followsFirstFrame || seedance25 && (options.aspectRatio === 'auto' || options.aspectRatio === 'adaptive')
+    ? 'adaptive' : options.aspectRatio && options.aspectRatio !== 'auto' ? options.aspectRatio
     : options.size === 'portrait' ? '9:16' : options.size === 'square' ? '1:1'
     : /^\d+:\d+$/.test(options.size) ? options.size
     : apiYiVideoRatio(options.size) === 'adaptive' ? '16:9' : apiYiVideoRatio(options.size)
@@ -2505,6 +2579,9 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   const limits = hfsyVideoLimits(settings.model)
   const invalid = (detail: string): never => { throw new GenerationRequestError('platform', '视频参数不符合模型要求', `${detail}。视频生成尚未提交。`) }
   if (!options.prompt.trim()) invalid('请先填写视频提示词')
+  if (followsFirstFrame && (videos.length || audios.length)) {
+    invalid('Seedance 2.5 首帧和首尾帧模式不能与全模态参考素材混用')
+  }
   if (nativeSeedance && (!Number.isInteger(options.seconds) || (options.seconds !== -1 && (options.seconds < 4 || options.seconds > 30)))) invalid('豆包 Seedance 接口接受 4–30 秒或自动时长')
   if (limits) {
     if (!Number.isInteger(options.seconds) || options.seconds < limits.minSeconds || options.seconds > limits.maxSeconds || (limits.durations && !limits.durations.includes(options.seconds))) invalid(`${settings.model} 时长需为 ${limits.durations?.join(' / ') || `${limits.minSeconds}–${limits.maxSeconds}`} 秒`)
@@ -2516,7 +2593,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     if (limits.maxAssets && images.length + videos.length + audios.length > limits.maxAssets) invalid(`${settings.model} 最多支持 ${limits.maxAssets} 个参考素材`)
     if (audios.length && limits.audioRequiresImage && !images.length) invalid('使用音频参考时至少需要一张参考图')
     if (Array.from(options.prompt).length > limits.prompt) invalid(`${settings.model} 提示词不得超过 ${limits.prompt} 字符`)
-    if (limits.ratios && !limits.ratios.includes(ratio)) invalid(`${settings.model} 不支持 ${ratio} 比例`)
+    if (limits.ratios && !limits.ratios.includes(seedance25 && ratio === 'adaptive' ? 'auto' : ratio)) invalid(`${settings.model} 不支持 ${ratio} 比例`)
   }
   if (options.mode === 'text2video' && (images.length || videos.length)) invalid('文生视频不能携带图片或视频，请切换参考模式')
   if (options.mode === 'image2video' && images.length !== 1) invalid('图生视频需要一张首帧图片')
@@ -2532,7 +2609,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   const body = nativeSeedance ? {
     model: settings.model,
     duration: options.seconds,
-    ratio: options.aspectRatio === 'auto' ? undefined : ratio,
+    ratio: !seedance25 && options.aspectRatio === 'auto' ? undefined : ratio,
     resolution: options.resolution,
     generate_audio: options.generateAudio,
     content: [
@@ -2550,10 +2627,13 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     prompt: options.prompt,
     duration: options.seconds,
     ...(!['minimax-h3', 'kling-o3', 'sora-2'].includes(model) ? { ratio } : {}),
-    ...(!/^muse[-_]video$/.test(model) ? {
+    ...(!(seedance25 && ratio === 'adaptive') && !/^muse[-_]video$/.test(model) ? {
       orientation: model === 'kling-o3' && ratio === '1:1' ? 'square' : ratioWidth < ratioHeight ? 'portrait' : 'landscape',
     } : {}),
-    ...(/^(?:sd-2|sora-2|grok-imagine-video-1\.5|muse-video$)/.test(model) ? { watermark: false } : {}),
+    // HFSY's SD-2 family is backed by jimeng_cli, which rejects an explicit
+    // watermark field. Only providers whose documented schema accepts it get
+    // the flag (Sora, Grok and Muse in this adapter).
+    ...(/^(?:sora-2|grok-imagine-video-1\.5|muse-video$)/.test(model) ? { watermark: false } : {}),
     ...(publicImages.length ? { images: publicImages } : {}),
     ...(publicVideos.length ? { videos: publicVideos } : {}),
     ...(publicAudios.length ? { audios: publicAudios } : {}),
@@ -3504,7 +3584,7 @@ async function resolveGenericProviderImageResult(
   )
 }
 
-export function resolveImageRequestSize(model: string, aspectRatio = '1:1', resolution: '1K' | '2K' | '4K' = '1K') {
+export function resolveImageRequestSize(model: string, aspectRatio = '1:1', resolution: Exclude<ImageResolution, 'auto'> = '1K') {
   const compatibleSize = (() => {
     const [width, height] = String(aspectRatio).split(':').map(Number)
     if (!Number.isFinite(width) || !Number.isFinite(height) || height === 0) return '1024x1024'
@@ -3520,7 +3600,9 @@ export function resolveImageRequestSize(model: string, aspectRatio = '1:1', reso
   const [rawWidth, rawHeight] = String(aspectRatio).split(':').map(Number)
   if (!Number.isFinite(rawWidth) || !Number.isFinite(rawHeight) || rawWidth <= 0 || rawHeight <= 0) return compatibleSize
   const ratio = Math.min(3, Math.max(1 / 3, rawWidth / rawHeight))
-  const shortEdge = resolution === '4K' ? 2160 : resolution === '2K' ? 1440 : 1024
+  const shape = Math.max(ratio, 1 / ratio)
+  const targetShortEdge = resolution === '4K' ? 2160 : resolution === '2K' ? 1440 : 1024
+  const shortEdge = Math.min(targetShortEdge, Math.floor(3840 / shape / 16) * 16)
   const roundTo16 = (value: number) => Math.max(16, Math.round(value / 16) * 16)
   const width = ratio >= 1 ? roundTo16(shortEdge * ratio) : roundTo16(shortEdge)
   const height = ratio >= 1 ? roundTo16(shortEdge) : roundTo16(shortEdge / ratio)
@@ -3531,6 +3613,9 @@ export async function generateRemoteImages(
   settings: ApiRequestSettings,
   options: ImageGenerationOptions,
 ): Promise<GeneratedImage[]> {
+  if (options.editMask && (!supportsImageEditMask(settings.baseUrl, settings.model) || !options.referenceImages?.[0])) {
+    throw new GenerationRequestError('platform', '当前模型无法使用图像蒙版', '请选择支持蒙版的 OpenAI 图像模型并添加原图。')
+  }
   const startedAtMs = Date.now()
   if (isMuseWebBase(settings.baseUrl)) {
     const references = await museWebReferences(options.referenceImages ?? [], options.signal)
@@ -3578,7 +3663,7 @@ export async function generateRemoteImages(
     const { aspectRatio, resolution, detail } = resolveImageModelOptions(settings.baseUrl, settings.model, options)
     const ratio = aspectRatio === 'auto' ? undefined : aspectRatio
     const references = provider === 'muse' ? [] : await Promise.all(referenceImages.map((url) => nativeImageSource(url, options.signal)))
-    const size = resolveImageRequestSize(settings.model, ratio, resolution)
+    const size = resolveImageRequestSize(settings.model, ratio, resolution === 'auto' ? undefined : resolution)
     const count = options.count
     const model = settings.model
     const path = referenceImages.length && provider !== 'ark' ? 'images/edits' : 'images/generations'
@@ -3589,7 +3674,7 @@ export async function generateRemoteImages(
         ...(references.length === 1 ? { image: { url: references[0] } } : references.length ? { images: references.map((url) => ({ url })) } : {}) }
     } else if (provider === 'ark') {
       const [w, h] = (ratio ?? '1:1').split(':').map(Number)
-      const scale = resolution === '4K' ? 4096 : resolution === '1K' ? 1024 : 2048
+      const scale = resolution === '4K' ? 4096 : resolution === '1.5K' ? 1536 : resolution === '1K' ? 1024 : 2048
       const round = (px: number) => Math.round(px / 16) * 16
       const arkSize = ratio ? `${round(scale * Math.sqrt(w / h))}x${round(scale * Math.sqrt(h / w))}` : resolution ?? '2K'
       body = { model, prompt: options.prompt, size: arkSize, response_format: 'b64_json', watermark: false,
@@ -3620,7 +3705,9 @@ export async function generateRemoteImages(
     return images
   }
   const startedAt = new Date(startedAtMs).toISOString()
-  const requestSize = resolveImageRequestSize(settings.model, options.aspectRatio, options.resolution)
+  const isOpenAiGptImage = provider === 'openai' && openAiGptImage.test(settings.model)
+  const requestSize = isOpenAiGptImage && options.aspectRatio === 'auto'
+    ? 'auto' : resolveImageRequestSize(settings.model, options.aspectRatio, options.resolution === 'auto' ? undefined : options.resolution)
   const isApiYiSeedream = /api\.apiyi\.com|apiyi\.com/i.test(settings.baseUrl) && /seedream/i.test(settings.model)
   const body: Record<string, unknown> = {
     model: settings.model,
@@ -3638,10 +3725,11 @@ export async function generateRemoteImages(
     body.watermark = false
     body.output_format = 'png'
   }
-  if (options.aspectRatio && options.aspectRatio !== 'auto' && !isApiYiSeedream) body.aspect_ratio = options.aspectRatio
-  if (options.resolution && !isApiYiSeedream) body.resolution = options.resolution
+  // GPT Image's official endpoint combines aspect and resolution in size.
+  if (!isOpenAiGptImage && options.aspectRatio && options.aspectRatio !== 'auto' && !isApiYiSeedream) body.aspect_ratio = options.aspectRatio
+  if (!isOpenAiGptImage && options.resolution && !isApiYiSeedream) body.resolution = options.resolution
   if (options.detail && !isApiYiSeedream) body.quality = options.detail
-  if (!/gpt-image/i.test(settings.model)) body.response_format = 'url'
+  if (!isOpenAiGptImage && !/gpt-image/i.test(settings.model)) body.response_format = 'url'
   const referenceImages = options.referenceImages?.filter(Boolean) ?? []
   const hfsy = getHfsyImageCapabilities(settings.baseUrl, settings.model)
   const hfsySeedream55 = Boolean(hfsy && settings.model.trim().toLowerCase() === 'seedream-5.5')
@@ -3835,6 +3923,7 @@ export async function generateRemoteImages(
       const form = new FormData()
       form.append('model', settings.model)
       form.append('prompt', options.prompt)
+      if (options.editMask) form.append('mask', options.editMask, 'mask.png')
       if (!isGrsai) {
         form.append('n', String(options.count))
         form.append('size', requestSize)
@@ -3884,9 +3973,8 @@ export async function generateRemoteImages(
           )
         }
         const extension = imageBlob.type.includes('webp') ? 'webp' : imageBlob.type.includes('jpeg') ? 'jpg' : 'png'
-        // GPT Image edit APIs represent an image array by repeating the same
-        // multipart `image` field. The upload order is the prompt's 图1/图2/... order.
-        form.append('image', imageBlob, `reference-${index + 1}.${extension}`)
+        // Preserve the reference order used by the numbered prompt.
+        form.append(isOpenAiGptImage ? 'image[]' : 'image', imageBlob, `reference-${index + 1}.${extension}`)
       }
 
       response = await providerFetch(endpoint(settings.baseUrl, 'images/edits'), {

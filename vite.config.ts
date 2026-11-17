@@ -331,6 +331,12 @@ const apiYiMediaRelayPlugin: Plugin = {
 }
 
 export default defineConfig({
+  // React Flow must use the same React module instance as the application.
+  // Without this, Vite's dependency optimizer can serve separate module
+  // instances in development and trigger React's "Invalid hook call" error.
+  resolve: {
+    dedupe: ['react', 'react-dom'],
+  },
   plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin, {
     name: 'official-provider-relay',
     configureServer(server) {

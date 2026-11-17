@@ -127,6 +127,7 @@ test('unknown model IDs stay unclassified instead of being silently treated as t
 test('GPT Image 2 preserves exact portrait ratios while legacy image models retain compatible buckets', () => {
   assert.equal(api.resolveImageRequestSize('gpt-image-2', '9:16', '1K'), '1024x1824')
   assert.equal(api.resolveImageRequestSize('gpt-image-2-2026-04-21', '16:9', '2K'), '2560x1440')
+  assert.equal(api.resolveImageRequestSize('gpt-image-2', '3:1', '4K'), '3840x1280')
   assert.equal(api.resolveImageRequestSize('gpt-image-1.5', '9:16', '1K'), '1024x1536')
 })
 
@@ -352,6 +353,72 @@ test('HFSY routes MiniMax, Kling, Muse and native Seedance using their own field
   assert.equal(api.hfsyVideoLimits('wan-3.0-720').maxSeconds, 30)
 })
 
+test('Seedance 2.5 sends 21:9 for generation and adaptive for frame-based requests on Ark and HFSY', async (t) => {
+  const bodies = []
+  const resultUrl = 'https://cdn.example.test/result.mp4'
+  const firstFrame = 'https://cdn.example.test/first.png'
+  const lastFrame = 'https://cdn.example.test/last.png'
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    if (init?.method === 'POST') {
+      bodies.push(JSON.parse(init.body))
+      return Response.json({ id: 'test-task', status: 'succeeded', result_url: resultUrl, content: { video_url: resultUrl } })
+    }
+    return new Response('video', { headers: { 'content-type': 'video/mp4' } })
+  })
+  const base = { prompt: 'A wide shot', seconds: 5, size: '1680x720', resolution: '720p', aspectRatio: '21:9' }
+  const ark = { baseUrl: 'https://ark.cn-beijing.volces.com/api/v3', apiKey: 'test', model: 'doubao-seedance-2-5-260628' }
+  const hfsy = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2.5-720' }
+  assert.ok(api.hfsyVideoLimits(hfsy.model).ratios.includes('21:9'))
+  for (const settings of [ark, hfsy]) {
+    assert.equal(api.seedance25FollowsFirstFrame(settings.model, 'first_last_frame'), true)
+    await api.generateRemoteVideo(settings, { ...base, mode: 'text2video' })
+    await api.generateRemoteVideo(settings, { ...base, mode: 'image_reference', referenceImages: [firstFrame] })
+    await api.generateRemoteVideo(settings, { ...base, mode: 'image2video', firstFrame })
+    await api.generateRemoteVideo(settings, { ...base, mode: 'first_last_frame', firstFrame, lastFrame })
+    assert.deepEqual(bodies.slice(-4).map(({ ratio }) => ratio), ['21:9', '21:9', 'adaptive', 'adaptive'])
+    await assert.rejects(() => api.generateRemoteVideo(settings, {
+      ...base, mode: 'first_last_frame', firstFrame, lastFrame, referenceAudios: ['https://cdn.example.test/audio.mp3'],
+    }), (error) => /不能与全模态参考素材混用/.test(error.detail))
+  }
+  assert.equal(bodies.length, 8)
+  assert.deepEqual(bodies[3].content.slice(1).map(({ role }) => role), ['first_frame', 'last_frame'])
+  assert.deepEqual(bodies[7].images, [firstFrame, lastFrame])
+  assert.equal('orientation' in bodies[7], false)
+})
+
+test('Seedance 2.5 gateways use the same frame rule with their own request fields', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    assert.equal(init?.method, 'POST')
+    requests.push(JSON.parse(init.body))
+    return Response.json({ error: { message: 'Mock stopped after request capture' } }, { status: 400 })
+  })
+  const options = { prompt: 'test', seconds: 5, size: '1280x720', resolution: '720p', aspectRatio: '21:9' }
+  const firstFrame = 'https://cdn.example.test/frame.png'
+  for (const settings of [
+    { baseUrl: 'https://api.apiyi.com/v1', apiKey: 'test', model: 'dreamina-seedance-2-5-260628' },
+    { baseUrl: 'https://api.apimart.ai/v1', apiKey: 'test', model: 'seedance-2.5-flash' },
+  ]) {
+    await assert.rejects(() => api.generateRemoteVideo(settings, { ...options, mode: 'text2video' }))
+    await assert.rejects(() => api.generateRemoteVideo(settings, { ...options, mode: 'image2video', firstFrame }))
+  }
+  assert.deepEqual(requests.map((body) => body.ratio ?? body.size), ['21:9', 'adaptive', '21:9', 'adaptive'])
+  assert.equal(requests[1].content[1].role, 'first_frame')
+  assert.equal(requests[3].image_with_roles[0].role, 'first_frame')
+  assert.equal(api.seedance25FollowsFirstFrame('seedance2.5', 'image2video'), true)
+  assert.equal(api.seedance25FollowsFirstFrame('video-2.5', 'image2video'), false)
+  assert.equal(api.seedance25FollowsFirstFrame('seedance-2.0', 'image2video'), false)
+})
+
+test('Grok Imagine Image 2.0 uses official aspect ratios and accepted quality values', () => {
+  const base = 'https://api.x.ai/v1'
+  const model = 'grok-imagine-image-2.0'
+  assert.deepEqual(api.getImageModelCapabilities(base, model).qualities, ['auto', 'low', 'medium'])
+  assert.deepEqual(api.resolveImageModelOptions(base, model, { aspectRatio: '21:9', resolution: '2K', detail: 'high' }), {
+    aspectRatio: '21:9', resolution: '2K', detail: 'auto', output: 'png',
+  })
+})
+
 test('new vendor adapters use native video paths and archive the completed result', async (t) => {
   const requests = []
   const win = { setTimeout: (run) => setTimeout(run, 0), clearTimeout }
@@ -399,9 +466,110 @@ test('vendor catalog supports Muse and Grok image requests and does not offer re
   const config = { prompt: 'test', count: 2, aspectRatio: '3:4', resolution: '2K' }
   await api.generateRemoteImages({ baseUrl: 'https://api.x.ai/v1', apiKey: 'test', model: 'grok-imagine-image-2.0' }, config)
   await api.generateRemoteImages({ baseUrl: 'https://api.meta.ai/v1', apiKey: 'test', model: 'muse-image-1.0' }, config)
-  assert.deepEqual(calls[0], ['https://api.x.ai/v1/images/generations', { model: 'grok-imagine-image-2.0', prompt: 'test', n: 2, aspect_ratio: '3:4', resolution: '2k', quality: 'low', response_format: 'b64_json' }])
+  assert.deepEqual(calls[0], ['https://api.x.ai/v1/images/generations', { model: 'grok-imagine-image-2.0', prompt: 'test', n: 2, aspect_ratio: '3:4', resolution: '2k', quality: 'auto', response_format: 'b64_json' }])
   assert.equal(calls[1][0], 'https://api.meta.ai/v1/images/generations')
   assert.equal(calls[1][1].n, 2)
+})
+
+test('OpenAI GPT Image sends official size and quality fields for manual and automatic framing', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    requests.push(JSON.parse(init.body))
+    return Response.json({ data: [{ url: 'https://cdn.example.test/image.png' }] })
+  })
+  const settings = { baseUrl: 'https://api.openai.com/v1', apiKey: 'test', model: 'gpt-image-2' }
+  const options = { prompt: 'test', count: 1, detail: 'high' }
+  await api.generateRemoteImages(settings, { ...options, aspectRatio: '9:16', resolution: '1K' })
+  await api.generateRemoteImages(settings, { ...options, aspectRatio: 'auto', resolution: 'auto' })
+  const premium = 'gpt-image-2.5-flare'
+  assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, premium).qualities, ['auto', 'low', 'medium', 'high', 'xhigh', 'max'])
+  await api.generateRemoteImages({ ...settings, model: premium }, { ...options, aspectRatio: '9:16', resolution: '1K', detail: 'xhigh' })
+  assert.deepEqual(requests, [
+    { model: settings.model, prompt: 'test', n: 1, size: '1024x1824', quality: 'high' },
+    { model: settings.model, prompt: 'test', n: 1, size: 'auto', quality: 'high' },
+    { model: premium, prompt: 'test', n: 1, size: '1024x1824', quality: 'xhigh' },
+  ])
+})
+
+test('Grok video reference modes enforce model-specific limits', () => {
+  const baseUrl = 'https://api.x.ai/v1'
+  assert.match(api.videoReferenceSettingsIssue(baseUrl, 'grok-imagine-video-1.5', 'image_reference', 15, 0, '1080p'), /720p/)
+  assert.match(api.videoReferenceSettingsIssue(baseUrl, 'grok-imagine-video', 'image_reference', 11, 0, '720p'), /10 秒/)
+  assert.match(api.videoReferenceSettingsIssue(baseUrl, 'grok-imagine-video-1.5-lite', 'image_reference', 5, 0, '720p'), /Lite/)
+  assert.equal(api.videoReferenceSettingsIssue(baseUrl, 'grok-imagine-video-1.5-lite', 'image2video', 5, 0, '1080p'), undefined)
+  assert.deepEqual(api.videoModeLimits(baseUrl, 'grok-imagine-video-1.5', 'image_reference').resolutions, ['480p', '720p'])
+  assert.equal(api.videoModeLimits('https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-omni-1.2-flash', 'first_last_frame').maxSeconds, 10)
+})
+
+test('OpenAI image edits upload the original and PNG mask in the same multipart request', async (t) => {
+  const source = 'https://cdn.example.test/original.png'
+  const openai = { baseUrl: 'https://api.openai.com/v1', apiKey: 'test', model: 'gpt-image-2.5-flare' }
+  const mask = new Blob(['mask bytes'], { type: 'image/png' })
+  let body
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url) === source) return new Response(new Blob(['original bytes'], { type: 'image/png' }))
+    assert.equal(String(url), 'https://api.openai.com/v1/images/edits')
+    body = init.body
+    return Response.json({ data: [{ url: 'https://cdn.example.test/result.png' }] })
+  })
+  globalThis.window = { setTimeout, clearTimeout }
+  try {
+    await api.generateRemoteImages(openai, { prompt: 'edit this region', count: 1, referenceImages: [source], editMask: mask })
+    assert.equal(await body.get('image[]').text(), 'original bytes')
+    assert.equal(body.get('mask').type, 'image/png')
+    assert.equal(await body.get('mask').text(), 'mask bytes')
+    await assert.rejects(api.generateRemoteImages({ ...openai, baseUrl: 'https://proxy.example.test/v1' }, { prompt: 'edit this region', count: 1, referenceImages: [source], editMask: mask }), /无法使用图像蒙版/)
+  } finally { delete globalThis.window }
+})
+
+test('local editing encodes matching source and mask sizes and clears the selected region', async () => {
+  const { prepareMaskedImageEdit } = await import(asModule(await compile('./imageEditMask.ts')))
+  const frames = []
+  const circles = []
+  let closed = false
+  const context = {
+    drawImage() {}, clearRect() {}, fillRect() {}, beginPath() {}, fill() {},
+    arc(x, y, radius) { circles.push({ x, y, radius, operation: this.globalCompositeOperation }) },
+  }
+  const canvas = {
+    width: 0, height: 0,
+    getContext: () => context,
+    toBlob(callback, type) {
+      frames.push([this.width, this.height, type])
+      callback(new Blob(['PNG'], { type }))
+    },
+  }
+  const previousBitmap = globalThis.createImageBitmap
+  const previousDocument = globalThis.document
+  globalThis.createImageBitmap = async () => ({ width: 1000, height: 500, close: () => { closed = true } })
+  globalThis.document = { createElement: () => canvas }
+  try {
+    await prepareMaskedImageEdit(new Blob(), [{ x: 25, y: 75, radius: 8 }])
+    assert.deepEqual(frames, [[1000, 500, 'image/png'], [1000, 500, 'image/png']])
+    assert.deepEqual(circles, [{ x: 250, y: 375, radius: 40, operation: 'destination-out' }])
+    assert.equal(closed, true)
+  } finally {
+    if (previousBitmap === undefined) delete globalThis.createImageBitmap
+    else globalThis.createImageBitmap = previousBitmap
+    if (previousDocument === undefined) delete globalThis.document
+    else globalThis.document = previousDocument
+  }
+})
+
+test('Ark Seedream 5.5 and 5.0 Pro/Flash expose 1.5K and send a preset for automatic framing', async (t) => {
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    requests.push(JSON.parse(init.body))
+    return Response.json({ data: [{ url: 'https://cdn.example.test/image.png' }] })
+  })
+  const baseUrl = 'https://ark.cn-beijing.volces.com/api/v3'
+  for (const model of ['doubao-seedream-5-5-261028', 'doubao-seedream-5-0-pro-260628', 'doubao-seedream-5-0-flash-260915']) {
+    const capabilities = api.getImageModelCapabilities(baseUrl, model)
+    assert.deepEqual(capabilities.resolutions, ['2K', '1.5K', '1K'])
+    assert.equal(capabilities.images, 10)
+    await api.generateRemoteImages({ baseUrl, apiKey: 'test', model }, { prompt: 'a wide landscape', count: 1, aspectRatio: 'auto', resolution: '1.5K' })
+  }
+  assert.deepEqual(requests.map(({ size }) => size), ['1.5K', '1.5K', '1.5K'])
 })
 
 test('Jimeng extracts its device flow and model choices without accepting other authorization hosts', async () => {
@@ -504,6 +672,7 @@ test('HFSY submits text, image, frame, image-reference and mixed-material routes
   await api.generateRemoteVideo(settings, { ...base, mode: 'all_reference', referenceImages: ['https://cdn.example.com/a.png'], referenceVideos: ['https://cdn.example.com/motion.mp4'] })
   await api.generateRemoteVideo(settings, { ...base, size: '3:4', mode: 'text2video' })
   assert.equal('images' in bodies[0], false)
+  assert.equal('watermark' in bodies[0], false, 'SD-2 routes through jimeng_cli and rejects a watermark field')
   assert.deepEqual(bodies[1].images, ['https://cdn.example.com/first.png'])
   assert.deepEqual(bodies[2].images, ['https://cdn.example.com/first.png', 'https://cdn.example.com/last.png'])
   assert.deepEqual(bodies[3].images, ['https://cdn.example.com/same.png', 'https://cdn.example.com/same.png'])
