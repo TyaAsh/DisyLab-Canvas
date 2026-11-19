@@ -83,3 +83,24 @@ export async function providerFetch(input: string | URL, init?: RequestInit) {
   }
   return fetch(input, init)
 }
+
+/** Bound both response headers and body reads; detach cancellation handlers on completion. */
+export async function withProviderDeadline<T>(request: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal, timeoutMs = 30_000): Promise<T> {
+  signal?.throwIfAborted()
+  const controller = new AbortController()
+  const cancel = () => controller.abort(signal?.reason)
+  signal?.addEventListener('abort', cancel, { once: true })
+  const timer = setTimeout(() => controller.abort(new DOMException('接口响应超时', 'TimeoutError')), timeoutMs)
+  let abort: (() => void) | undefined
+  try {
+    const deadline = new Promise<never>((_, reject) => {
+      abort = () => reject(controller.signal.reason)
+      controller.signal.addEventListener('abort', abort, { once: true })
+    })
+    return await Promise.race([request(controller.signal), deadline])
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', cancel)
+    if (abort) controller.signal.removeEventListener('abort', abort)
+  }
+}

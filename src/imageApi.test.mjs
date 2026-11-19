@@ -18,6 +18,7 @@ const museWeb = asModule((await compile('./museWeb.ts')).replace("'./providerTra
 const { resolveDesktopProviderRequest } = await import(transport)
 const referenceMediaModule = asModule(await compile('./referenceMediaValidation.ts'))
 const api = await import(asModule((await compile('./imageApi.ts'))
+  .replace("'./textModelPolicy'", JSON.stringify(asModule(await compile('./textModelPolicy.ts'))))
   .replace("'./referenceMediaValidation'", JSON.stringify(referenceMediaModule))
   .replace("'./providerLifecycle'", JSON.stringify(lifecycle))
   .replace("'./providerTransport'", JSON.stringify(transport))
@@ -1464,4 +1465,48 @@ test('APIMart uploads a local reference clip before requesting Kling 4 Flash', a
   assert.equal(rules.media({ kind: 'video', url: uploaded }).maxMB, undefined)
   const result = await api.generateRemoteVideo(settings, { prompt: 'test', seconds: 5, size: '16:9', mode: 'all_reference', referenceVideos: [local] })
   assert.equal(await result.blob.text(), 'ready video')
+})
+
+
+test('text defaults recognize Claude and prefer the current mainstream GPT over catalog order', () => {
+  assert.equal(api.isModelAutoEnabled({ id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', capability: 'text' }), true)
+  const available = ['deepseek-chat', 'gpt-4o', 'gpt-6.2-sol', 'gpt-6.2-mini', 'claude-sonnet-5-5'].map(id => ({ id, name: id, capability: 'text', enabled: true }))
+  assert.equal(api.pickPreferredModelId(available, 'text'), 'gpt-6.2-sol')
+  assert.notEqual(api.pickPreferredModelId(available.map(model => ({ ...model, enabled: model.id !== 'gpt-6.2-sol' })), 'text'), 'gpt-6.2-sol')
+})
+
+test('HFSY preserves the completed task URL before download and never resubmits generation', async (t) => {
+  const events = []
+  t.mock.method(globalThis, 'fetch', async (_url, init = {}) => {
+    assert.notEqual(init.method, 'POST')
+    events.push('download')
+    return new Response('video', { headers: { 'Content-Type': 'video/mp4' } })
+  })
+  const result = await api.resumeHfsyVideoTask({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-fast-480' }, 'existing-task', {
+    onResultUrl: (url, id) => events.push(['url', url, id]),
+    onProgress: (_, status) => events.push(status),
+  }, { status: 'SUCCESS', result_url: 'https://example.test/result.mp4' })
+  assert.equal(result.taskId, 'existing-task')
+  assert.deepEqual(events, [['url','https://example.test/result.mp4','existing-task'], 'downloading', 'download', 'completed'])
+})
+test('video download moves past a stuck body instead of staying at 100 percent forever', async (t) => {
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++
+    if (calls === 1) return { ok: true, status: 200, headers: new Headers({ 'Content-Type': 'video/mp4' }), blob: () => new Promise(() => {}) }
+    return new Response('complete-video', { headers: { 'Content-Type': 'video/mp4' } })
+  })
+  const blob = await api.downloadGeneratedVideoBlob('https://example.test/result.mp4', { attemptTimeoutMs: 10 })
+  assert.equal(await blob.text(), 'complete-video')
+  assert.equal(calls, 2)
+})
+test('deadline covers hung response headers and respects explicit cancellation', async () => {
+  const { withProviderDeadline } = await import(transport)
+  let requestSignal
+  await assert.rejects(withProviderDeadline(async signal => { requestSignal = signal; return new Promise(() => {}) }, undefined, 10), { name: 'TimeoutError' })
+  assert.equal(requestSignal.aborted, true)
+  const controller = new AbortController()
+  const pending = withProviderDeadline(async () => new Promise(() => {}), controller.signal, 1000)
+  controller.abort()
+  await assert.rejects(pending, { name: 'AbortError' })
 })

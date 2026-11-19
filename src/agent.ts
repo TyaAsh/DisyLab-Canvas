@@ -136,6 +136,7 @@ export type AgentImagePlan = {
   deliverableIndex?: number
   imageConnectionId?: string
   imageModelId?: string
+  modelLocked?: boolean
   modelMention?: AgentModelMention
   assistantMessageId?: string
   createdAt?: string
@@ -204,6 +205,7 @@ export type AgentVideoPlan = {
   firstFrameAspect?: number
   videoConnectionId?: string
   videoModelId?: string
+  modelLocked?: boolean
   modelMention?: AgentModelMention
   assistantMessageId?: string
   createdAt?: string

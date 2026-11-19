@@ -4,7 +4,6 @@ const routes = {
   xai: { host: 'api.x.ai', get: /^\/v1\/(?:models|(?:image-|video-|language-)models|videos\/[\w.-]+)$/, post: /^\/v1\/(?:chat\/completions|images\/(?:generations|edits)|videos\/(?:generations|edits))$/ },
   ark: { host: 'ark.cn-beijing.volces.com', get: /^\/api\/v3\/(?:models|contents\/generations\/tasks(?:\/[\w.-]+)?)$/, post: /^\/api\/v3\/(?:chat\/completions|images\/generations|contents\/generations\/tasks)$/ },
   minimax: { host: 'api.minimaxi.com', get: /^\/v(?:1\/(?:models|query\/video_generation|files\/retrieve)|2\/query\/video_generation\/[\w.-]+)$/, post: /^\/v(?:1\/(?:chat\/completions|text\/chatcompletion_v2|video_generation|t2a_v2)|2\/video_generation)$/ },
-  muse: { host: 'api.meta.ai', get: /^\/v1\/models$/, post: /^\/v1\/(?:chat\/completions|responses|images\/(?:generations|edits))$/ },
 }
 
 export async function onRequest({ request }) {

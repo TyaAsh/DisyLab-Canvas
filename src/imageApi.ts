@@ -1,3 +1,4 @@
+import { rankTextModels } from './textModelPolicy'
 /*!
  * Copyright (c) 2026 DisyLab. All rights reserved.
  * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
@@ -8,7 +9,7 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import { HFSY_UPLOAD_IMAGE_TYPES, imageMimeFromBytes, videoMimeFromBytes, type MediaLimits, type ReferenceMedia } from './referenceMediaValidation'
-import { isDesktopApp, providerFetch } from './providerTransport'
+import { isDesktopApp, providerFetch, withProviderDeadline } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
 import { parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
@@ -71,6 +72,7 @@ export type VideoGenerationOptions = {
   onTaskId?: (taskId: string) => void
   /** Captures the provider request/result for recovery and output history. */
   captureAdminLog?: (log: GenerationAdminLog) => void
+  onResultUrl?: (sourceUrl: string, taskId: string) => void
 }
 
 export type GenerationAdminLog = {
@@ -1225,7 +1227,7 @@ async function readCompleteVideoResponse(response: Response) {
  * and their CDN can lag behind the completed task response. Try the controlled
  * same-origin relay (with and without scoped auth) and a direct request across
  * a short replication window before declaring the archive recoverable. */
-export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { signal?: AbortSignal; authorization?: string } = {}) {
+export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { signal?: AbortSignal; authorization?: string; attemptTimeoutMs?: number } = {}) {
   const relayUrl = /^https?:\/\//i.test(sourceUrl) ? apiYiGeneratedMediaUrl(sourceUrl) : sourceUrl
   const candidates = typeof window === 'undefined' || relayUrl === sourceUrl
     ? [{ url: sourceUrl, headers: undefined as HeadersInit | undefined }]
@@ -1238,12 +1240,10 @@ export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { s
   for (let round = 0; round < 3; round += 1) {
     for (const candidate of candidates) {
       try {
-        const response = await providerFetch(candidate.url, { signal: options.signal, headers: candidate.headers, cache: round ? 'reload' : 'default' })
-        if (!response.ok) {
-          failures.push(`${response.status}`)
-          continue
-        }
-        return await readCompleteVideoResponse(response)
+        return await withProviderDeadline(async (signal) => {
+          const response = await providerFetch(candidate.url, { signal, headers: candidate.headers, cache: round ? 'reload' : 'default' })
+          return readCompleteVideoResponse(response)
+        }, options.signal, options.attemptTimeoutMs ?? 30_000)
       } catch (error) {
         if (options.signal?.aborted || error instanceof DOMException && error.name === 'AbortError') throw error
         failures.push(error instanceof Error && /^(?:partial-video|invalid-body|empty|text\/|image\/|audio\/|application\/)/i.test(error.message)
@@ -2659,7 +2659,7 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   return resumeHfsyVideoTask(settings, taskId, options, task)
 }
 
-export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: string, options: Pick<VideoGenerationOptions, 'signal' | 'onProgress'> = {}, initialTask?: unknown): Promise<GeneratedVideo> {
+export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: string, options: Pick<VideoGenerationOptions, 'signal' | 'onProgress' | 'onResultUrl'> = {}, initialTask?: unknown): Promise<GeneratedVideo> {
   if (!isHfsyBaseUrl(settings.baseUrl)) throw new Error('请选择已有的 HFSY API 连接。')
   if (!/^[\w-]{1,160}$/.test(taskId)) throw new Error('请输入有效的 HFSY 任务 ID。')
   const model = settings.model.toLowerCase()
@@ -2677,6 +2677,7 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
     }
     const sourceUrl = videoResultUrl(task)
     if (sourceUrl && (!status || /^(?:success|succeeded|completed|complete)$/.test(status))) {
+      options.onResultUrl?.(sourceUrl, taskId)
       options.onProgress?.(100, 'downloading')
       let blob: Blob
       try {
@@ -2695,26 +2696,31 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
     options.onProgress?.(Math.min(99, providerTaskPercent(task) ?? 0), status || 'queued')
     if (task) await waitForDelay(3_000, options.signal)
     try {
-      const poll = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
+      const poll = await withProviderDeadline(async (signal) => {
+        const response = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
         method: pollMethod,
-        signal: options.signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
+        signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
       })
+        const payload = response.ok ? await response.json() as unknown : undefined
+        return { response, payload }
+      }, options.signal)
+
       // HFSY's notice specifies api.hfsyapi.cn as the query fallback for 504s.
-      if (poll.status === 504 && /^(?:www\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname)) {
+      if (poll.response.status === 504 && /^(?:www\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname)) {
         pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
         continue
       }
-      if ([404, 405].includes(poll.status) && pollMethod === 'POST') {
+      if ([404, 405].includes(poll.response.status) && pollMethod === 'POST') {
         pollMethod = 'GET'
         continue
       }
-      if ([404, 405].includes(poll.status) && !triedOtherQueryPath) {
+      if ([404, 405].includes(poll.response.status) && !triedOtherQueryPath) {
         triedOtherQueryPath = true
         queryParameter = !queryParameter
         continue
       }
-      if (!poll.ok) throw await createApiError(poll)
-      task = await poll.json() as unknown
+      if (!poll.response.ok) throw await createApiError(poll.response)
+      task = poll.payload
       const queryFailure = hfsyFailureDetail(task)
       if (queryFailure && !/^(?:failed|failure|error|expired|cancelled|canceled|violation|rejected)$/.test(extractProviderTaskStatus(task))) {
         throw new GenerationRequestError('api', 'HFSY 视频任务查询失败', queryFailure, { requestId: taskId })
@@ -3200,7 +3206,7 @@ export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 
 // Auto-enable current mainstream families when a provider actually exposes
 // them to the user's key. This never invents catalog entries or bypasses the
 // provider's model/group permissions.
-const DEFAULT_TEXT_PATTERN = /gemini|deepseek|gpt/i
+const DEFAULT_TEXT_PATTERN = /claude|deepseek|gpt/i
 const DEFAULT_IMAGE_PATTERN = /nano(?:-banana)?|seedream|gpt-image/i
 // Video families that should be enabled immediately after a successful model
 // catalog refresh. The match is deliberately based on the provider's returned
@@ -3222,9 +3228,7 @@ export function pickPreferredModelId(
   const enabled = models.filter((model) => model.enabled && model.capability === kind)
   if (enabled.length === 0) return undefined
   if (kind === 'text') {
-    return enabled.find((model) => /gpt/i.test(`${model.id} ${model.name}`))?.id
-      ?? enabled.find((model) => /gemini/i.test(`${model.id} ${model.name}`))?.id
-      ?? enabled[0].id
+    return rankTextModels(enabled)[0]?.id
   }
   return enabled.find((model) => /gpt-image|image2/i.test(`${model.id} ${model.name}`))?.id
     ?? enabled.find((model) => /nano/i.test(`${model.id} ${model.name}`))?.id

@@ -1,3 +1,4 @@
+import { isRetiredProvider } from './providerCatalogSync'
 /*!
  * Copyright (c) 2026 DisyLab. All rights reserved.
  * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
@@ -26,6 +27,7 @@ export type ApiModelConfig = {
   name: string
   capability: ModelCapability
   enabled: boolean
+  manuallyEnabled?: boolean
 }
 
 export type ApiConnection = {
@@ -36,6 +38,7 @@ export type ApiConnection = {
   authMode?: ApiAuthMode
   balanceToken?: string
   models: ApiModelConfig[]
+  textDefaultsVersion?: number
   modelsFetchedAt?: string
   /** Master switch for whether this connection's models participate in selection. Defaults to true. */
   enabled?: boolean
@@ -136,25 +139,27 @@ function readApiSettings(): ApiSettings {
                   name: typeof model.name === 'string' && model.name.trim() ? model.name : model.id,
                   capability,
                   enabled: model.enabled !== false,
+                  manuallyEnabled: typeof model.manuallyEnabled === 'boolean' ? model.manuallyEnabled : undefined,
                 }]
               })
             : [],
+          textDefaultsVersion: connection.textDefaultsVersion,
           modelsFetchedAt: typeof connection.modelsFetchedAt === 'string' ? connection.modelsFetchedAt : undefined,
           enabled: connection.enabled === false ? false : true,
           disconnected: connection.disconnected === true,
         }
       })
-      // APIYI is no longer offered by DisyLab. Remove old saved entries during
+      // APIYI and standalone Muse providers are no longer offered. Remove saved entries during
       // loading so they cannot remain selectable after this update, and erase
       // their session-only credentials at the same time.
-      const removedApiYiIds = loadedConnections.filter(isApiYiConnection).map((connection) => connection.id)
-      const connections = loadedConnections.filter((connection) => !isApiYiConnection(connection))
+      const removedApiYiIds = loadedConnections.filter(connection => isApiYiConnection(connection) || isRetiredProvider(connection)).map((connection) => connection.id)
+      const connections = loadedConnections.filter((connection) => !isApiYiConnection(connection) && !isRetiredProvider(connection))
       if (removedApiYiIds.length) {
         removeSessionCredentials(removedApiYiIds)
         try {
           localStorage.setItem(API_SETTINGS_KEY, JSON.stringify({
             ...value,
-            connections: value.connections.filter((item) => !isApiYiConnection({ baseUrl: typeof (item as Partial<ApiConnection>).baseUrl === 'string' ? (item as Partial<ApiConnection>).baseUrl! : '' })),
+            connections: connections.map(({ apiKey: _secret, balanceToken: _balanceSecret, ...connection }) => connection),
           }))
         } catch {
           // The in-memory migration still prevents the removed connections from use.

@@ -1,3 +1,6 @@
+import { CATALOG_SYNC_KEY, nextCatalogCheck, recommendCatalogModels, mergeProviderCatalog, isRetiredProvider } from './providerCatalogSync'
+import { TextModelRecoveryDialog, type TextModelRecovery } from './TextModelRecoveryDialog'
+import { rankTextModels, mainstreamTextModelIds, textModelFamily, runTextModelRecovery } from './textModelPolicy'
 /*!
  * Copyright (c) 2026 DisyLab. All rights reserved.
  * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
@@ -169,7 +172,7 @@ import { MULTI_GRID_SKILLS } from './skills/manifests/official/image'
 import { buildCompositeWorkflow, type CompositeWorkbenchConfig, type WorkflowTemplate } from './skills/compositeBlueprints'
 import { appendOperatorRecoveryLog, listOperatorRecoveryLogs, type OperatorRecoveryLog } from './adminGate'
 import { expandConnectedTextReferences, nodesWithGroupChildren, resolveVideoFrameSources } from './nodeReferences'
-import { extractImageUrlsFromAdminResult, fetchProviderCredits, fetchProviderModelPrices, fetchRemoteModels, fetchUsdToCnyRate, generateRemoteImages, generateRemoteText, generateRemoteVideo, isModelAutoEnabled, normalizeGenerationError, pickPreferredModelId, prepareReferenceImageForRequest, resolveProviderLabel, shouldAppendReferenceGuide, validateApiCredentials, type CurrencyRate, type GenerationAdminLog, type GenerationErrorCategory, type ProviderCredits, type ProviderModelPrice } from './imageApi'
+import { extractImageUrlsFromAdminResult, fetchProviderCredits, fetchProviderModelPrices, fetchRemoteModels, fetchUsdToCnyRate, generateRemoteImages, generateRemoteText as requestRemoteText, generateRemoteVideo, isModelAutoEnabled, normalizeGenerationError, pickPreferredModelId, prepareReferenceImageForRequest, resolveProviderLabel, shouldAppendReferenceGuide, validateApiCredentials, type CurrencyRate, type GenerationAdminLog, type GenerationErrorCategory, type ProviderCredits, type ProviderModelPrice } from './imageApi'
 import { agentPaceGuide, agentReferencePurposeGuide, type AgentTurnOptions, type AgentWebReference } from './agent'
 import { buildAgentWebAnalysisPrompt, formatAgentWebReference, parseAgentWebAnalysis, readAgentReferencePage } from './agentWebReference'
 import { useProjectDialog } from './ProjectDialog'
@@ -192,14 +195,14 @@ function pickValidSelections(connections: ApiConnection[], previous: { selectedT
   const usable = connections.filter(isConnectionUsable)
   const enabledText = usable.flatMap((connection) => connection.models
     .filter((model) => model.enabled && model.capability === 'text')
-    .map((model) => ({ connectionId: connection.id, modelId: model.id })))
+    .map((model) => ({ connectionId: connection.id, modelId: model.id, id: model.id, name: model.name })))
   const enabledImage = usable.flatMap((connection) => connection.models
     .filter((model) => model.enabled && model.capability === 'image')
     .map((model) => ({ connectionId: connection.id, modelId: model.id })))
   const selectedTextModel = previous.selectedTextModel
     && enabledText.some((model) => model.connectionId === previous.selectedTextModel?.connectionId && model.modelId === previous.selectedTextModel?.modelId)
     ? previous.selectedTextModel
-    : enabledText[0]
+    : rankTextModels(enabledText)[0]
   const selectedImageModel = previous.selectedImageModel
     && enabledImage.some((model) => model.connectionId === previous.selectedImageModel?.connectionId && model.modelId === previous.selectedImageModel?.modelId)
     ? previous.selectedImageModel
@@ -3274,6 +3277,7 @@ function useTouchCanvasMode() {
 }
 
 function App() {
+  const [textModelRecoveries, setTextModelRecoveries] = useState<TextModelRecovery[]>([])
   const mobileCanvasMode = useMobileCanvasMode()
   const touchCanvasMode = useTouchCanvasMode()
   const { confirm: projectConfirm, dialogNode: projectDialogNode } = useProjectDialog()
@@ -3283,6 +3287,50 @@ function App() {
     clearApiSettings,
     saveApiSettings,
   } = useDisyStore()
+
+  useEffect(() => {
+    const current = useDisyStore.getState().apiSettings
+    const connections = current.connections.filter(connection => !isRetiredProvider(connection)).map(connection => connection.textDefaultsVersion === 1 ? connection : { ...connection, models: recommendCatalogModels(connection.models), textDefaultsVersion: 1 })
+    if (connections.length !== current.connections.length || connections.some((connection, index) => connection !== current.connections[index])) saveApiSettings({ ...current, connections, ...pickValidSelections(connections, current) })
+  }, [apiSettings.connections, saveApiSettings])
+  useEffect(() => {
+    let stopped = false
+    let busy = false
+    const check = async () => {
+      if (busy || stopped || !navigator.onLine) return
+      busy = true
+      try {
+        let schedule: Record<string, number> = {}
+        try { schedule = JSON.parse(localStorage.getItem(CATALOG_SYNC_KEY) ?? '{}') } catch { /* reset invalid schedule */ }
+        const connections = useDisyStore.getState().apiSettings.connections.filter(connection => isConnectionUsable(connection) && connection.apiKey && !isRetiredProvider(connection) && apiProviderForBase(connection.baseUrl)?.accountOnly !== true)
+        for (const connection of connections) {
+          if (stopped) break
+          if ((schedule[connection.id] ?? 0) > Date.now()) continue
+          try {
+            const incoming = await fetchRemoteModels(connection)
+            if (stopped) break
+            const current = useDisyStore.getState().apiSettings
+            const latest = current.connections.find(item => item.id === connection.id)
+            if (!latest || latest.apiKey !== connection.apiKey || latest.baseUrl !== connection.baseUrl) continue
+            const models = mergeProviderCatalog(latest.models, incoming, isModelAutoEnabled)
+            const updated = current.connections.map(item => item.id === connection.id ? { ...item, models, modelsFetchedAt: new Date().toISOString(), textDefaultsVersion: 1 } : item)
+            saveApiSettings({ ...current, connections: updated, ...pickValidSelections(updated, current) })
+            schedule[connection.id] = nextCatalogCheck()
+          } catch {
+            // Keep the last good catalog on network/auth failure and retry in six hours.
+            schedule[connection.id] = Date.now() + 6 * 60 * 60 * 1000
+          }
+          try { localStorage.setItem(CATALOG_SYNC_KEY, JSON.stringify(schedule)) } catch { /* keep current settings when storage is unavailable */ }
+        }
+      } finally { busy = false }
+    }
+    void check()
+    const timer = window.setInterval(() => void check(), 15 * 60 * 1000)
+    const resumed = () => { if (document.visibilityState === 'visible') void check() }
+    document.addEventListener('visibilitychange', resumed)
+    window.addEventListener('online', resumed)
+    return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', resumed); window.removeEventListener('online', resumed) }
+  }, [saveApiSettings])
 
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>(initialNodes)
   const [edges, setEdges, applyEdgesChange] = useEdgesState(initialEdges)
@@ -4658,11 +4706,12 @@ function App() {
       await validateApiCredentials({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
       const models = await fetchRemoteModels({ baseUrl: apiDraft.baseUrl.trim(), apiKey: apiDraft.apiKey.trim(), authMode: apiDraft.authMode })
       if (requestId !== modelFetchRequestRef.current) return
+      const mainstream = mainstreamTextModelIds(models.filter(model => model.capability === 'text'))
       const nextDraftModels = models.map((model) => {
         const existing = draftModels.find((item) => item.id === model.id)
-        return { ...model, enabled: existing?.enabled ?? isModelAutoEnabled(model) }
+        return { ...model, manuallyEnabled: existing?.manuallyEnabled, enabled: existing?.enabled ?? (model.capability === 'text' ? mainstream.has(model.id) : isModelAutoEnabled(model)) }
       })
-      setDraftModels(nextDraftModels)
+      setDraftModels(recommendCatalogModels(nextDraftModels))
       setDraftModelsCredentialKey(apiCredentialKey(apiDraft.baseUrl, apiDraft.apiKey, apiDraft.authMode))
       setManualModelIds([])
       if (!models.length) showApiAlert('接口没有返回可用模型')
@@ -6672,6 +6721,7 @@ function App() {
         validationWarning = message
       }
 
+      if (isRetiredProvider({ baseUrl: apiDraft.baseUrl })) { setApiConnectionError('Muse 厂商已下架，请选择其他厂商'); return }
       const currentSettings = useDisyStore.getState().apiSettings
       const connectionId = editingConnection?.id ?? `connection-${crypto.randomUUID()}`
       const nextConnection: ApiConnection = {
@@ -6682,6 +6732,7 @@ function App() {
         authMode: apiDraft.authMode,
         balanceToken: apiDraft.balanceToken.trim(),
         models: modelsForCredentials,
+        textDefaultsVersion: 1,
         modelsFetchedAt: modelsMatchCredentials && modelsForCredentials.length ? new Date().toISOString() : undefined,
         enabled: editingConnection?.enabled !== false,
         disconnected: false,
@@ -6898,8 +6949,8 @@ function App() {
       if (modelCredentials === savedCredentials) {
         const existing = connection.models.find(({ id }) => id === model.id)
         const models = existing
-          ? connection.models.map((item) => item.id === model.id ? { ...item, enabled } : item)
-          : [...connection.models, { ...model, enabled }]
+          ? connection.models.map((item) => item.id === model.id ? { ...item, enabled, manuallyEnabled: enabled } : item)
+          : [...connection.models, { ...model, enabled, manuallyEnabled: enabled }]
         const nextConnection = { ...connection, models }
         const connections = currentSettings.connections.map((item) => item.id === connection.id ? nextConnection : item)
         try {
@@ -6912,7 +6963,7 @@ function App() {
         }
       }
     }
-    setDraftModels((current) => current.map((item) => item.id === model.id ? { ...item, enabled } : item))
+    setDraftModels((current) => current.map((item) => item.id === model.id ? { ...item, enabled, manuallyEnabled: enabled } : item))
   }
 
   const removeCurrentApiConnection = async () => {
@@ -9913,13 +9964,48 @@ function App() {
     })
   }
 
-  const enabledTextModels = useMemo(() => apiSettings.connections.filter(isConnectionUsable).flatMap((connection) => connection.models
+  const enabledTextModels = useMemo(() => rankTextModels(apiSettings.connections.filter(isConnectionUsable).flatMap((connection) => connection.models
     .filter((model) => model.enabled && model.capability === 'text')
-    .map((model) => ({ connection, model }))), [apiSettings.connections])
+    .map((model) => ({ connection, model, id: model.id, name: model.name })))), [apiSettings.connections])
   const selectedTextModel = enabledTextModels.find(({ connection, model }) => (
     connection.id === apiSettings.selectedTextModel?.connectionId
     && model.id === apiSettings.selectedTextModel?.modelId
   )) ?? enabledTextModels[0]
+  // Failures wait for user approval; selecting a default never authorizes failover.
+  const generateRemoteText = async (
+    settings: Parameters<typeof requestRemoteText>[0], prompt: string,
+    options: Parameters<typeof requestRemoteText>[2] & { onModelAttempt?: (model: typeof enabledTextModels[number]) => void } = {},
+  ) => {
+    const primary = enabledTextModels.find(item => item.connection.baseUrl === settings.baseUrl && item.model.id === settings.model && item.connection.apiKey === settings.apiKey)
+    if (!primary) throw new Error('指定的对话模型不可用，请重新选择')
+    return runTextModelRecovery(primary, (candidate, signal) => requestRemoteText({
+      baseUrl: candidate.connection.baseUrl, apiKey: candidate.connection.apiKey, authMode: candidate.connection.authMode, model: candidate.model.id,
+    }, prompt, { ...options, signal }), {
+      signal: options.signal,
+      onAttempt: options.onModelAttempt,
+      chooseNext: (current, error) => new Promise((resolve, reject) => {
+        options.signal?.throwIfAborted()
+        const id = crypto.randomUUID()
+        const finish = (key?: string) => {
+          options.signal?.removeEventListener('abort', aborted)
+          setTextModelRecoveries(items => items.filter(item => item.id !== id))
+          if (options.signal?.aborted) { reject(options.signal.reason); return }
+          const latest = useDisyStore.getState().apiSettings.connections.filter(isConnectionUsable).flatMap(connection => connection.models.filter(model => model.enabled && model.capability === 'text').map(model => `${connection.id}::${model.id}`))
+          resolve(key && latest.includes(key) ? enabledTextModels.find(item => `${item.connection.id}::${item.model.id}` === key) : undefined)
+        }
+        const aborted = () => finish()
+        options.signal?.addEventListener('abort', aborted, { once: true })
+        setTextModelRecoveries(items => [...items, {
+          id, currentKey: `${current.connection.id}::${current.model.id}`, modelName: current.model.name,
+          message: normalizeGenerationError(error).message,
+          models: enabledTextModels.map(item => ({ key: `${item.connection.id}::${item.model.id}`, name: item.model.name, connectionName: item.connection.name })),
+          choose: finish, cancel: () => finish(),
+        }])
+      }),
+    })
+  }
+  const preferredOptimizeModel = enabledTextModels.find(item => textModelFamily(item.model) === 'claude')
+
   const reverseInspirationPrompts = async (image: string, textModelKey: string) => {
     const [connectionId, modelId] = textModelKey.split('::')
     const reverseTextModel = enabledTextModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
@@ -10004,6 +10090,7 @@ function App() {
     if (!source) { setToastMessage('请先输入需要优化的提示词'); return }
     const [connectionId, modelId] = (textModelKey || optimizeTextModelKey).split('::')
     const textModel = enabledTextModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
+      ?? preferredOptimizeModel
       ?? selectedTextModel
       ?? enabledTextModels[0]
     if (!textModel) { setToastMessage('请先从 API 获取并启用一个文本模型'); setApiOpen(true); return }
@@ -10023,11 +10110,12 @@ function App() {
     } finally {
       setOptimizingPromptNodeIds((current) => { const next = new Set(current); next.delete(nodeId); return next })
     }
-  }, [enabledTextModels, nodes, optimizeTextModelKey, selectedTextModel, setNodes])
+  }, [preferredOptimizeModel, enabledTextModels, nodes, optimizeTextModelKey, selectedTextModel, setNodes])
 
   const effectiveOptimizeTextModel = (() => {
     const [connectionId, modelId] = optimizeTextModelKey.split('::')
     return enabledTextModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
+      ?? preferredOptimizeModel
       ?? selectedTextModel
       ?? enabledTextModels[0]
   })()
@@ -10037,6 +10125,7 @@ function App() {
     if (!value) return source
     const [connectionId, modelId] = (textModelKey || optimizeTextModelKey).split('::')
     const textModel = enabledTextModels.find(({ connection, model }) => connection.id === connectionId && model.id === modelId)
+      ?? preferredOptimizeModel
       ?? selectedTextModel
       ?? enabledTextModels[0]
     if (!textModel) {
@@ -10063,7 +10152,7 @@ function App() {
       setToastMessage(normalizeGenerationError(error).message)
       return source
     }
-  }, [enabledTextModels, optimizeTextModelKey, selectedTextModel])
+  }, [preferredOptimizeModel, enabledTextModels, optimizeTextModelKey, selectedTextModel])
 
   const renderPromptOptimizeControl = (nodeId: string) => {
     const loading = optimizingPromptNodeIds.has(nodeId)
@@ -10505,8 +10594,13 @@ function App() {
             pending = accepted
             queueVideoPatch((data) => ({ pendingVideoResults: [...(data.pendingVideoResults ?? []).filter(({ id }) => id !== attemptId), accepted] }), true)
           },
+          onResultUrl: (sourceUrl, taskId) => {
+            pending = { id: attemptId, taskId, sourceUrl, binding: videoResultBinding }
+            const ready = pending
+            queueVideoPatch((data) => ({ pendingVideoResults: [...(data.pendingVideoResults ?? []).filter(({ id }) => id !== attemptId), ready] }), true)
+          },
           onProgress: (progress, status) => {
-            const label = status === 'queued' ? '排队中' : status === 'completed' ? '下载完成' : generateCount > 1 ? `生成中 ${index + 1}/${generateCount}` : '生成中'
+            const label = status === 'queued' ? '排队中' : status === 'downloading' ? '生成完成 · 正在下载' : status === 'completed' ? '下载完成，正在保存' : generateCount > 1 ? `生成中 ${index + 1}/${generateCount}` : '生成中'
             queueVideoPatch(() => ({ status: label, videoProgress: Math.max(0, Math.min(100, progress)) }), false)
           },
         })
@@ -10903,6 +10997,7 @@ function App() {
       }))
       const videoFrames = (await Promise.all(selectedVideoReferences.map((reference) => captureVideoReferenceFrames(reference, controller.signal)))).flat()
       const referenceImages = [...visualImages, ...videoFrames]
+      let actualTextModel = selectedTextModel
       const output = await generateRemoteText({
       baseUrl: selectedTextModel.connection.baseUrl,
       apiKey: selectedTextModel.connection.apiKey,
@@ -10910,25 +11005,26 @@ function App() {
       model: selectedTextModel.model.id,
       }, prompt, {
         referenceImages,
+        onModelAttempt: (model) => { actualTextModel = model },
         signal: controller.signal,
         captureAdminLog: (log) => captureGenerationAdminLog(log, {
           prompt,
-          modelName: selectedTextModel.model.name,
-          connectionName: selectedTextModel.connection.name,
+          modelName: actualTextModel.model.name,
+          connectionName: actualTextModel.connection.name,
           projectId: textGenerationOrigin.projectId,
         }),
       })
       await patchCanvasNodesAtOrigin(textGenerationOrigin, (current) => current.map((node) => node.id === textGenerationNodeId
-        ? { ...node, data: { ...node.data, body: output, status: formatModelDisplayName(selectedTextModel.model.name) } }
+        ? { ...node, data: { ...node.data, body: output, status: formatModelDisplayName(actualTextModel.model.name) } }
         : node))
       appendOutputHistory({
         kind: 'text',
         status: 'success',
         canvasId: textGenerationOrigin.canvasId, nodeId: textGenerationNodeId,
         prompt,
-        modelId: selectedTextModel.model.id,
-        modelName: selectedTextModel.model.name,
-        connectionName: selectedTextModel.connection.name,
+        modelId: actualTextModel.model.id,
+        modelName: actualTextModel.model.name,
+        connectionName: actualTextModel.connection.name,
         requestedCount: generationCount,
         outputCount: 1,
         preview: output.slice(0, 240),
@@ -11776,7 +11872,7 @@ function App() {
             ? parseStoryboardRegions(await generateRemoteText(
               { baseUrl: selection.connection.baseUrl, apiKey: selection.connection.apiKey, authMode: selection.connection.authMode, model: selection.model.id },
               '读取附图中的分镜拼图。只返回 JSON 对象 {"regions":[[左,上,右,下]]}。四个坐标为相对整张图的 0 到 1000 数值。识别实际存在的每一格，按从上到下、同一行从左到右排列。边界贴合各格画面，排除外框、格间留白和格外字幕。不同格子的尺寸可以不同。不要按预期数量硬分格，也不要把格子里的物体单独当作镜头。如果看不清或不是分镜拼图，返回空数组。',
-              { referenceImages: [previewUrl], signal: AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]) },
+              { referenceImages: [previewUrl], signal: controller.signal },
             ))
             : [[0, 0, 1000, 1000]] as AgentImageOperationDraft['regions']
         }
@@ -11866,16 +11962,13 @@ function App() {
         projectMemoryPrompt(agentProjectSettings.memory),
       ].filter(Boolean).join('\n\n')
       if (!teamEnabled) updateAgentRun(runId, { stage: '等待模型回复' })
-      const planningTimeout = turnOptions?.pace === 'quick' ? 60_000 : turnOptions?.pace === 'deep' ? 120_000 : 90_000
-      const requestText = async (prompt: string, timeoutMs = planningTimeout, model = selection) => {
-        const timeout = AbortSignal.timeout(timeoutMs)
+      const requestText = async (prompt: string, model = selection) => {
         try {
           return await generateRemoteText(
             { baseUrl: model.connection.baseUrl, apiKey: model.connection.apiKey, authMode: model.connection.authMode, model: model.model.id },
-            prompt, { referenceImages: images, signal: AbortSignal.any([controller.signal, timeout]) },
+            prompt, { referenceImages: images, signal: controller.signal },
           )
         } catch (error) {
-          if (timeout.aborted && !controller.signal.aborted) throw new Error('对话模型响应超时。可以缩短本次任务，或换一个模型重试。')
           throw error
         }
       }
@@ -11883,7 +11976,7 @@ function App() {
         ? runAgentTeam(teamRoles, taskInstruction, controller.signal, (role, prompt) => {
           const model = teamModels.get(role.id)!
           updateAgentRun(runId, { stage: `${role.label} · ${formatModelDisplayName(model.model.name)}` })
-          return requestText(prompt, planningTimeout, model)
+          return requestText(prompt, model)
         })
         : requestText(taskInstruction)))
       if (controller.signal.aborted) return
@@ -11911,7 +12004,7 @@ function App() {
           const repairInstruction = repairFilm
             ? `${invalidFields.length ? `上一份 filmDraft 的这些字段缺失或格式不符：${invalidFields.map(({ name, label }) => `${name}（${label}）`).join('、')}。` : '上一条回复没有返回界面创建确认卡所需的 filmDraft。'}现在根据已确认的对话生成供审阅的 filmDraft，保留已定的产品外观、故事和镜头。它只会创建确认卡。确实缺少必要信息时才返回具体的 questions，不要编造。上一条回复：${JSON.stringify({ reply: parsed.reply, filmDraft: parsed.filmDraft })}`
             : '上一条回复缺少可用的结构化方案。请检查 JSON 字段与要求后重新返回；如果信息不足，返回 questions，不要编造。'
-          const repaired = parseAgentReply(await requestText(`${taskInstruction}\n\n${repairInstruction}`, 45_000, teamEnabled ? teamModels.get(teamRoles.at(-1)!.id) : selection))
+          const repaired = parseAgentReply(await requestText(`${taskInstruction}\n\n${repairInstruction}`, teamEnabled ? teamModels.get(teamRoles.at(-1)!.id) : selection))
           const next = assess(repaired)
           const usableRepair = repairFilm
             ? next.filmReply?.check || repaired.questions?.length
@@ -12109,6 +12202,7 @@ function App() {
             imageConnectionId,
             imageModelId,
             modelMention,
+            modelLocked: Boolean(modelMention),
             assistantMessageId: assistantMessage.id,
             createdAt,
           }
@@ -12154,6 +12248,7 @@ function App() {
             videoConnectionId,
             videoModelId,
             modelMention,
+            modelLocked: Boolean(modelMention),
             assistantMessageId: assistantMessage.id,
             createdAt,
           }))
@@ -12213,7 +12308,7 @@ function App() {
   }
 
   const optimizeAgentPrompt = async (prompt: string) => {
-    const selection = enabledTextModels.find(({ connection, model }) => `${connection.id}::${model.id}` === agentTextModelKey)
+    const selection = preferredOptimizeModel ?? enabledTextModels.find(({ connection, model }) => `${connection.id}::${model.id}` === agentTextModelKey)
     if (!selection) throw new Error('请先选择对话模型')
     const { connection, model } = selection
     const result = await generateRemoteText(
@@ -12246,7 +12341,7 @@ function App() {
     const analysis = await generateRemoteText(
       { baseUrl: connection.baseUrl, apiKey: connection.apiKey, authMode: connection.authMode, model: model.id },
       buildAgentWebAnalysisPrompt(url, page),
-      { signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) },
+      { signal },
     )
     return { ...parseAgentWebAnalysis(analysis, url, page.title), pasted: Boolean(pastedText) }
   }
@@ -19644,6 +19739,7 @@ function App() {
           </motion.div>
         )}
       </AnimatePresence>
+      {textModelRecoveries[0] && <TextModelRecoveryDialog key={textModelRecoveries[0].id} recovery={textModelRecoveries[0]} />}
       {projectDialogNode}
     </div>
   )
