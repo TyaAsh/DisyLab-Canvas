@@ -7,11 +7,11 @@
  * SPDX-FileCopyrightText: 2026 DisyLab
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
-import { normalizeAgentProjectSettings, type AgentProjectSettings } from './agentProject'
+import { withoutLegacyAgentSettings } from './agentProject'
 import type { FilmCheckpoint } from './skills/filmProduction'
 
 const DATABASE_NAME = 'disy-infinite-local'
-const DATABASE_VERSION = 5
+const DATABASE_VERSION = 7
 const LEGACY_PROJECT_STORE = 'projects'
 const ASSET_STORE = 'assets'
 const WORKSPACE_PROJECT_STORE = 'workspace-projects'
@@ -64,7 +64,6 @@ export type WorkspaceProject = {
   canvasIds: string[]
   createdAt: string
   updatedAt: string
-  agentSettings?: AgentProjectSettings
 }
 
 export type WorkspaceCanvas = Omit<LocalProject, 'id'> & {
@@ -196,6 +195,7 @@ export function makeUniqueWorkspaceName(requestedName: string, existingNames: It
 }
 
 function normalizeWorkspaceSnapshotNames(snapshot: WorkspaceSnapshot) {
+  snapshot.projects = snapshot.projects.map(withoutLegacyAgentSettings)
   const projectNames: string[] = []
   snapshot.projects.forEach((project) => {
     project.name = makeUniqueWorkspaceName(typeof project.name === 'string' ? project.name : '', projectNames, '未命名项目')
@@ -264,6 +264,26 @@ function openDatabase() {
       }
       if (!database.objectStoreNames.contains(IMPORT_BACKUP_STORE)) {
         database.createObjectStore(IMPORT_BACKUP_STORE, { keyPath: 'id' })
+      }
+      // Remove retired Agent configuration from projects and import backups.
+      if (event.oldVersion < 7) {
+        const cursor = projects.openCursor()
+        cursor.onsuccess = () => {
+          const entry = cursor.result
+          if (!entry) return
+          const project = entry.value as WorkspaceProject
+          entry.update(withoutLegacyAgentSettings(project))
+          entry.continue()
+        }
+        const backups = transaction!.objectStore(IMPORT_BACKUP_STORE).openCursor()
+        backups.onsuccess = () => {
+          const entry = backups.result
+          if (!entry) return
+          const backup = entry.value as WorkspaceImportBackup
+          if (backup.snapshot?.projects) backup.snapshot.projects = backup.snapshot.projects.map(withoutLegacyAgentSettings)
+          entry.update(backup)
+          entry.continue()
+        }
       }
 
       // v2 and older stored one canvas as one "project". Copy it during the
@@ -379,29 +399,8 @@ export async function loadWorkspaceProject(id: string) {
 
 export async function saveWorkspaceProject(project: WorkspaceProject) {
   await runTransaction<void>([WORKSPACE_PROJECT_STORE], 'readwrite', (transaction) => {
-    const store = transaction.objectStore(WORKSPACE_PROJECT_STORE)
-    const request = store.get(project.id)
-    request.onsuccess = () => {
-      const current = request.result as WorkspaceProject | undefined
-      store.put({ ...project, agentSettings: current?.agentSettings ?? project.agentSettings })
-    }
+    transaction.objectStore(WORKSPACE_PROJECT_STORE).put(withoutLegacyAgentSettings(project))
   })
-}
-
-export async function updateProjectAgentSettings(projectId: string, update: (current: AgentProjectSettings) => AgentProjectSettings) {
-  let saved: AgentProjectSettings | undefined
-  await runTransaction<void>([WORKSPACE_PROJECT_STORE], 'readwrite', (transaction) => {
-    const store = transaction.objectStore(WORKSPACE_PROJECT_STORE)
-    const request = store.get(projectId)
-    request.onsuccess = () => {
-      const project = request.result as WorkspaceProject | undefined
-      if (!project) return
-      saved = normalizeAgentProjectSettings(update(normalizeAgentProjectSettings(project.agentSettings)))
-      store.put({ ...project, agentSettings: saved })
-    }
-  })
-  if (!saved) throw new Error('项目已不存在')
-  return saved
 }
 
 export async function renameWorkspaceProject(projectId: string, name: string) {

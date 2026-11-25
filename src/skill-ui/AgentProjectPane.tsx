@@ -1,11 +1,8 @@
 import { useState } from 'react'
-import { ArrowUpRight, Brain, CircleCheck, Cpu, ListTodo, LoaderCircle, Pencil, Plus, Square, Tag, Trash2, UsersRound } from 'lucide-react'
-import { activeAgentTeamRoles, agentTaskIsActive, agentTeamTemplates, getAgentTeamTemplate, memoryKinds, PROJECT_MEMORY_LENGTH, PROJECT_MEMORY_LIMIT, type AgentProjectSettings, type AgentTask, type AgentTeamConfig, type ProjectMemoryKind } from '../agentProject'
-import type { AgentModelOption } from '../AgentPanel'
-import { AgentSelect, getModelBrand } from './AgentSelect'
+import { ArrowUpRight, ListTodo, LoaderCircle, Square } from 'lucide-react'
+import { agentTaskIsActive, type AgentTask } from '../agentProject'
 
-export type AgentProjectView = 'memory' | 'tasks' | 'team' | 'guide'
-type SaveSettings = (update: (settings: AgentProjectSettings) => AgentProjectSettings) => Promise<void>
+export type AgentProjectView = 'tasks' | 'guide'
 const taskStatusLabels = { waiting: '待确认', running: '进行中', completed: '已完成', failed: '失败', cancelled: '已停止' }
 
 export function AgentTasks({ tasks, onOpen, onStop }: { tasks: AgentTask[]; onOpen: (task: AgentTask) => Promise<boolean>; onStop: (id: string) => void }) {
@@ -35,108 +32,38 @@ export function AgentTasks({ tasks, onOpen, onStop }: { tasks: AgentTask[]; onOp
   </section>
 }
 
-export function AgentMemory({ settings, save, seed }: { settings: AgentProjectSettings; save: SaveSettings; seed?: string }) {
-  const [editing, setEditing] = useState<string | null>(seed ? 'new' : null)
-  const [kind, setKind] = useState<ProjectMemoryKind>('fact')
-  const [value, setValue] = useState(seed ?? '')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const start = (id = 'new', type: ProjectMemoryKind = 'fact', text = '') => {
-    setEditing(id); setKind(type); setValue(text); setError('')
-  }
-  const commit = async (update: Parameters<SaveSettings>[0], close = false) => {
-    setBusy(true); setError('')
-    try { await save(update); if (close) setEditing(null) }
-    catch { setError('项目记忆保存失败，请重试。') }
-    finally { setBusy(false) }
-  }
-  const full = settings.memory.length >= PROJECT_MEMORY_LIMIT
-  return <section className="agent-project-pane" aria-label="项目记忆">
-    <div className="agent-project-tools"><span>{settings.memory.length} 条记忆</span><button type="button" disabled={busy || full} onClick={() => start()}><Plus size={15} aria-hidden="true" />添加记忆</button></div>
-    <p className="agent-project-copy">保存的内容会供这个项目里的后续对话参考。</p>
-    {editing && <form className="agent-project-form" onSubmit={(event) => {
-      event.preventDefault()
-      const text = value.trim()
-      if (!text || busy || (editing === 'new' && full)) return
-      const entry = { id: editing === 'new' ? crypto.randomUUID() : editing, kind, text }
-      void commit((current) => ({ ...current, memory: editing === 'new' ? [entry, ...current.memory] : current.memory.map((item) => item.id === entry.id ? entry : item) }), true)
-    }}>
-      <div className="agent-project-field"><span>类型</span><AgentSelect variant="floating" ariaLabel="记忆类型" value={kind} disabled={busy} placeholder="选择记忆类型" icon={<Tag size={14} />}
-        options={Object.entries(memoryKinds).map(([value, label]) => ({ value, label }))} onChange={(value) => setKind(value as ProjectMemoryKind)} /></div>
-      <label>记忆内容<textarea autoFocus value={value} maxLength={PROJECT_MEMORY_LENGTH} rows={3} disabled={busy} onChange={(event) => setValue(event.target.value)} /></label>
-      <footer><button type="button" disabled={busy} onClick={() => setEditing(null)}>取消</button><button type="submit" className="is-primary" disabled={busy || !value.trim() || (editing === 'new' && full)}>保存记忆</button></footer>
-    </form>}
-    {error && <p className="agent-plan-error" role="alert">{error}</p>}
-    {!settings.memory.length && !editing && <div className="agent-project-empty"><Brain size={24} aria-hidden="true" /><strong>还没有项目记忆</strong><span>可保存已经确认的事实、偏好、约束或决定。</span></div>}
-    <div className="agent-project-list">{settings.memory.map((item) => <article className="agent-project-card" key={item.id}>
-      <div className="agent-project-card-heading"><span>{memoryKinds[item.kind]}</span><div>
-        <button type="button" disabled={busy} aria-label={`编辑记忆 ${item.text.slice(0, 20)}`} onClick={() => start(item.id, item.kind, item.text)}><Pencil size={14} /></button>
-        <button type="button" disabled={busy} aria-label={`删除记忆 ${item.text.slice(0, 20)}`} onClick={() => {
-          if (editing === item.id) setEditing(null)
-          void commit((current) => ({ ...current, memory: current.memory.filter(({ id }) => id !== item.id) }))
-        }}><Trash2 size={14} /></button>
-      </div></div><p>{item.text}</p>
-    </article>)}</div>
-  </section>
-}
-
-export function AgentTeam({ settings, save, models, enabled, onEnabled }: { settings: AgentProjectSettings; save: SaveSettings; models: AgentModelOption[]; enabled: boolean; onEnabled: (value: boolean) => void }) {
-  const [team, setTeam] = useState<AgentTeamConfig>(settings.team)
-  const [saving, setSaving] = useState(false)
-  const [notice, setNotice] = useState('')
-  const template = getAgentTeamTemplate(team.template)
-  const active = activeAgentTeamRoles(team)
-  const changed = team.template !== settings.team.template || agentTeamTemplates.some(({ roles }) => roles.some(({ id }) => (
-    (team.models[id] || '') !== (settings.team.models[id] || '') || team.disabled.includes(id) !== settings.team.disabled.includes(id)
-  )))
-  const unavailable = active.some(({ id }) => team.models[id] && !models.some(({ key }) => key === team.models[id]))
-  return <section className="agent-project-pane" aria-label="团队协作">
-    <div className="agent-project-tools"><span><UsersRound size={16} aria-hidden="true" />{active.length} 个角色</span><label className="agent-team-toggle"><input type="checkbox" checked={enabled} disabled={changed || saving || unavailable} onChange={(event) => onEnabled(event.target.checked)} />在此对话启用</label></div>
-    <p className="agent-project-copy">角色按顺序交接，通常每个角色调用一次模型，按实际调用计费。</p>
-    <form className="agent-project-form" onSubmit={async (event) => {
-      event.preventDefault()
-      if (!changed || unavailable) return
-      setSaving(true); setNotice('')
-      try { await save((current) => ({ ...current, team })); setNotice('团队配置已保存') }
-      catch { setNotice('团队配置保存失败，请重试。') }
-      finally { setSaving(false) }
-    }}>
-      <div className="agent-project-field"><span>团队模板</span><AgentSelect variant="floating" ariaLabel="团队模板" value={team.template} disabled={saving} placeholder="选择团队模板" icon={<UsersRound size={14} />}
-        options={agentTeamTemplates.map(({ id, label, use }) => ({ value: id, label, detail: use }))}
-        onChange={(value) => { setNotice(''); setTeam((current) => ({ ...current, template: value as AgentTeamConfig['template'] })) }} /></div>
-      <p className="agent-project-copy">{template.use}</p>
-      {template.roles.map(({ id, label, action }, index) => {
-        const participating = active.some((role) => role.id === id)
-        const final = index === template.roles.length - 1
-        return <div className="agent-team-role" key={id}>
-        <label className="agent-team-toggle"><input type="checkbox" checked={participating} disabled={saving || final || (participating && active.length <= 2)}
-          aria-label={`启用${label}`} onChange={(event) => {
-            const checked = event.target.checked
-            setNotice('')
-            setTeam((current) => ({ ...current, disabled: checked ? current.disabled.filter((role) => role !== id) : [...current.disabled, id] }))
-          }} /><strong>{label}</strong>{final && <small>负责交付</small>}</label><small>{action}</small>
-        <AgentSelect variant="floating" ariaLabel={`${label}模型`} disabled={saving || !participating} value={team.models[id] || ''} placeholder="选择模型" icon={<Cpu size={14} />}
-          options={[{ value: '', label: '跟随当前对话模型' },
-            ...(team.models[id] && !models.some(({ key }) => key === team.models[id]) ? [{ value: team.models[id], label: '原模型已不可用' }] : []),
-            ...models.map(({ key, name, connectionName }) => ({ value: key, label: name, detail: connectionName, brand: getModelBrand(name) }))]}
-          onChange={(key) => { setNotice(''); setTeam((current) => ({ ...current, models: { ...current.models, [id]: key } })) }} />
-        </div>
-      })}
-      <footer><button type="submit" className="is-primary" disabled={saving || !changed || unavailable}><CircleCheck size={15} aria-hidden="true" />保存团队配置</button></footer>
-    </form>
-    {notice && <p className="agent-project-copy" role="status">{notice}</p>}
-  </section>
-}
-
-export function AgentProjectGuide({ open }: { open: (view: AgentProjectView) => void }) {
+export function AgentProjectGuide({ open, onExample }: { open: (view: AgentProjectView) => void; onExample?: (text: string) => void }) {
   const sections = [
-    { view: 'memory', icon: Brain, title: '项目记忆', text: '添加品牌口吻、画幅或已定方向。也可点自己消息旁的记忆图标，核对后保存。同项目的新对话会参考这些内容。' },
-    { view: 'tasks', icon: ListTodo, title: '任务中心', text: '在「进行中」找正在运行或待确认的任务，切到「全部」查看记录。点「查看对话」回到原画布和对话。' },
-    { view: 'team', icon: UsersRound, title: '团队协作', text: '按任务选设计、制片或文案模板，选择参与角色和模型后保存。在当前对话开启，再像平时一样发消息。最后由你确认方案。' },
+    { view: 'tasks', title: '任务中心', text: '在「进行中」找正在运行或待确认的任务，切到「全部」查看记录。点「查看对话」回到原画布和对话。' },
   ] as const
   return <section className="agent-project-pane" aria-label="使用指南">
-    {sections.map(({ view, icon: Icon, title, text }) => <article className="agent-project-card agent-guide-card" key={view}>
-      <strong><Icon size={16} aria-hidden="true" />{title}</strong><p>{text}</p>
+    <article className="agent-project-card agent-guide-card"><strong>从一句话开始</strong>
+      <p>没想法也可以说目标，例如「我想做咖啡广告，但不知道什么风格」。Agent 会给不同的创意方向和推荐理由。</p>
+      <p>方向卡的「按这个生成」直接开始制作，「继续细化」只讨论。也可以自由回复，或说「你帮我决定」。</p>
+      {onExample && <footer><button type="button" onClick={() => onExample('帮我想三个咖啡广告的视觉方向，推荐一个，先不要生成。')}>试试找方向<ArrowUpRight size={14}/></button></footer>}
+    </article>
+    <article className="agent-project-card agent-guide-card"><strong>三个创作入口</strong>
+      <p>Agent：构思、讨论、制作。点输入框左上角的工作方式图标，可切换智能、协作或直接生成；悬停可查看当前方式。</p>
+      <dl className="agent-guide-modes"><div><dt>智能 · 默认</dt><dd>需求明确就制作，方向模糊先给建议。</dd></div><div><dt>协作</dt><dd>先完善方案，你点头后再生成。</dd></div><div><dt>直接生成</dt><dd>补齐技术参数后制作，关键歧义才追问。</dd></div></dl>
+      <p>图像、视频：选择对应模型和参数后发送，默认直接制作，不再另选工作方式。你随时可以说「先给方案，先不要生成」。</p>
+    </article>
+    <article className="agent-project-card agent-guide-card"><strong>想清楚了，就直接告诉我</strong>
+      <p>可以说明主体、效果和用途。比例、时长等有要求就写，没写的由 Agent 按用途和可用模型补齐。</p>
+      <p>例如「做一张暖色咖啡海报，竖版，不要文字，直接生成」。复杂成片、多项交付或规格冲突时，仍会保留方案供你审阅。</p>
+      {onExample && <footer><button type="button" onClick={() => onExample('做一张暖色咖啡海报，竖版9:16，不要文字，生成1张。')}>填入示例，不会自动发送<ArrowUpRight size={14}/></button></footer>}
+    </article>
+    <article className="agent-project-card agent-guide-card"><strong>带上参考素材</strong>
+      <p>点输入框的「＋」上传图片或视频，也可以输入 @ 引用画布内容。说清楚素材用途，例如「保留图1的杯子，参考视频2的运镜」。</p>
+      <p>图像、视频模式优先使用你选择的模型和参数；没有可用模型会显示「配置模型」。模型不支持要求时会说明具体限制，请你选择如何调整。</p>
+      <p>视频有三种方式：「参考图/视频」可用文字或参考素材生成新片；「视频编辑」修改 1 段原视频，图片仅作辅助参考；「首尾帧」使用 2 张图片作为开头和结尾。素材不足或模型未接通时，发送按钮会说明原因。</p>
+      <p>视频参考图会居中适配目标画幅，超出裁切、不足补边。需要保留整张图时，直接说「保留完整画面，不要裁剪」，会自动只补边；发送副本可在输出历史核对。</p>
+    </article>
+    <article className="agent-project-card agent-guide-card"><strong>修改、撤回与查看结果</strong>
+      <p>鼠标悬停在自己发出的消息上，可复制或编辑。编辑后从该处继续，原对话与已生成素材仍保留。</p>
+      <p>「优化」用于整理提示词，完成后可「撤回」恢复原稿。生成成功和失败都可在输出历史查看，错误会显示实际原因。</p>
+    </article>
+    {sections.map(({ view, title, text }) => <article className="agent-project-card agent-guide-card" key={view}>
+      <strong>{title}</strong><p>{text}</p>
       <footer><button type="button" onClick={() => open(view)}>打开{title}<ArrowUpRight size={14} aria-hidden="true" /></button></footer>
     </article>)}
   </section>

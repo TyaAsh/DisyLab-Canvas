@@ -12,9 +12,8 @@ import { HFSY_UPLOAD_IMAGE_TYPES, imageMimeFromBytes, videoMimeFromBytes, type M
 import { isDesktopApp, providerFetch, withProviderDeadline } from './providerTransport'
 import type { ApiAuthMode, ModelCapability } from './store'
 import { classifyProviderPayload, extractProviderImages, extractProviderTaskId, extractProviderTaskStatus, providerTaskPollPaths } from './providerLifecycle'
-import { parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
+import { isRemovedModel, isRemovedProvider, parseHfsyMarketplaceCatalog, parseRemoteModelCatalog } from './modelCatalog'
 import { apiProviderForBase } from './apiProviders'
-import { checkMuseWebAccount, isMuseWebBase, listMuseWebModels, runMuseWebTask } from './museWeb'
 import { checkJimengAccount, isJimengCliBase, jimengImageRatios, jimengImageResolutions, listJimengModels, parseJimengJson, readJimengMedia, runJimengCli } from './jimengCli'
 
 export { inferModelCapability } from './modelCatalog'
@@ -24,6 +23,11 @@ export type ApiRequestSettings = {
   apiKey: string
   model: string
   authMode?: ApiAuthMode
+}
+
+function assertAvailableModel(settings: Pick<ApiRequestSettings, 'model' | 'baseUrl'>) {
+  if (isRemovedProvider(settings)) throw new GenerationRequestError('platform', '此厂商已移除', '请选择其他连接。本次请求尚未提交。')
+  if (isRemovedModel({ id: settings.model })) throw new GenerationRequestError('platform', '此模型已移除', '请选择其他模型。本次请求尚未提交。')
 }
 
 export type RemoteModel = {
@@ -57,7 +61,7 @@ export type VideoGenerationOptions = {
   size: string
   resolution?: '480p' | '720p' | '768p' | '1080p' | '2k' | '4k'
   aspectRatio?: string
-  mode?: 'text2video' | 'image2video' | 'first_last_frame' | 'image_reference' | 'all_reference'
+  mode?: 'text2video' | 'image2video' | 'first_last_frame' | 'image_reference' | 'all_reference' | 'video_edit'
   referenceImage?: string
   referenceImages?: string[]
   firstFrame?: string
@@ -124,16 +128,13 @@ const REFERENCE_IMAGE_REQUEST_MAX_DIMENSION = 1024
 const REFERENCE_IMAGE_READ_TIMEOUT_MS = 45_000
 const REFERENCE_IMAGE_READ_ATTEMPTS = 2
 const GRSAI_IMAGE_POLL_INTERVAL_MS = 2_500
-const GRSAI_IMAGE_POLL_TIMEOUT_MS = 15 * 60_000
 const GRSAI_MAX_CONSECUTIVE_POLL_ERRORS = 24
 const GRSAI_MEDIA_HOST = /^file[1-9]\d?\.aitohumanize\.com$/i
 const HFSY_MEDIA_HOST = 'file.hfsyapi.cn'
 const VISIONARY_POLL_INTERVAL_MS = 3_000
-const VISIONARY_POLL_TIMEOUT_MS = 15 * 60_000
 const VISIONARY_MAX_CONSECUTIVE_POLL_ERRORS = 5
 const VISIONARY_SUCCESS_WITHOUT_URL_RETRIES = 20
 const GENERIC_PROVIDER_POLL_INTERVAL_MS = 3_000
-const GENERIC_PROVIDER_POLL_TIMEOUT_MS = 15 * 60_000
 const GENERIC_PROVIDER_MAX_CONSECUTIVE_POLL_ERRORS = 5
 const GENERIC_PROVIDER_SUCCESS_WITHOUT_URL_RETRIES = 20
 
@@ -144,21 +145,6 @@ function blobToDataUrl(blob: Blob) {
     reader.onerror = () => reject(reader.error ?? new Error('参考图片读取失败'))
     reader.readAsDataURL(blob)
   })
-}
-
-async function museWebReferences(sources: (string | undefined)[], signal?: AbortSignal) {
-  const distinct = [...new Set(sources.filter((source): source is string => Boolean(source)))]
-  if (distinct.length > 8) throw new Error('Muse 网页连接最多支持 8 张参考图。')
-  let totalBytes = 0
-  const references: string[] = []
-  for (const source of distinct) {
-    const blob = await readImageSourceBlob(source, signal)
-    totalBytes += blob.size
-    if (totalBytes > 24_000_000) throw new Error('Muse 参考图超过 24 MB，请缩小后重试。')
-    if (!/^image\/(?:png|jpeg|webp|gif)$/.test(blob.type)) throw new Error('Muse 参考图请使用 PNG、JPEG、WebP 或 GIF。')
-    references.push(await blobToDataUrl(blob))
-  }
-  return references
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
@@ -362,7 +348,7 @@ function sanitizeAdminLogValue(value: unknown, depth = 0): unknown {
   if (!value || typeof value !== 'object') return value
   const output: Record<string, unknown> = {}
   for (const [key, child] of Object.entries(value as Record<string, unknown>).slice(0, 80)) {
-    output[key] = sanitizeAdminLogValue(child, depth + 1)
+    output[key] = /^(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password)$/i.test(key) ? '[已隐藏]' : sanitizeAdminLogValue(child, depth + 1)
   }
   return output
 }
@@ -452,7 +438,7 @@ function endpoint(baseUrl: string, path: string) {
   url.pathname = pathname.startsWith('/') ? pathname : `${url.pathname.replace(/\/$/, '')}/${pathname}`
   if (query) url.search = query
   const provider = apiProviderForBase(url.href)
-  if (typeof window !== 'undefined' && !isDesktopApp() && provider && (['relayon', 'minimax', 'xai', 'ark', 'muse'].includes(provider.id)
+  if (typeof window !== 'undefined' && !isDesktopApp() && provider && (['relayon', 'minimax', 'xai', 'ark'].includes(provider.id)
     || provider.id === 'apimart' && /^(?:videos\/generations|uploads\/(?:images|videos)|tasks\/)/.test(path))
     && url.origin === new URL(provider.baseUrl).origin) return `/provider/${provider.id}${url.pathname}${url.search}`
   return url.toString()
@@ -551,6 +537,7 @@ export function getGrsaiImageCapabilities(baseUrl: string, modelId: string) {
 
 // Pixel sizes in HFSY's native image/create tables, indexed by resolution.
 const HFSY_IMAGE_SIZES: Record<string, readonly [string, string, string]> = {
+  '9:21': ['576x1344', '864x2016', '1584x3696'],
   '1:1': ['1024x1024', '2048x2048', '2880x2880'],
   '5:4': ['1040x832', '2080x1664', '3200x2560'],
   '9:16': ['720x1280', '1152x2048', '2160x3840'],
@@ -582,10 +569,10 @@ export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
   const resolutions: readonly ImageResolution[] = standard || seedream ? ['1K'] : seedream55 ? ['2K'] : midjourney ? []
     : pro ? (model.endsWith('-4k') ? ['2K', '4K'] : ['2K']) : ['1K', '2K', '4K']
   const ratios = seedream ? Object.keys(HFSY_SEEDREAM_SIZES)
-    : seedream55 ? ['1:1', '3:2', '9:16', '16:9', '4:3', '4:5', '2:3'] : transparent
+    : seedream55 ? ['1:1', '3:2', '2:3', '9:16', '16:9', '4:3', '3:4', '4:5', '5:4', '21:9', '9:21'] : transparent
     ? ['1:1', '5:4', '9:16', '16:9', '4:3', '3:1', '3:2', '3:4']
     : Object.keys(HFSY_IMAGE_SIZES).filter((ratio) => ratio !== '3:1')
-  const outputs: readonly ImageOutput[] = transparent ? ['png', 'transparent-png'] : ['png']
+  const outputs: readonly ImageOutput[] = transparent || seedream55 ? ['png', 'transparent-png'] : ['png']
   const images = transparent ? 16 : standard || seedream55 ? 6 : seedream ? 10
     : /^(?:nano-banana-pro|gemini-3-pro-image-preview|mj_)/.test(model) ? 7 : 4
   return { ratios, resolutions, outputs, images, qualities: [] as readonly ImageQuality[], customRatio: midjourney }
@@ -615,6 +602,8 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
     const flexible = premium || openAiFlexibleImage.test(model)
     return {
       ...common, customRatio: flexible,
+      outputs: (premium || openAiFlexibleImage.test(model) || /^gpt-image-1(?:[.-]|$)|^chatgpt-image-latest$/i.test(model)
+        ? ['png', 'transparent-png', ...(/^gpt-image-2\.6(?:-|$)/i.test(model) ? ['gif'] : [])] : ['png']) as readonly ImageOutput[],
       ratios: flexible ? ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9', '3:1'] : ['auto', '1:1', '3:2', '2:3'],
       resolutions: (flexible ? ['1K', '2K', '4K'] : ['1K']) as readonly ImageResolution[],
       images: 16,
@@ -635,15 +624,12 @@ export function getImageModelCapabilities(baseUrl: string, model: string) {
     }
   }
   if (provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(model)) return {
-    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '4:5', '5:4', '21:9'],
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '4:5', '5:4', '21:9', ...(/nano-banana-2\.1|3\.1-flash/i.test(model) ? ['1:4','4:1','1:8','8:1'] : [])],
     resolutions: ['1K', '2K', '4K'] as readonly ImageResolution[], images: 14, qualities: [] as readonly ImageQuality[],
   }
-  if (provider === 'muse') return {
-    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
-    resolutions: [] as readonly ImageResolution[], images: 4, qualities: [] as readonly ImageQuality[],
-  }
   if (provider === 'ark') return {
-    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9', ...(arkSeedreamFlexibleSize.test(model) ? ['auto'] : [])],
+    ...common, ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '4:5', '5:4', '21:9', '9:21', ...(arkSeedreamFlexibleSize.test(model) ? ['auto'] : [])],
+    outputs: (arkSeedreamFlexibleSize.test(model) ? ['png','transparent-png'] : ['png']) as readonly ImageOutput[],
     resolutions: (arkSeedreamFlexibleSize.test(model) ? ['2K', '1.5K', '1K'] : /5[-.]0[-.]pro/.test(model) ? ['1K', '2K'] : /5[-.]0/.test(model) ? ['2K'] : ['2K', '4K']) as readonly ImageResolution[],
     images: /(?:4[-.]0|5[-.]5|5[-.]0[-.](?:pro|flash))/.test(model) ? 10 : 14, qualities: [] as readonly ImageQuality[],
   }
@@ -864,9 +850,8 @@ async function generateJimengMedia(kind: 'image' | 'video', input: NonNullable<P
   const taskId = String(result?.submit_id ?? (result?.data as Record<string, unknown> | undefined)?.submit_id ?? '')
   if (!/^[\w-]{1,256}$/.test(taskId)) throw new GenerationRequestError('api', '即梦没有返回任务编号', '请先在即梦任务记录确认是否已提交。')
   options.onTaskId?.(taskId)
-  const started = Date.now()
   let failures = 0
-  while (Date.now() - started < 30 * 60_000) {
+  while (true) {
     options.signal?.throwIfAborted()
     const task = (result?.data ?? result) as Record<string, unknown> | undefined
     const status = String(task?.gen_status ?? task?.status ?? '').toLowerCase()
@@ -895,7 +880,6 @@ async function generateJimengMedia(kind: 'image' | 'video', input: NonNullable<P
       if (++failures >= 3) throw new GenerationRequestError('network', '即梦任务查询暂时中断', '任务可能仍在运行，请在即梦任务记录查询。', { requestId: taskId })
     }
   }
-  throw new GenerationRequestError('network', '即梦等待超时', '任务可能仍在运行，请在即梦任务记录查询。', { requestId: taskId })
 }
 
 function nativeVideoTaskPath(provider: string, id: string, h3: boolean) {
@@ -999,9 +983,8 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
   options.onTaskId?.(taskId)
   const id = encodeURIComponent(taskId)
   const pollPath = nativeVideoTaskPath(provider, id, h3)
-  const started = Date.now()
   let failures = 0
-  while (Date.now() - started < 30 * 60_000) {
+  while (true) {
     const task = unwrap(result)
     const status = videoTaskStatus(task)
     if (/^(?:fail(?:ed|ure)?|error|expired|cancell?ed|rejected)$/.test(status)) {
@@ -1035,7 +1018,6 @@ async function generateNativeProviderVideo(provider: 'ark' | 'xai' | 'minimax', 
       if (++failures >= 3) throw new GenerationRequestError('network', '视频任务查询暂时中断', '任务可能仍在生成，请在厂商控制台查询。', { requestId: taskId })
     }
   }
-  throw new GenerationRequestError('network', '视频生成等待超时', '任务可能仍在生成，请在厂商控制台查询。', { requestId: taskId })
 }
 
 async function waitForReplicatedVideoUrl(taskUrl: string, headers: HeadersInit, initialPayload: unknown, signal?: AbortSignal) {
@@ -1158,11 +1140,11 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
   }
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
+  { const failure = providerPayloadFailure(created, response); if (failure) throw failure }
   const taskId = extractTaskId(created)
   if (!taskId) throw new GenerationRequestError('platform', 'Seedance 没有返回任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
   options.onProgress?.(1, 'queued')
-  const startedAt = Date.now()
   let status = videoTaskStatus(created, 'queued')
   let job: Record<string, unknown> = created
   while (true) {
@@ -1183,7 +1165,6 @@ async function generateApiYiSeedanceVideo(settings: ApiRequestSettings, options:
       options.onProgress?.(100, 'completed')
       return { blob, taskId, progress: 100, sourceUrl: videoUrl }
     }
-    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Seedance 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`)
     await waitForDelay(20_000, options.signal)
     let poll: Response
     try {
@@ -1206,7 +1187,10 @@ function validGeneratedVideoType(contentType: string) {
 }
 
 async function readCompleteVideoResponse(response: Response) {
-  if (!response.ok) throw await createApiError(response)
+  if (!response.ok) {
+    const error = await createApiError(response)
+    throw new GenerationRequestError('network', '视频下载服务器拒绝请求或暂时不可用', error.detail, { status: response.status, code: error.code, requestId: error.requestId })
+  }
   let expectedBytes: number | undefined
   if (response.status === 206) {
     const range = /^bytes 0-(\d+)\/(\d+)$/i.exec(response.headers.get('content-range') ?? '')
@@ -1246,14 +1230,19 @@ export async function downloadGeneratedVideoBlob(sourceUrl: string, options: { s
         }, options.signal, options.attemptTimeoutMs ?? 30_000)
       } catch (error) {
         if (options.signal?.aborted || error instanceof DOMException && error.name === 'AbortError') throw error
-        failures.push(error instanceof Error && /^(?:partial-video|invalid-body|empty|text\/|image\/|audio\/|application\/)/i.test(error.message)
-          ? error.message : error instanceof Error ? error.name : 'network')
+        const detail = error instanceof GenerationRequestError
+          ? [error.status && `HTTP ${error.status}`, error.message, error.detail].filter(Boolean).join(' · ')
+          : error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+        const path = candidate.url === sourceUrl ? '直连' : '下载转发'
+        failures.push(`${path}：${detail.replace(/https?:\/\/[^\s"<>]+/gi, value => {
+          try { return new URL(value).origin } catch { return '[媒体地址]' }
+        })}`)
       }
     }
     if (round < 2) await waitForDelay(round ? 1_800 : 700, options.signal)
   }
   const host = (() => { try { return new URL(sourceUrl).hostname } catch { return 'unknown-host' } })()
-  throw new GenerationRequestError('network', '视频已生成但本地归档失败', `媒体主机 ${host} 在多路径下载后仍不可读（${Array.from(new Set(failures)).join('、') || '无响应'}）。任务结果地址已保留，可稍后恢复。`, { resultUrls: [sourceUrl] })
+  throw new GenerationRequestError('network', '视频已生成但下载失败', `媒体主机：${host}\n${Array.from(new Set(failures)).join('\n') || '媒体服务器无响应'}\n原任务和结果地址已保留，继续取回不会重新生成。`, { resultUrls: [sourceUrl] })
 }
 
 function videoResolutionFromSize(size: string) {
@@ -1315,13 +1304,12 @@ async function generateApiYiVeoVideo(settings: ApiRequestSettings, options: Vide
   })
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
+  { const failure = providerPayloadFailure(created, response); if (failure) throw failure }
   const taskId = extractTaskId(created)
   if (!taskId) throw new GenerationRequestError('platform', 'Veo 没有返回任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
   let status = videoTaskStatus(created)
-  const startedAt = Date.now()
   while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
-    if (Date.now() - startedAt > 10 * 60_000) throw new GenerationRequestError('network', 'Veo 视频生成等待超时', `任务 ${taskId} 超过 10 分钟仍未完成`, { requestId: taskId })
     await waitForDelay(8_000, options.signal)
     const poll = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/veo', `/v1/videos/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (!poll.ok) throw await createApiError(poll)
@@ -1397,13 +1385,12 @@ async function generateApiYiWanVideo(settings: ApiRequestSettings, options: Vide
   })
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
+  { const failure = providerPayloadFailure(created, response); if (failure) throw failure }
   const taskId = extractTaskId(created)
   if (!taskId) throw new GenerationRequestError('platform', 'Wan 没有返回任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
-  const startedAt = Date.now()
   let status = 'submitted'
   while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
-    if (Date.now() - startedAt > 15 * 60_000) throw new GenerationRequestError('network', 'Wan 视频生成等待超时', `任务 ${taskId} 超过 15 分钟仍未完成`, { requestId: taskId })
     await waitForDelay(8_000, options.signal)
     const poll = await providerFetch(apiYiVideoEndpoint(settings, '/apiyi/wan', `/v1/tasks/${encodeURIComponent(taskId)}`), { signal: options.signal, headers: apiYiVideoHeaders(settings, { Authorization: `Bearer ${settings.apiKey}` }) })
     if (!poll.ok) throw await createApiError(poll)
@@ -1443,7 +1430,7 @@ async function readError(response: Response) {
       ...errors.map((item) => typeof item === 'string' ? item : item && typeof item === 'object' ? ((item as Record<string, unknown>).message ?? (item as Record<string, unknown>).detail) : undefined),
     ]
     const message = candidates.find((value): value is string => typeof value === 'string' && value.trim().length > 0)
-    return message?.trim().slice(0, 4_000) || text.slice(0, 4_000)
+    return message ? `${message.trim()}\n原始响应：${text.slice(0, 6000)}` : text.slice(0, 6000)
   } catch {
     return text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4_000) || `请求失败（${response.status}）`
   }
@@ -1497,7 +1484,9 @@ export function seedanceVideoDefaults(model: string): SeedanceVideoDefaults | un
   }
 }
 
-function apiErrorSummary(status: number) {
+function apiErrorSummary(status: number, detail = '') {
+  if (/insufficient[_ -]?(?:quota|balance|credit|fund)|余额不足|积分不足|额度(?:不足|用尽)|quota[_ -]exceeded|credit.*(?:exhausted|insufficient)|balance.*(?:insufficient|not enough)/i.test(detail)) return '厂商提示余额或可用额度不足'
+  if (status === 402) return '厂商要求付费或充值，请查看具体原因'
   if (status === 400 || status === 422) return '当前模型不接受这组生成参数'
   if (status === 401) return 'API Key 无效或已经过期'
   if (status === 403) return '当前账号没有使用这个模型的权限'
@@ -1524,7 +1513,7 @@ async function createApiError(response: Response) {
       requestId: responseRequestId,
     })
   }
-  return new GenerationRequestError('api', apiErrorSummary(response.status), detail, {
+  return new GenerationRequestError('api', apiErrorSummary(response.status, detail), detail, {
     status: response.status,
     requestId: responseRequestId,
   })
@@ -1535,8 +1524,33 @@ function createNetworkError(error: unknown) {
   return new GenerationRequestError('network', '没有连接到 API 服务，请检查网络、接口地址或跨域设置', detail)
 }
 
+function providerPayloadFailure(payload: unknown, response?: Response): GenerationRequestError | undefined {
+  const find = (value: unknown, depth = 0): unknown => {
+    if (!value || typeof value !== 'object' || depth > 4) return undefined
+    if (Array.isArray(value)) return value.map(item => find(item, depth + 1)).find(Boolean)
+    const record = value as Record<string, unknown>
+    if (record.error || record.success === false || record.ok === false || record.type === 'error'
+      || record.type === 'response.failed' || record.type === 'response.incomplete'
+      || record.status === 'failed' || record.status === 'incomplete' || record.status === 'error') return value
+    for (const key of ['data', 'result', 'response']) {
+      const failure = find(record[key], depth + 1)
+      if (failure) return failure
+    }
+  }
+  const failed = find(payload)
+  if (!failed) return undefined
+  const detail = sanitizeAdminLogJson(failed)
+  const summary = apiErrorSummary(response?.status ?? 200, detail)
+  const requestId = response && ['x-request-id', 'openai-request-id', 'request-id', 'x-correlation-id', 'cf-ray']
+    .map(name => response.headers.get(name)).find(Boolean) || extractTaskId(payload) || undefined
+  return new GenerationRequestError('api', summary === 'API 服务拒绝了这次请求' ? '厂商返回任务失败或不完整的结果' : summary, detail, { status: response?.status, requestId })
+}
+
 export function normalizeGenerationError(error: unknown) {
   if (error instanceof GenerationRequestError) return error
+  if (error instanceof Error && error.name === 'TimeoutError') {
+    return new GenerationRequestError('network', '接口或连接报告超时', error.message)
+  }
   if (error instanceof TypeError && /fetch|network|load|cors/i.test(error.message)) return createNetworkError(error)
   const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
   if (error instanceof Error && /没有返回图片|没有返回图像/.test(error.message)) {
@@ -1613,7 +1627,7 @@ async function fetchHfsyMarketplaceCatalog(settings: Pick<ApiRequestSettings, 'b
 }
 
 export async function fetchRemoteModels(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<RemoteModel[]> {
-  if (isMuseWebBase(settings.baseUrl)) return listMuseWebModels()
+  if (isRemovedProvider(settings)) throw new Error('此厂商已移除，请选择其他连接')
   if (isJimengCliBase(settings.baseUrl)) return listJimengModels()
   const normalizedBase = normalizedApiBaseUrl(settings.baseUrl)
   const signal = AbortSignal.timeout(15_000)
@@ -1763,9 +1777,8 @@ async function generateApiMartVideo(settings: ApiRequestSettings, options: Video
   const taskId = extractTaskId(payload)
   if (!taskId) throw new GenerationRequestError('api', 'APIMart 未返回任务编号', sanitizeAdminLogJson(payload))
   options.onTaskId?.(taskId)
-  const deadline = Date.now() + 30 * 60_000
   let failures = 0
-  while (Date.now() < deadline) {
+  while (true) {
     await waitForDelay(5_000, options.signal)
     let task: ApiMartTask
     try {
@@ -1782,7 +1795,6 @@ async function generateApiMartVideo(settings: ApiRequestSettings, options: Video
       return finishApiMartVideo(task, taskId, options.signal)
     }
   }
-  throw new GenerationRequestError('network', 'APIMart 视频任务查询暂时中断', '任务可能尚在生成，可稍后取回。', { requestId: taskId })
 }
 
 const GEMINI_API_ORIGIN = 'https://generativelanguage.googleapis.com'
@@ -1803,6 +1815,7 @@ function geminiOmniLimits(model: string, mode: string | undefined, seconds: numb
 }
 
 export function videoModeLimits(baseUrl: string, model: string, mode: VideoGenerationOptions['mode'], videoCount = 0) {
+  if (mode === 'video_edit' && !videoEditingCapabilities(baseUrl, model).supported) return { unsupported: videoEditingCapabilities(baseUrl, model).detail }
   const provider = apiProviderForBase(baseUrl)?.id
   if (provider === 'xai' && (mode === 'image_reference' || mode === 'all_reference' && !videoCount)) {
     if (/^grok-imagine-video-1\.5-lite$/i.test(model)) return { unsupported: 'Grok Imagine Video 1.5 Lite 支持文生视频和图生视频' }
@@ -1816,8 +1829,13 @@ export function videoModeLimits(baseUrl: string, model: string, mode: VideoGener
 }
 
 export function videoReferenceSettingsIssue(baseUrl: string, model: string, mode: VideoGenerationOptions['mode'], duration: number, videoCount: number, resolution?: string) {
+  if (mode === 'video_edit') {
+    const editing = videoEditingCapabilities(baseUrl, model)
+    if (!editing.supported) return editing.detail
+    if (videoCount !== 1) return videoCount ? '视频编辑只接受 1 段待编辑原视频，请移除多余视频。' : '请添加 1 段待编辑的原视频。'
+    if (editing.inheritsSource) return undefined
+  }
   const provider = apiProviderForBase(baseUrl)?.id
-  if (provider === 'muse') return 'Meta Muse API 目前提供图像生成，视频生成请选择支持视频的连接'
   if (provider === 'openai' && /^sora-2/i.test(model)) return 'OpenAI Sora 视频 API 已停止服务，请切换模型'
   if (provider === 'gemini' && /^veo-/i.test(model)) return 'Google Gemini API 的 Veo 型号已停止服务，请切换至 Gemini Omni'
   const limits = videoModeLimits(baseUrl, model, mode, videoCount)
@@ -2004,10 +2022,8 @@ async function generateGeminiOmniVideo(settings: ApiRequestSettings, options: Vi
   const taskId = interaction.id
   if (!taskId || !/^[\w.:-]{1,256}$/.test(taskId)) throw new Error('Google 未返回有效的视频任务编号')
   options.onTaskId?.(taskId)
-  const deadline = Date.now() + 30 * 60_000
   let failures = 0
   while (interaction.status === 'in_progress' || interaction.status === 'queued' || interaction.status === 'pending') {
-    if (Date.now() > deadline) throw new GenerationRequestError('network', 'Google 视频任务查询暂时中断', '任务可能仍在生成，可稍后取回。', { requestId: taskId })
     options.onProgress?.(0, interaction.status)
     await waitForDelay(4_000, options.signal)
     try {
@@ -2026,18 +2042,6 @@ async function generateGeminiOmniVideo(settings: ApiRequestSettings, options: Vi
 /** OpenAI-compatible asynchronous video job. Large media stays as a Blob and is
  * never converted to base64, keeping React state and canvas snapshots small. */
 async function generateRemoteVideoRequest(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
-  if (isMuseWebBase(settings.baseUrl)) {
-    if (options.referenceVideo || options.referenceVideos?.length || options.referenceAudios?.length) {
-      throw new GenerationRequestError('platform', 'Muse 网页连接目前支持图片参考', '请移除视频或音频参考后重试。')
-    }
-    const references = await museWebReferences([options.firstFrame, options.lastFrame, options.referenceImage, ...(options.referenceImages ?? [])], options.signal)
-    const result = await runMuseWebTask({
-      kind: 'video', prompt: `请直接生成并返回可播放的视频文件。时长 ${options.seconds} 秒，比例 ${options.aspectRatio ?? options.size}${options.resolution ? `，分辨率 ${options.resolution}` : ''}。\n\n${options.prompt}`,
-      references, signal: options.signal, onSubmitted: options.onTaskId,
-    })
-    if (!result.blob) throw new Error('Muse 没有返回视频文件。')
-    return { blob: result.blob, taskId: result.taskId, progress: 100 }
-  }
   if (isJimengCliBase(settings.baseUrl)) {
     const frames = Array.from(new Set([options.firstFrame, options.referenceImage, ...(options.referenceImages ?? [])].filter((source): source is string => Boolean(source))))
     if (frames.length > 1 || options.lastFrame || options.referenceVideo || options.referenceVideos?.length || options.referenceAudios?.length) {
@@ -2117,17 +2121,16 @@ async function generateRemoteVideoRequest(settings: ApiRequestSettings, options:
   }
   if (!createdResponse.ok) throw await createApiError(createdResponse)
   const created = await createdResponse.json() as Record<string, unknown>
+  { const failure = providerPayloadFailure(created, createdResponse); if (failure) throw failure }
   const taskId = extractTaskId(created)
   if (!taskId) throw new GenerationRequestError('platform', '视频服务没有返回任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
-  const startedAt = Date.now()
   let progress = Number(created.progress ?? 0)
   let status = videoTaskStatus(created)
   let lastJob: unknown = created
   let consecutivePollErrors = 0
   options.onProgress?.(progress, status)
   while (!['completed', 'succeeded', 'success', 'failed', 'cancelled', 'canceled'].includes(status)) {
-    if (Date.now() - startedAt > 30 * 60_000) throw new GenerationRequestError('network', '视频生成等待超时', `任务 ${taskId} 超过 30 分钟仍未完成`, { requestId: taskId })
     await waitForDelay(2_500, options.signal)
     let pollResponse: Response
     try {
@@ -2221,6 +2224,7 @@ async function generateGrsaiVideo(settings: ApiRequestSettings, options: VideoGe
   })
   if (!response.ok) throw await createApiError(response)
   const created: unknown = await response.json()
+  { const failure = providerPayloadFailure(created, response); if (failure) throw failure }
   const taskId = extractProviderTaskId(created)
   if (taskId) options.onTaskId?.(taskId)
   const completed = await resolveGrsaiMediaResult(settings, created, options.signal, '视频', (percent, status) => {
@@ -2346,10 +2350,10 @@ function hfsyFailureDetail(payload: unknown) {
   const root = payload as Record<string, unknown>
   const data = root.data && typeof root.data === 'object' ? root.data as Record<string, unknown> : undefined
   for (const value of [data?.fail_reason, root.fail_reason, data?.error, root.error, root.success === false ? root.message : undefined]) {
-    if (typeof value === 'string' && value.trim()) return value.trim()
-    if (value && typeof value === 'object' && 'message' in value && typeof value.message === 'string') return value.message.trim()
+    const reason = typeof value === 'string' ? value.trim() : value && typeof value === 'object' && 'message' in value && typeof value.message === 'string' ? value.message.trim() : ''
+    if (reason) return `${reason}\n厂商返回：${sanitizeAdminLogJson(payload)}`
   }
-  return root.success === false ? 'HFSY 返回请求失败' : ''
+  return root.success === false ? `HFSY 返回请求失败\n厂商返回：${sanitizeAdminLogJson(payload)}` : ''
 }
 
 function hfsyTaskUrl(settings: ApiRequestSettings, kind: 'image' | 'video', taskId: string, queryParameter = false) {
@@ -2388,7 +2392,6 @@ export function hfsyVideoLimits(model: string): HfsyVideoLimits | undefined {
   }
   if (/^wan-3\.0(?:-(?:480|720|1080)(?:-tehui)?)?$/.test(model)) return { minSeconds: 2, maxSeconds: 30, images: 10, videos: 5, audios: 5, prompt: 5000, ratios: model === 'wan-3.0' ? HFSY_VIDEO_RATIOS : HFSY_SEEDANCE_RATIOS }
   if (model === 'video-2.5') return { minSeconds: 4, maxSeconds: 12, images: 5, videos: 1, audios: 3, prompt: 10_000, ratios: HFSY_SEEDANCE_RATIOS }
-  if (/^muse[-_]video$/.test(model)) return { minSeconds: model === 'muse_video' ? 1 : 4, maxSeconds: 30, images: 10, videos: 10, audios: 10, prompt: 10_000, maxAssets: 10, ratios: HFSY_VERTICAL_RATIOS }
   if (model === 'minimax-h3') return { minSeconds: 5, maxSeconds: 15, images: 9, videos: 0, audios: 3, minImages: 1, prompt: 7000, ratios: HFSY_VERTICAL_RATIOS }
   if (model === 'sora-2') return { minSeconds: 4, maxSeconds: 12, images: 1, videos: 0, audios: 0, prompt: 10_000, durations: [4, 8, 12], ratios: HFSY_VERTICAL_RATIOS }
   if (model === 'grok-imagine-video-1.5') return { minSeconds: 6, maxSeconds: 15, images: 7, videos: 0, audios: 0, minReferenceImages: 2, prompt: 5000, durations: [6, 10, 15], ratios: [...HFSY_VERTICAL_RATIOS, '4:3', '3:4', '3:2', '2:3'] }
@@ -2423,14 +2426,12 @@ export function videoReferenceRules(baseUrl: string, model: string) {
   const hfsy25 = hfsy && /^sd-2\.5/.test(model)
   const hfsyWan = hfsy && /^wan-3\.0/.test(model)
   const hfsyAgnes = hfsy && model === 'video-2.5'
-  const hfsyMuse = hfsy && /^muse[-_]video$/.test(model)
   const hfsyWanTehui = hfsyWan && model === 'wan-3.0-480-tehui'
   const hfsyVideoTimes: readonly [number, number] | undefined = legacyHfsy || hfsyAgnes || hfsyWanTehui ? [3, 10]
-    : hfsy25 ? [2, 30] : hfsyWan ? [1, 15] : hfsySeedance ? [2, 15] : hfsyMuse ? [0, 120] : undefined
+    : hfsy25 ? [2, 30] : hfsyWan ? [3, 10] : hfsySeedance ? [2, 15] : undefined
   const h3 = /^minimax-h3(?:-(?:highspeed|lite|max))?$/.test(model)
   const nativeH3 = provider === 'minimax' && h3
   const jimeng = isJimengCliBase(baseUrl)
-  const muse = isMuseWebBase(baseUrl)
   const grok15 = /^grok-imagine-video-1\.5/.test(model)
   let images = limits?.images ?? grsai?.images
   let videos = limits?.videos
@@ -2442,7 +2443,6 @@ export function videoReferenceRules(baseUrl: string, model: string) {
   if (apiMart === 'kling-v3') { images = 0; videos = 0 }
   if (apiMart === 'kling-v4' || apiMart === 'kling-v4-flash') { images = 10; videos = 5; frames = apiMart === 'kling-v4' }
   if (jimeng) { images = 1; videos = 0; frames = false }
-  if (muse) { images = 8; videos = 0 }
   if (nativeH3) { images = 9; videos = 3 }
   if (omni) { const limits = geminiOmniLimits(model, undefined, 3); images = limits.maxImages; videos = limits.maxVideos }
   if (provider === 'minimax' && !h3) { images = 1; videos = 0; frames = false }
@@ -2471,10 +2471,10 @@ export function videoReferenceRules(baseUrl: string, model: string) {
     minReferenceImages: limits?.minReferenceImages,
     maxAssets: limits?.maxAssets ?? (apiMart === 'kling-v4' || apiMart === 'kling-v4-flash' ? 15 : undefined) ?? (wan27Reference ? 5 : undefined) ?? (hfsy && /^sd-2-vip-(?:480|720)$/.test(model) ? 12 : undefined),
     totals: {
-      maxImageBytes: muse ? 24_000_000 : jimeng ? 30_000_000 : hfsyWan ? 25 * 1024 ** 2
-        : hfsy && (legacyHfsy || hfsy25 || hfsyAgnes || hfsySeedance || hfsyMuse || model === 'kling-o3') ? 30 * 1024 ** 2 : undefined,
+      maxImageBytes: jimeng ? 30_000_000 : hfsyWan ? 25 * 1024 ** 2
+        : hfsy && (legacyHfsy || hfsy25 || hfsyAgnes || hfsySeedance || model === 'kling-o3') ? 30 * 1024 ** 2 : undefined,
       maxVideoSeconds: apiMart === 'kling-v4-flash' ? 20 : apiMart === 'kling-v4' || apiMart === 'seedance25' ? 30
-        : legacyHfsy || hfsyAgnes || hfsyWanTehui || nativeH3 || hfsySeedance ? 15 : hfsy25 || (seedance && seedance25) ? 30 : seedance ? 15 : undefined,
+        : legacyHfsy || hfsyAgnes || hfsyWan || nativeH3 || hfsySeedance ? 15 : hfsy25 || (seedance && seedance25) ? 30 : seedance ? 15 : undefined,
     },
     exclusiveVideo: grokVideo,
     media: (entry: ReferenceMedia): MediaLimits => {
@@ -2495,7 +2495,7 @@ export function videoReferenceRules(baseUrl: string, model: string) {
           : hfsy25 ? { ...SEEDANCE_IMAGE_LIMITS, types: REFERENCE_IMAGE_TYPES, maxMB: undefined }
             : hfsy && (legacyHfsy || hfsyWan || hfsyAgnes || h3) ? { types: REFERENCE_IMAGE_TYPES, maxMB: h3 ? 20 : undefined } : {}
         if (hfsy && !entry.publicUrl) return { ...modelRules, upload: true }
-        return muse ? { types: REFERENCE_IMAGE_TYPES, maxMB: 24_000_000 / 1024 ** 2 } : modelRules
+        return modelRules
       }
       if (omni) return { seconds: [0, 3] }
       if (apiMart === 'zoe') return {
@@ -2507,10 +2507,10 @@ export function videoReferenceRules(baseUrl: string, model: string) {
       const hfsyLocalLimits: MediaLimits = hfsyLocal ? { types: REFERENCE_VIDEO_TYPES, maxMB: HFSY_LOCAL_VIDEO_LIMIT_MB, requireReadable: true } : {}
       if (hfsyVideoTimes) return {
         publicOnly: !hfsyLocal,
-        types: hfsyMuse ? [...REFERENCE_VIDEO_TYPES, 'video/webm', 'video/3gpp'] : hfsySeedance ? undefined : REFERENCE_VIDEO_TYPES,
-        maxMB: hfsyMuse ? 40 : 200, seconds: hfsyVideoTimes,
-        ...(hfsy25 ? { ratio: [0.4, 2.5], side: [300, 6000] } : {}),
-        fps: hfsy25 || (hfsyWan && !hfsyWanTehui) ? [24, 60] : undefined,
+        types: hfsySeedance ? undefined : REFERENCE_VIDEO_TYPES,
+        maxMB: 200, seconds: hfsyVideoTimes,
+        ...(hfsy25 ? { ratio: [0.4, 2.5], side: [300, 6000] } : hfsyWan ? { side: [720, 2160] } : {}),
+        fps: hfsy25 ? [24, 60] : undefined,
         ...hfsyLocalLimits,
       }
       if (seedance) return {
@@ -2529,7 +2529,6 @@ export function videoReferenceRules(baseUrl: string, model: string) {
 
 export function imageReferenceRules(baseUrl: string, model: string) {
   const capabilities = getImageModelCapabilities(baseUrl, model)
-  const muse = isMuseWebBase(baseUrl)
   const seedream55 = isHfsyBaseUrl(baseUrl) && model.toLowerCase() === 'seedream-5.5'
   const provider = apiProviderForBase(baseUrl)?.id
   const arkSeedream = provider === 'ark' && /seedream/i.test(model)
@@ -2537,8 +2536,8 @@ export function imageReferenceRules(baseUrl: string, model: string) {
   const gptImage = provider === 'openai' && /^(?:gpt-image-|chatgpt-image-latest$)/i.test(model)
   const grokImage2 = provider === 'xai' && /^grok-imagine-image-2\.0(?:-|$)/i.test(model)
   return {
-    count: muse ? 8 : grokImage2 ? 5 : capabilities && 'images' in capabilities ? capabilities.images : 16,
-    totals: { maxImageBytes: muse ? 24_000_000 : isJimengCliBase(baseUrl) ? 30_000_000 : seedream55 ? 25 * 1024 ** 2 : undefined },
+    count: grokImage2 ? 5 : capabilities && 'images' in capabilities ? capabilities.images : 16,
+    totals: { maxImageBytes: isJimengCliBase(baseUrl) ? 30_000_000 : seedream55 ? 25 * 1024 ** 2 : undefined },
     media: (entry: ReferenceMedia): MediaLimits => {
       if (seedream55) return { upload: !entry.publicUrl }
       if (geminiImage) return { types: GEMINI_IMAGE_TYPES }
@@ -2547,7 +2546,6 @@ export function imageReferenceRules(baseUrl: string, model: string) {
         types: [...SEEDANCE_IMAGE_TYPES, 'image/heic', 'image/heif'],
         maxMB: 30, ratio: [1 / 16, 16], minSide: 15, pixels: [196, 36_000_000],
       }
-      if (muse) return { types: REFERENCE_IMAGE_TYPES }
       return {}
     },
   }
@@ -2627,13 +2625,13 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
     prompt: options.prompt,
     duration: options.seconds,
     ...(!['minimax-h3', 'kling-o3', 'sora-2'].includes(model) ? { ratio } : {}),
-    ...(!(seedance25 && ratio === 'adaptive') && !/^muse[-_]video$/.test(model) ? {
+    ...(!(seedance25 && ratio === 'adaptive') ? {
       orientation: model === 'kling-o3' && ratio === '1:1' ? 'square' : ratioWidth < ratioHeight ? 'portrait' : 'landscape',
     } : {}),
     // HFSY's SD-2 family is backed by jimeng_cli, which rejects an explicit
     // watermark field. Only providers whose documented schema accepts it get
-    // the flag (Sora, Grok and Muse in this adapter).
-    ...(/^(?:sora-2|grok-imagine-video-1\.5|muse-video$)/.test(model) ? { watermark: false } : {}),
+    // the flag (Sora and Grok in this adapter).
+    ...(/^(?:sora-2|grok-imagine-video-1\.5)/.test(model) ? { watermark: false } : {}),
     ...(publicImages.length ? { images: publicImages } : {}),
     ...(publicVideos.length ? { videos: publicVideos } : {}),
     ...(publicAudios.length ? { audios: publicAudios } : {}),
@@ -2652,6 +2650,11 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
   if (!createdResponse.ok) throw await createApiError(createdResponse)
   let task = await createdResponse.json() as unknown
   const createFailure = hfsyFailureDetail(task)
+  const providerFailure = providerPayloadFailure(task, createdResponse)
+  if (providerFailure) {
+    if (createFailure && providerFailure.message === '厂商返回任务失败或不完整的结果') providerFailure.message = '视频接口拒绝了生成参数'
+    throw providerFailure
+  }
   if (createFailure) throw new GenerationRequestError('api', '视频接口拒绝了生成参数', createFailure)
   const taskId = extractTaskId(task)
   if (!taskId) throw new GenerationRequestError('platform', 'HFSY 没有返回视频任务编号', sanitizeAdminLogJson(task))
@@ -2662,15 +2665,12 @@ async function generateHfsyVideo(settings: ApiRequestSettings, options: VideoGen
 export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: string, options: Pick<VideoGenerationOptions, 'signal' | 'onProgress' | 'onResultUrl'> = {}, initialTask?: unknown): Promise<GeneratedVideo> {
   if (!isHfsyBaseUrl(settings.baseUrl)) throw new Error('请选择已有的 HFSY API 连接。')
   if (!/^[\w-]{1,160}$/.test(taskId)) throw new Error('请输入有效的 HFSY 任务 ID。')
-  const model = settings.model.toLowerCase()
   let task = initialTask
-  const startedAt = Date.now()
   let pollSettings = settings
-  let pollMethod = model === 'muse-video' ? 'POST' : 'GET'
-  let queryParameter = pollMethod === 'GET'
+  let queryParameter = true
   let triedOtherQueryPath = false
   let consecutiveFailures = 0
-  while (Date.now() - startedAt < 30 * 60_000) {
+  while (true) {
     const status = extractProviderTaskStatus(task)
     if (['failed', 'failure', 'error', 'expired', 'cancelled', 'canceled', 'violation', 'rejected'].includes(status)) {
       throw new GenerationRequestError('api', 'HFSY 视频生成失败', hfsyFailureDetail(task) || sanitizeAdminLogJson(task), { requestId: taskId })
@@ -2698,7 +2698,7 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
     try {
       const poll = await withProviderDeadline(async (signal) => {
         const response = await providerFetch(hfsyTaskUrl(pollSettings, 'video', taskId, queryParameter), {
-        method: pollMethod,
+        method: 'GET',
         signal, headers: providerRelayHeaders(pollSettings, { Authorization: `Bearer ${pollSettings.apiKey}`, Accept: 'application/json' }),
       })
         const payload = response.ok ? await response.json() as unknown : undefined
@@ -2708,10 +2708,6 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
       // HFSY's notice specifies api.hfsyapi.cn as the query fallback for 504s.
       if (poll.response.status === 504 && /^(?:www\.|apigo\.)?hfsyapi\.cn$/i.test(new URL(normalizedApiBaseUrl(pollSettings.baseUrl)).hostname)) {
         pollSettings = { ...settings, baseUrl: 'https://api.hfsyapi.cn/v1' }
-        continue
-      }
-      if ([404, 405].includes(poll.response.status) && pollMethod === 'POST') {
-        pollMethod = 'GET'
         continue
       }
       if ([404, 405].includes(poll.response.status) && !triedOtherQueryPath) {
@@ -2730,15 +2726,13 @@ export async function resumeHfsyVideoTask(settings: ApiRequestSettings, taskId: 
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       if (error instanceof GenerationRequestError && (error.status === undefined || error.status < 500 && ![408, 429].includes(error.status))) throw error
       consecutiveFailures += 1
-      if (consecutiveFailures >= 3) throw new GenerationRequestError('network', 'HFSY 视频任务查询暂时中断', `任务 ID：${taskId}。任务仍可能成功，请勿重复提交。`, { requestId: taskId })
+      if (consecutiveFailures >= 3) throw new GenerationRequestError('network', 'HFSY 视频任务查询暂时中断', `任务 ID：${taskId}。任务仍可能成功，请勿重复提交。\n${error instanceof GenerationRequestError ? error.detail : error instanceof Error ? error.message : String(error)}`, { requestId: taskId, status: error instanceof GenerationRequestError ? error.status : undefined })
     }
   }
-  throw new GenerationRequestError('network', 'HFSY 视频生成等待超时', `任务 ID：${taskId}。任务可能仍在生成，请在 HFSY 控制台查询。`, { requestId: taskId })
 }
 
 async function waitForCompatibleAudioTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal, onProgress?: (progress: number, status: string) => void) {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 30 * 60_000) {
+  while (true) {
     await waitForDelay(3_000, signal)
     const response = await providerFetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
       signal,
@@ -2752,11 +2746,10 @@ async function waitForCompatibleAudioTask(settings: ApiRequestSettings, taskId: 
     if (['failed', 'cancelled', 'canceled', 'expired'].includes(status)) throw new GenerationRequestError('api', '音频接口 任务失败', sanitizeAdminLogJson(payload), { requestId: taskId })
     if (status === 'completed' || extractProviderImages(payload).length) return payload
   }
-  throw new GenerationRequestError('network', '音频接口 任务查询超时', `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复提交。`, { requestId: taskId })
 }
 
 /** Reopens an existing task using the same provider routes as generation. */
-export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal): Promise<GeneratedVideo> {
+export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, taskId: string, signal?: AbortSignal, callbacks: Pick<VideoGenerationOptions, 'onProgress' | 'onResultUrl'> = {}): Promise<GeneratedVideo> {
   if (!/^[\w.:-]{1,256}$/.test(taskId)) throw new Error('原视频任务编号无效')
   signal?.throwIfAborted()
   if (geminiOmniVideo(settings.baseUrl, settings.model)) {
@@ -2764,7 +2757,7 @@ export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, ta
     return finishGeminiVideo(settings, taskId, interaction, signal)
   }
   if (apiMartVideoFamily(settings.baseUrl, settings.model)) return finishApiMartVideo(await readApiMartVideoTask(settings, taskId, signal), taskId, signal)
-  if (isHfsyBaseUrl(settings.baseUrl)) return resumeHfsyVideoTask(settings, taskId, { signal })
+  if (isHfsyBaseUrl(settings.baseUrl)) return resumeHfsyVideoTask(settings, taskId, { ...callbacks, signal })
   if (isJimengCliBase(settings.baseUrl)) {
     const bytes = await readJimengMedia(taskId, true).catch(async () => {
       signal?.throwIfAborted()
@@ -2774,7 +2767,6 @@ export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, ta
     signal?.throwIfAborted()
     return { blob: await readCompleteVideoResponse(new Response(new Uint8Array(bytes), { headers: { 'Content-Type': 'video/mp4' } })), taskId, progress: 100 }
   }
-  if (isMuseWebBase(settings.baseUrl)) throw new Error('请在 Muse 网页的原对话中下载视频')
   const id = encodeURIComponent(taskId)
   const read = (url: string, headers: HeadersInit = compatibleApiHeaders(settings)) => providerFetch(url, { headers, signal, cache: 'no-store' })
   const json = async (url: string, headers?: HeadersInit) => {
@@ -2821,19 +2813,18 @@ export async function recoverGeneratedVideoTask(settings: ApiRequestSettings, ta
   return { blob: await readCompleteVideoResponse(await read(endpoint(settings.baseUrl, `videos/${id}/content`))), taskId, progress: 100 }
 }
 
-export async function readRecoverableVideo(options: { sourceUrl?: string; taskId?: string; settings?: ApiRequestSettings; signal?: AbortSignal }) {
+export async function readRecoverableVideo(options: { sourceUrl?: string; taskId?: string; settings?: ApiRequestSettings; signal?: AbortSignal } & Pick<VideoGenerationOptions, 'onProgress' | 'onResultUrl'>) {
   const { sourceUrl, taskId, settings, signal } = options
   if (sourceUrl) {
     try {
       const authorization = settings && isHfsyBaseUrl(settings.baseUrl) ? `Bearer ${settings.apiKey}` : undefined
-      const sourceTimeout = taskId && settings ? AbortSignal.timeout(12_000) : undefined
-      const sourceSignal = sourceTimeout && signal ? AbortSignal.any([sourceTimeout, signal]) : sourceTimeout ?? signal
-      return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal: sourceSignal, authorization }), sourceUrl }
+      options.onProgress?.(100, 'downloading')
+      return { blob: await downloadGeneratedVideoBlob(sourceUrl, { signal, authorization }), sourceUrl }
     } catch (error) {
       if (signal?.aborted || !taskId || !settings) throw error
     }
   }
-  if (taskId && settings) return recoverGeneratedVideoTask(settings, taskId, signal)
+  if (taskId && settings) return recoverGeneratedVideoTask(settings, taskId, signal, options)
   throw new Error('找不到可读取的视频文件或原任务连接')
 }
 
@@ -2876,6 +2867,7 @@ export async function generateRemoteAudio(settings: ApiRequestSettings, options:
   })
   if (!response.ok) throw await createApiError(response)
   const created = await response.json() as Record<string, unknown>
+  { const failure = providerPayloadFailure(created, response); if (failure) throw failure }
   const taskId = extractTaskId(created)
   if (!taskId) throw new GenerationRequestError('platform', '音频接口 没有返回音频任务编号', sanitizeAdminLogJson(created))
   options.onTaskId?.(taskId)
@@ -2898,7 +2890,25 @@ export function isRecoverableVideoError(error: GenerationRequestError) {
     /视频已生成但|视频任务完成但|视频.*返回了空|任务已完成，但下载失败|视频任务查询暂时中断/.test(error.message))
 }
 
+export function videoEditingCapabilities(baseUrl: string, model: string) {
+  const provider = apiProviderForBase(baseUrl)?.id
+  const name = model.toLowerCase()
+  if (provider === 'xai' && name === 'grok-imagine-video') return { supported: true, maxImages: 0, inheritsSource: true, transport: 'native' as const, detail: '添加 1 段 MP4 原视频（最长 8.7 秒），描述想修改的内容。比例和时长跟随原视频，清晰度最高 720p；不接收辅助图片。' }
+  const hfsy = isHfsyBaseUrl(baseUrl)
+  const seedance = (hfsy && (isHfsyNativeSeedance(name) || /^sd-2(?:[.\-_]|$)/.test(name)))
+    || (provider === 'ark' || /^https?:\/\/(?:api\.)?apiyi\.com(?::\d+)?(?:\/|$)/i.test(normalizedApiBaseUrl(baseUrl))) && /seedance[-_. ]*2(?:[.\-_]|$)/.test(name)
+  const wan = hfsy && /^wan-3\.0(?:-|$)/.test(name)
+  if (seedance || wan) return { supported: true, maxImages: videoReferenceRules(baseUrl, model).images ?? 9, inheritsSource: false, transport: 'reference' as const,
+    detail: '添加 1 段待编辑原视频；可加图片作为主体替换、服装或风格参考。在提示词中写明修改内容，未提及部分尽量保留。输出规格按下方设置，不保证逐帧一致。' }
+  return { supported: false, maxImages: 0, inheritsSource: false, transport: 'reference' as const, detail: '当前模型或连接尚未接通视频编辑。请切换支持编辑的 Seedance 2.x、HFSY WAN 3.0 或 Grok Imagine Video；不会自动改成参考生成。' }
+}
+
+export function videoEditPrompt(prompt: string, source = '视频1') {
+  return `视频编辑任务：严格编辑${source}。本次唯一的视频是待编辑原片，不是借鉴运镜后另拍的新片。图片（如有）只作为本次修改的辅助参考。以用户明确要求为准，未要求修改的主体、场景、动作、镜头与声音尽量保持原样；输出规格以用户设置为准。\n\n用户的编辑要求：\n${prompt}`
+}
+
 export async function generateRemoteVideo(settings: ApiRequestSettings, options: VideoGenerationOptions): Promise<GeneratedVideo> {
+  assertAvailableModel(settings)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const provider = resolveProviderLabel(settings.baseUrl)
@@ -2914,7 +2924,20 @@ export async function generateRemoteVideo(settings: ApiRequestSettings, options:
     referenceAudioCount: options.referenceAudios?.length ?? 0,
   })
   try {
-    const result = await generateRemoteVideoRequest(settings, options)
+    let requestOptions = options
+    if (options.mode === 'video_edit') {
+      const editing = videoEditingCapabilities(settings.baseUrl, settings.model)
+      const videos = [...new Set([...(options.referenceVideos ?? []), options.referenceVideo].filter(Boolean))]
+      const images = [...new Set([...(options.referenceImages ?? []), options.referenceImage].filter(Boolean))]
+      const issue = !editing.supported ? editing.detail : videos.length !== 1 ? '视频编辑需要且只接受 1 段待编辑原视频。'
+        : options.firstFrame || options.lastFrame ? '视频编辑不能同时指定首尾帧。' : images.length > editing.maxImages ? `此编辑模型最多接收 ${editing.maxImages} 张辅助图片。` : undefined
+      if (issue) throw new GenerationRequestError('platform', '视频编辑尚未提交', issue)
+      // HFSY's flattened gateway identifies media as @video1; native Seedance
+      // uses 视频1. Preserve the exact original URL and its documented role.
+      const source = isHfsyBaseUrl(settings.baseUrl) && !isHfsyNativeSeedance(settings.model) ? '@video1' : '视频1'
+      requestOptions = { ...options, prompt: videoEditPrompt(options.prompt, source), mode: editing.transport === 'reference' ? 'all_reference' : 'video_edit' }
+    }
+    const result = await generateRemoteVideoRequest(settings, requestOptions)
     options.captureAdminLog?.({
       provider,
       taskId: result.taskId,
@@ -3155,7 +3178,7 @@ export async function fetchProviderCredits(settings: Pick<ApiRequestSettings, 'b
 
 /** Validate credentials without performing a billable generation request. */
 export async function validateApiCredentials(settings: Pick<ApiRequestSettings, 'baseUrl' | 'apiKey' | 'authMode'>): Promise<void> {
-  if (isMuseWebBase(settings.baseUrl)) return checkMuseWebAccount()
+  if (isRemovedProvider(settings)) throw new Error('此厂商已移除，请选择其他连接')
   if (isJimengCliBase(settings.baseUrl)) {
     await checkJimengAccount()
     return
@@ -3291,10 +3314,9 @@ async function resolveGrsaiMediaResult(
   if (!taskId) return initialPayload
   if (kind === '图片') reportImageTaskProgress(initialPayload, onProgress, 'queued')
 
-  const startedAt = Date.now()
   let consecutiveErrors = 0
   let succeededWithoutResultCount = 0
-  while (Date.now() - startedAt < GRSAI_IMAGE_POLL_TIMEOUT_MS) {
+  while (true) {
     await waitForDelay(GRSAI_IMAGE_POLL_INTERVAL_MS, signal)
     let response: Response
     try {
@@ -3362,12 +3384,6 @@ async function resolveGrsaiMediaResult(
       }
     }
   }
-  throw new GenerationRequestError(
-    'network',
-    'GRS AI 任务仍在生成或结果查询超时',
-    `任务 ID：${taskId}。Disy 已持续查询 15 分钟，任务仍可能稍后成功；请勿直接重复生成。`,
-    { requestId: taskId },
-  )
 }
 
 async function resolveVisionaryImageResult(
@@ -3387,7 +3403,7 @@ async function resolveVisionaryImageResult(
   const startedAt = Date.now()
   let consecutiveErrors = 0
   let successWithoutResultCount = 0
-  while (Date.now() - startedAt < VISIONARY_POLL_TIMEOUT_MS) {
+  while (true) {
     await waitForDelay(VISIONARY_POLL_INTERVAL_MS, signal)
     try {
       const response = await providerFetch(endpoint(settings.baseUrl, `tasks/${encodeURIComponent(taskId)}`), {
@@ -3434,12 +3450,6 @@ async function resolveVisionaryImageResult(
       }
     }
   }
-  throw new GenerationRequestError(
-    'network',
-    'Visionary 任务查询超时',
-    `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复生成。`,
-    { requestId: taskId },
-  )
 }
 
 function genericProviderPollCandidates(settings: ApiRequestSettings, initialPayload: unknown, taskId: string) {
@@ -3506,7 +3516,7 @@ async function resolveGenericProviderImageResult(
   let selectedEndpoint = ''
   let consecutiveErrors = 0
   let successWithoutResultCount = 0
-  while (Date.now() - startedAt < GENERIC_PROVIDER_POLL_TIMEOUT_MS) {
+  while (true) {
     await waitForDelay(GENERIC_PROVIDER_POLL_INTERVAL_MS, signal)
     const roundCandidates = selectedEndpoint ? [selectedEndpoint] : candidates
     let foundEndpointThisRound = false
@@ -3580,12 +3590,6 @@ async function resolveGenericProviderImageResult(
       )
     }
   }
-  throw new GenerationRequestError(
-    'network',
-    '任务查询超时',
-    `任务 ID：${taskId}。任务仍可能稍后完成，请勿重复生成。`,
-    { requestId: taskId },
-  )
 }
 
 export function resolveImageRequestSize(model: string, aspectRatio = '1:1', resolution: Exclude<ImageResolution, 'auto'> = '1K') {
@@ -3617,24 +3621,11 @@ export async function generateRemoteImages(
   settings: ApiRequestSettings,
   options: ImageGenerationOptions,
 ): Promise<GeneratedImage[]> {
+  assertAvailableModel(settings)
   if (options.editMask && (!supportsImageEditMask(settings.baseUrl, settings.model) || !options.referenceImages?.[0])) {
     throw new GenerationRequestError('platform', '当前模型无法使用图像蒙版', '请选择支持蒙版的 OpenAI 图像模型并添加原图。')
   }
   const startedAtMs = Date.now()
-  if (isMuseWebBase(settings.baseUrl)) {
-    const references = await museWebReferences(options.referenceImages ?? [], options.signal)
-    const images: GeneratedImage[] = []
-    for (let index = 0; index < options.count; index++) {
-      const result = await runMuseWebTask({
-        kind: 'image',
-        prompt: `请直接生成并返回一张图片${options.aspectRatio ? `，画面比例 ${options.aspectRatio}` : ''}${options.resolution ? `，分辨率 ${options.resolution}` : ''}。\n\n${options.prompt}`,
-        references, signal: options.signal, onSubmitted: options.onTaskId,
-      })
-      if (!result.blob) throw new Error('Muse 没有返回图片文件。')
-      images.push({ url: await blobToDataUrl(result.blob) })
-    }
-    return images
-  }
   if (isJimengCliBase(settings.baseUrl)) {
     const references = options.referenceImages ?? []
     if (references.length && /^3\./.test(settings.model)) throw new GenerationRequestError('platform', '当前即梦模型不支持参考图', '请改用即梦 4.0 或更新的版本。')
@@ -3659,48 +3650,42 @@ export async function generateRemoteImages(
   }
   const provider = apiProviderForBase(settings.baseUrl)?.id
   if (provider === 'gemini' && GEMINI_INTERACTION_IMAGE.test(settings.model)) return generateGeminiImages(settings, options)
-  if (provider === 'xai' || provider === 'ark' || provider === 'muse') {
+  if (provider === 'xai' || provider === 'ark') {
     const referenceImages = options.referenceImages?.filter(Boolean) ?? []
     const capabilities = getImageModelCapabilities(settings.baseUrl, settings.model)!
     const maxReferences = 'images' in capabilities ? capabilities.images : 1
     if (referenceImages.length > maxReferences) throw new GenerationRequestError('platform', '参考图太多', `当前模型最多支持 ${maxReferences} 张参考图。`)
     const { aspectRatio, resolution, detail } = resolveImageModelOptions(settings.baseUrl, settings.model, options)
     const ratio = aspectRatio === 'auto' ? undefined : aspectRatio
-    const references = provider === 'muse' ? [] : await Promise.all(referenceImages.map((url) => nativeImageSource(url, options.signal)))
-    const size = resolveImageRequestSize(settings.model, ratio, resolution === 'auto' ? undefined : resolution)
+    const references = await Promise.all(referenceImages.map((url) => nativeImageSource(url, options.signal)))
     const count = options.count
     const model = settings.model
     const path = referenceImages.length && provider !== 'ark' ? 'images/edits' : 'images/generations'
-    let body: FormData | Record<string, unknown>
+    let body: Record<string, unknown>
     if (provider === 'xai') {
       body = { model, prompt: options.prompt, n: count, aspect_ratio: ratio, resolution: resolution?.toLowerCase(),
         quality: detail, response_format: 'b64_json',
         ...(references.length === 1 ? { image: { url: references[0] } } : references.length ? { images: references.map((url) => ({ url })) } : {}) }
-    } else if (provider === 'ark') {
+    } else {
+      if (options.output === 'transparent-png' && /seedream-5-0-(?:pro|flash)/i.test(model)) {
+        if (referenceImages.length !== 1) throw new GenerationRequestError('platform', '透明背景需要一张透明 PNG 参考图', 'Seedream 5.0 Pro/Flash 只支持单张带透明通道的 PNG 图生图；文字生成透明背景请选择 Seedream 5.5。')
+        const bytes = new Uint8Array(await (await readImageSourceBlob(referenceImages[0], options.signal)).arrayBuffer())
+        if (bytes[0] !== 137 || bytes[1] !== 80 || bytes[2] !== 78 || bytes[3] !== 71 || ![4,6].includes(bytes[25])) throw new GenerationRequestError('platform', '参考图需要透明通道', '请上传带 Alpha 通道的 PNG，或选择 Seedream 5.5。')
+      }
       const [w, h] = (ratio ?? '1:1').split(':').map(Number)
       const scale = resolution === '4K' ? 4096 : resolution === '1.5K' ? 1536 : resolution === '1K' ? 1024 : 2048
       const round = (px: number) => Math.round(px / 16) * 16
       const arkSize = ratio ? `${round(scale * Math.sqrt(w / h))}x${round(scale * Math.sqrt(h / w))}` : resolution ?? '2K'
       body = { model, prompt: options.prompt, size: arkSize, response_format: 'b64_json', watermark: false,
+        ...(options.output === 'transparent-png' ? { background: 'transparent', output_format: 'png' } : {}),
         sequential_image_generation: count > 1 ? 'auto' : 'disabled',
         ...(count > 1 ? { sequential_image_generation_options: { max_images: count } } : {}),
         ...(references.length ? { image: references } : {}) }
-    } else if (referenceImages.length) {
-      body = new FormData()
-      body.set('model', model); body.set('prompt', options.prompt); body.set('size', size); body.set('n', String(count))
-      for (const [index, url] of referenceImages.entries()) {
-        const source = await providerFetch(url, { signal: options.signal })
-        if (!source.ok) throw new GenerationRequestError('platform', '参考图无法读取', `图片读取失败（${source.status}）`)
-        const blob = await source.blob()
-        body.append('image', blob, `reference-${index + 1}.${blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png'}`)
-      }
-    } else {
-      body = { model, prompt: options.prompt, size, n: count, response_format: 'b64_json' }
     }
     const response = await providerFetch(endpoint(settings.baseUrl, path), {
       method: 'POST', signal: options.signal,
-      headers: compatibleApiHeaders(settings, body instanceof FormData ? undefined : { 'Content-Type': 'application/json' }),
-      body: body instanceof FormData ? body : JSON.stringify(body),
+      headers: compatibleApiHeaders(settings, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
     })
     if (!response.ok) throw await createApiError(response)
     const result = await response.json() as unknown
@@ -3718,6 +3703,8 @@ export async function generateRemoteImages(
     prompt: options.prompt,
     ...(isApiYiSeedream ? {} : { n: options.count }),
     size: requestSize,
+    ...(isOpenAiGptImage && options.output ? { output_format: options.output === 'transparent-png' ? 'png' : options.output,
+      ...(options.output === 'transparent-png' ? { background: 'transparent' } : {}) } : {}),
   }
   // APIYI's Seedream endpoint uses resolution presets. A 1024x1024 OpenAI
   // default is invalid for Seedream 5.x (and pro requires 1K/2K presets).
@@ -3935,6 +3922,10 @@ export async function generateRemoteImages(
       const quality = isGrsai ? grsaiOptions.detail : options.detail
       if (quality) form.append('quality', quality)
       if (isGrsai) form.append('output_format', outputFormat ?? 'png')
+      if (isOpenAiGptImage && options.output) {
+        form.append('output_format', options.output === 'transparent-png' ? 'png' : options.output)
+        if (options.output === 'transparent-png') form.append('background', 'transparent')
+      }
       if (isGrsai && !referenceImages.length) throw new GenerationRequestError('platform', '图像编辑需要参考图', '当前连接指定了 images/edits。请先添加参考图，或使用 GRS AI 默认接口。')
 
       for (const [index, imageSource] of referenceImages.entries()) {
@@ -4040,6 +4031,8 @@ export async function generateRemoteImages(
     ))
   }
   try {
+    const providerFailure = providerPayloadFailure(payload, response)
+    if (providerFailure) throw providerFailure
     if (useHfsyNativeImage) {
       const failure = hfsyFailureDetail(payload)
       if (failure) throw new GenerationRequestError('api', 'HFSY 图片任务生成失败', failure, { requestId: taskId || undefined })
@@ -4082,14 +4075,7 @@ export async function generateRemoteText(
   prompt: string,
   options: TextGenerationOptions = {},
 ) {
-  if (isMuseWebBase(settings.baseUrl)) {
-    const references = await museWebReferences(options.referenceImages ?? [], options.signal)
-    const result = await runMuseWebTask({
-      kind: 'text', prompt: `请在当前对话中直接回复文字。\n\n${prompt}`, references, signal: options.signal,
-    })
-    if (!result.text) throw new Error('Muse 没有返回文字。')
-    return result.text
-  }
+  assertAvailableModel(settings)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const providerLabel = resolveProviderLabel(settings.baseUrl)
@@ -4173,6 +4159,7 @@ export async function generateRemoteText(
       body: JSON.stringify(requestBody),
     })
   } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     if (error instanceof GenerationRequestError) throw error
     const networkError = createNetworkError(error)
@@ -4184,32 +4171,40 @@ export async function generateRemoteText(
     emitTextAdminLog('failed', { error: apiError.detail, summary: apiError.message, status: apiError.status }, apiError.requestId)
     throw apiError
   }
+  const responseRequestId = ['x-request-id', 'openai-request-id', 'request-id', 'x-correlation-id', 'x-ms-request-id', 'cf-ray', 'traceparent']
+    .map((name) => response.headers.get(name)).find(Boolean) ?? undefined
+  const responseMetadata = { status: response.status, requestId: responseRequestId }
   let payload: unknown
+  let responseBody = ''
   try {
     const contentType = response.headers.get('content-type') || ''
-    if (/text\/event-stream/i.test(contentType) || hfsy) {
-      const body = await response.text()
-      if (/text\/event-stream/i.test(contentType) || /^(?:data:|event:|:)/.test(body.trimStart())) {
-        const events = body.split(/\r?\n\r?\n/).map((event) => event.split(/\r?\n/)
-          .filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n'))
-          .filter((event) => event && event !== '[DONE]')
-        payload = events.flatMap((event) => { try { return [JSON.parse(event)] } catch { return [] } })
-      } else {
-        try { payload = JSON.parse(body) } catch (error) {
-          if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) throw error
-          payload = body
-        }
-      }
-    } else if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) {
-      payload = await response.json()
+    responseBody = await response.text()
+    const body = responseBody
+    if (/text\/event-stream/i.test(contentType) || /^(?:data:|event:|:)/.test(body.trimStart())) {
+      const events = body.split(/\r?\n\r?\n/).map((event) => event.split(/\r?\n/)
+        .filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n'))
+        .filter((event) => event && event !== '[DONE]')
+      payload = events.map((event) => JSON.parse(event))
     } else {
-      const text = await response.text()
-      try { payload = JSON.parse(text) } catch { payload = text }
+      try { payload = JSON.parse(body) } catch (error) {
+        if (/application\/(?:json|[^;]+\+json)/i.test(contentType)) throw error
+        payload = body
+      }
     }
   } catch (error) {
-    const parseError = new GenerationRequestError('platform', 'API 返回了无法识别的数据', error instanceof Error ? error.message : String(error))
-    emitTextAdminLog('failed', { error: parseError.detail, summary: parseError.message })
+    // A deadline or user stop during body reading is not a response parsing bug.
+    if (options.signal?.aborted) throw options.signal.reason
+    const parseError = error instanceof SyntaxError
+      ? new GenerationRequestError('api', 'API 返回了无法识别的数据', sanitizeAdminLogJson({ error: error.message, response: responseBody.slice(0, 6000) }), responseMetadata)
+      : new GenerationRequestError('network', '读取 API 响应时连接中断', error instanceof Error ? error.message : String(error), responseMetadata)
+    emitTextAdminLog('failed', { error: parseError.detail, summary: parseError.message, status: parseError.status }, responseRequestId)
     throw parseError
+  }
+  // Some gateways report upstream failures in a nominally successful HTTP/SSE response.
+  const providerFailure = providerPayloadFailure(payload, response)
+  if (providerFailure) {
+    emitTextAdminLog('failed', payload, providerFailure.requestId)
+    throw providerFailure
   }
   if (hfsy) {
     const failure = (Array.isArray(payload) ? payload : [payload]).map(hfsyFailureDetail).find(Boolean)
@@ -4251,7 +4246,7 @@ export async function generateRemoteText(
   const responseDeltaText = responseEvents.filter((event) => event.type === 'response.output_text.delta' && typeof event.delta === 'string').map((event) => event.delta).join('')
   const content = (typeof completedResponseText === 'string' ? completedResponseText : responseDeltaText) || extractText(payload)
   if (!content.trim()) {
-    const emptyError = new GenerationRequestError('platform', '模型没有返回文本内容', '接口请求成功，但响应中没有可用的文本字段。')
+    const emptyError = new GenerationRequestError('api', '接口响应中没有可用文本', `已收到 API 响应，但没有读到可用文本；需要根据原始响应区分空结果、内容限制或格式兼容问题。响应：${sanitizeAdminLogJson(payload)}`, responseMetadata)
     emitTextAdminLog('failed', payload, extractTaskId(payload))
     throw emptyError
   }

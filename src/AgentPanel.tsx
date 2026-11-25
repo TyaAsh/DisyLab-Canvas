@@ -1,3 +1,9 @@
+import { AgentGenerationParameters } from './skill-ui/AgentGenerationParameters'
+import { AgentDirections } from './skill-ui/AgentDirections'
+import { AgentMediaResults } from './skill-ui/AgentMediaResults'
+import { AGENT_WORKFLOWS, type AgentWorkflow } from './agentInteraction'
+import { OriginalText, useLocale } from './i18n/react'
+import { getIntlLocale, translateUi } from './i18n/core'
 /*!
  * Copyright (c) 2026 DisyLab. All rights reserved.
  * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
@@ -8,10 +14,11 @@
  * SPDX-License-Identifier: LicenseRef-DisyLab-Proprietary
  */
 import { Fragment, useEffect, useId, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import { AGENT_VIDEO_WORKFLOWS, composerVideoInputIssue, composerVideoMode, normalizeComposerSettings, type ComposerParameterOptions, type VideoEditingOptions } from './agentComposer'
 import { videoFileType } from './videoReference'
-import { createPortal } from 'react-dom'
+import { loadVideoThumbnailPoster, VideoReferenceThumbnail } from './VideoReferenceThumbnail'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { ArrowLeft, ArrowUp, Box, Brain, Check, ChevronDown, CircleHelp, Download, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, Link2, ListTodo, LoaderCircle, Maximize2, MessageCircle, MousePointer2, PanelRight, PictureInPicture2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Trash2, UsersRound, Wrench, X } from 'lucide-react'
+import { ArrowLeft, ArrowUp, ArrowUpRight, BrainCircuit, Box, Check, ChevronDown, CircleHelp, Copy, FilePlus2, FileText, Film, Focus, ImagePlus, ImageUp, KeyRound, Link2, ListTodo, LoaderCircle, LockKeyhole, MessageCircle, MessagesSquare, MousePointer2, PanelRight, Pencil, PictureInPicture2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Trash2, WandSparkles, Wrench, X, Zap } from 'lucide-react'
 import { AGENT_REFERENCE_PURPOSES, compactReferenceName, normalizeAgentMessageContent, reconcileAgentImagePlanSpecs, type AgentContextReference, type AgentImagePlan, type AgentImageReference, type AgentMessage, type AgentTextPlan, type AgentTurnOptions, type AgentVideoPlan, type AgentWebReference } from './agent'
 import { AgentWebDisclosure, AgentWebReferenceCard, AgentWebReferenceInput } from './skill-ui/AgentWebReference'
 import { resolveImageModelOptions, type ImageOutput, type ImageGenerationOptions } from './imageApi'
@@ -24,8 +31,8 @@ import { AgentImageOperationReview } from './skill-ui/AgentImageOperationReview'
 import { AgentQuestions } from './skill-ui/AgentQuestions'
 import { AgentCanvasEditReview } from './skill-ui/AgentCanvasEditReview'
 import { AgentSelect, getModelBrand, type SelectOption } from './skill-ui/AgentSelect'
-import { AgentMemory, AgentProjectGuide, AgentTasks, AgentTeam, type AgentProjectView } from './skill-ui/AgentProjectPane'
-import { activeAgentTeamRoles, getAgentTeamTemplate, PROJECT_MEMORY_LENGTH, type AgentProjectSettings, type AgentTask } from './agentProject'
+import { AgentProjectGuide, AgentTasks, type AgentProjectView } from './skill-ui/AgentProjectPane'
+import type { AgentTask } from './agentProject'
 import type { AgentCanvasEditDraft } from './agentCanvasEdits'
 import { skillOpening } from './skills/conversation'
 import type { FilmReview, FilmReviewAnswer } from './skills/filmProduction'
@@ -34,14 +41,14 @@ import type { SkillManifest } from './skills/types'
 export type AgentModelOption = {
   key: string; name: string; connectionName: string; outputs?: readonly ImageOutput[]
   imageParameters?: { baseUrl: string; modelId: string; ratios: SelectOption[]; resolutions: SelectOption[]; qualities: SelectOption[]; maxReferences?: number }
-  videoParameters?: { ratios: SelectOption[]; resolutions: SelectOption[]; durations: SelectOption[] }
+  videoParameters?: { ratios: SelectOption[]; resolutions: SelectOption[]; durations: SelectOption[]; modes?: Array<SelectOption & { detail?: string }>; editing?: VideoEditingOptions }
 }
 export type AgentConversationOption = { id: string; title: string; updatedAt: string }
 
 function conversationDate(value: string) {
   const date = new Date(value)
   if (!Number.isFinite(date.getTime())) return undefined
-  return date.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return date.toLocaleString(getIntlLocale(), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 const AGENT_PANEL_WIDTH_KEY = 'disylab.agent-panel-width'
@@ -120,9 +127,9 @@ function getInitialAgentPanelWidth() {
 }
 
 type Props = {
+  automaticPlanIds?: string[]
+  onEditMessage?: (messageId: string, content: string) => Promise<boolean>
   projectId: string
-  projectSettings: AgentProjectSettings
-  onSaveProjectSettings: (update: (settings: AgentProjectSettings) => AgentProjectSettings) => Promise<void>
   tasks: AgentTask[]
   onTaskCenterOpen: (open: boolean) => void
   onOpenTask: (task: AgentTask) => Promise<boolean>
@@ -178,7 +185,7 @@ type Props = {
   onOpenSkillFactory: (view: 'browse' | 'manage', skillSlug?: string) => void
   getSkillCanvasContext?: () => string
   onSkillAuthorReply: (prompt: string, signal: AbortSignal) => Promise<string>
-  onDownloadImage: (url: string, fileName: string) => void
+  onDownloadImage: (url: string, fileName: string) => void | Promise<void>
   onNewConversation: () => void
   onDeleteConversation: () => void
   onSelectConversation: (id: string) => void
@@ -190,7 +197,7 @@ type Props = {
   onUploadNotice: (message: string) => void
   onPendingReferenceConsumed: () => void
   onPickFromCanvas: (mediaKind?: 'image' | 'video', videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni') => void
-  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode: 'text' | 'image' | 'frames' | 'reference' | 'omni' | undefined, team: boolean, options: AgentTurnOptions) => void
+  onSend: (message: string, invocationText: string, references: AgentImageReference[], videoGenerationMode: 'text' | 'image' | 'frames' | 'reference' | 'omni' | undefined, options: AgentTurnOptions) => void
   onRetry: (messageId: string) => void
   onOptimizePrompt: (prompt: string) => Promise<string>
   onPlanChange: (id: string, patch: Partial<Pick<AgentImagePlan, 'prompt' | 'aspectRatio' | 'resolution' | 'detail' | 'requestedDetail' | 'count' | 'imageConnectionId' | 'imageModelId' | 'modelMention'>>) => void
@@ -217,19 +224,16 @@ type Props = {
 }
 
 export function AgentPanel(props: Props) {
+  const interfaceLocale = useLocale()
   const [projectView, setProjectView] = useState<AgentProjectView | null>(null)
-  const [memorySeed, setMemorySeed] = useState<{ id: string; content: string }>()
-  const [teamConversations, setTeamConversations] = useState<Set<string>>(() => new Set())
-  const teamEnabled = teamConversations.has(props.activeConversationId)
   const changeProjectView = (view: AgentProjectView | null) => {
-    setMemorySeed(undefined)
     setProjectView(view)
     props.onTaskCenterOpen(view === 'tasks')
   }
   const [skillMenuOpen, setSkillMenuOpen] = useState(false)
   const [skillAuthoring, setSkillAuthoring] = useState(false)
   const attachedSkill = props.skillSelection?.skill ?? null
-  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '告诉我想做什么，也可以直接说数量、画幅和时长。输入 @ 引用素材。'
+  const composerHint = attachedSkill ? skillOpening(attachedSkill) : '说说想做什么，没想法也可以。输入 @ 引用素材。'
   const latestMessage = props.messages.at(-1)
   const [freeReplyMessageId, setFreeReplyMessageId] = useState<string>()
   const guidedMessage = !props.busy && !skillAuthoring && latestMessage?.role === 'assistant'
@@ -252,19 +256,33 @@ export function AgentPanel(props: Props) {
   const [mentionIndex, setMentionIndex] = useState(0)
   const mentionMenuId = useId()
   const [automaticModels, setAutomaticModels] = useState(!props.imageModelKey && !props.videoModelKey)
-  const [composerMode, setComposerMode] = useState('agent')
   const [preferenceTab, setPreferenceTab] = useState('image')
-  const [composerMenu, setComposerMenu] = useState<'add' | 'models' | null>(null)
+  const [manualImageModelKey, setManualImageModelKey] = useState(props.imageModelKey || props.imageModels[0]?.key || '')
+  const [manualVideoModelKey, setManualVideoModelKey] = useState(props.videoModelKey || props.videoModels[0]?.key || '')
+  useEffect(() => {
+    setManualImageModelKey(current => props.imageModels.some(model => model.key === current) ? current : props.imageModels[0]?.key ?? '')
+  }, [props.imageModels])
+  useEffect(() => {
+    setManualVideoModelKey(current => props.videoModels.some(model => model.key === current) ? current : props.videoModels[0]?.key ?? '')
+  }, [props.videoModels])
+  const [composerMode, setComposerMode] = useState('agent')
+  const [workflow, setWorkflow] = useState<AgentWorkflow>(() => {
+    try { const saved = localStorage.getItem('disy-agent-workflow'); return saved === 'collaborate' || saved === 'direct' ? saved : 'smart' } catch { return 'smart' }
+  })
+  const [composerMenu, setComposerMenu] = useState<'add' | 'models' | 'parameters' | null>(null)
   const composerMenuRef = useRef<HTMLDivElement>(null)
+  const mediaControlsRef = useRef<HTMLDivElement>(null)
+  const parameterTriggerRef = useRef<HTMLButtonElement>(null)
   useEffect(() => {
     if (!composerMenu) return
-    const dismiss = (event: Event) => { if (!composerMenuRef.current?.contains(event.target as Node)) setComposerMenu(null) }
+    const dismiss = (event: Event) => { if (!composerMenuRef.current?.contains(event.target as Node) && !mediaControlsRef.current?.contains(event.target as Node)) setComposerMenu(null) }
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setComposerMenu(null) }
     document.addEventListener('pointerdown', dismiss)
     document.addEventListener('keydown', escape)
     return () => { document.removeEventListener('pointerdown', dismiss); document.removeEventListener('keydown', escape) }
   }, [composerMenu])
-  const [turnModels, setTurnModels] = useState<NonNullable<AgentTurnOptions['models']>>({})
+  const [imageDraft, setImageDraft] = useState<NonNullable<AgentTurnOptions['generation']>>({ kind: 'image' })
+  const [videoDraft, setVideoDraft] = useState<NonNullable<AgentTurnOptions['generation']>>({ kind: 'video' })
   const [turnStyles, setTurnStyles] = useState<Props['styleCandidates']>([])
   const [turnTextNodes, setTurnTextNodes] = useState<Props['textCandidates']>([])
   const [webReferences, setWebReferences] = useState<AgentWebReference[]>([])
@@ -275,8 +293,23 @@ export function AgentPanel(props: Props) {
   const [editorHeight, setEditorHeight] = useState<number>()
   const editorResize = useRef<{ y: number; height: number } | null>(null)
   const [optimizingPrompt, setOptimizingPrompt] = useState(false)
-  const [promptBackup, setPromptBackup] = useState<{ conversationId: string; contents: Node[] }>()
+  const [promptBackups, setPromptBackups] = useState<{ conversationId: string; contents: Node[] }[]>([])
   const [promptError, setPromptError] = useState('')
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [editedMessageText, setEditedMessageText] = useState('')
+  const [messageEditBusy, setMessageEditBusy] = useState(false)
+  const [messageActionError, setMessageActionError] = useState('')
+  const [messageActionMessageId, setMessageActionMessageId] = useState<string | null>(null)
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
+  const messageEditInput = useRef<HTMLTextAreaElement>(null)
+  const messageEditTrigger = useRef<HTMLButtonElement | null>(null)
+  useEffect(() => { setEditingMessageId(null); setMessageActionError(''); setMessageEditBusy(false) }, [props.activeConversationId])
+  useEffect(() => { if (editingMessageId) { messageEditInput.current?.focus({preventScroll:true}); messageEditInput.current?.setSelectionRange(editedMessageText.length, editedMessageText.length) } }, [editingMessageId])
+  useEffect(() => { if (!copiedMessageId) return; const timer=window.setTimeout(() => setCopiedMessageId(null), 1800); return () => window.clearTimeout(timer) }, [copiedMessageId])
+  const cancelMessageEdit = () => { setEditingMessageId(null); setMessageActionError(''); window.requestAnimationFrame(() => messageEditTrigger.current?.focus({preventScroll:true})) }
+  const [parameterHelpOpen, setParameterHelpOpen] = useState(false)
+  const optimizeHint = optimizingPrompt ? '正在优化，原稿已保留' : props.busy ? '请等待当前对话完成，或先停止对话' : '优化提示词，完成后可撤回'
+  const undoHint = optimizingPrompt ? '等待本次优化完成后可撤回' : '恢复到上次优化前，支持逐次撤回'
   const conversationIdRef = useRef(props.activeConversationId)
   conversationIdRef.current = props.activeConversationId
   const latestUserMessage = props.messages.at(-2)
@@ -296,10 +329,6 @@ export function AgentPanel(props: Props) {
   } | null>(null)
   const panelFloating = !props.agentOnly && panelPlacement.mode === 'floating'
   const [referenceDropActive, setReferenceDropActive] = useState(false)
-  const [previewResult, setPreviewResult] = useState<{ url: string; fileName: string } | null>(null)
-  const previewCloseRef = useRef<HTMLButtonElement>(null)
-  const previewDialogRef = useRef<HTMLDivElement>(null)
-  const previewTriggerRef = useRef<HTMLButtonElement | null>(null)
   const editorRef = useRef<HTMLDivElement>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
@@ -310,8 +339,41 @@ export function AgentPanel(props: Props) {
   const resizeStartRef = useRef({ pointerX: 0, width: AGENT_PANEL_DEFAULT_WIDTH })
   const readyPlans = props.plans.filter((plan) => plan.status === 'ready')
   const activeReadyPlan = readyPlans.find((plan) => plan.id === activeReadyPlanId) ?? readyPlans[readyPlans.length - 1]
-  const draftImageModel = props.imageModels.find((model) => model.key === (turnModels.image?.key ?? props.imageModelKey))
-  const draftOutputIntent = draftImageModel ? imageOutputIntent(draftInvocationText, draftImageModel.outputs) : undefined
+  const draftImageModel = composerMode === 'image'
+    ? props.imageModels.find(model => model.key === manualImageModelKey) ?? props.imageModels[0]
+    : props.imageModels.find(model => model.key === props.imageModelKey)
+  const draftVideoModel = composerMode === 'video'
+    ? props.videoModels.find(model => model.key === manualVideoModelKey) ?? props.videoModels[0]
+    : props.videoModels.find(model => model.key === props.videoModelKey)
+  const mediaKind = composerMode === 'video' ? 'video' : 'image'
+  const mediaModel = mediaKind === 'image' ? draftImageModel : draftVideoModel
+  const mediaModels = mediaKind === 'image' ? props.imageModels : props.videoModels
+  const parameterLockReason = mediaModels.length
+    ? `请先在右侧选择${mediaKind === 'image' ? '生图' : '视频'}模型，再设置参数。比例、清晰度${mediaKind === 'video' ? '和时长' : '和画质'}的可选范围由模型决定。`
+    : `当前没有可用的${mediaKind === 'image' ? '生图' : '视频'}模型，请先点击「配置模型」，添加并启用模型后再设置参数。`
+  useEffect(() => {
+    if (composerMenu === 'parameters' && !mediaModel) setComposerMenu(null)
+  }, [composerMenu, mediaModel?.key])
+  useEffect(() => { setParameterHelpOpen(false) }, [composerMode, mediaModel?.key])
+  const parameterOptions: ComposerParameterOptions = mediaKind === 'image'
+    ? { ...(draftImageModel?.imageParameters ?? { ratios: props.aspectOptions, resolutions: props.resolutionOptions, qualities: props.detailOptions }), outputs: draftImageModel?.outputs }
+    : draftVideoModel?.videoParameters ?? { ratios: props.videoAspectOptions, resolutions: props.videoResolutionOptions, durations: props.videoDurationOptions }
+  const generationSettings = normalizeComposerSettings(mediaKind, mediaKind === 'image' ? imageDraft : videoDraft, parameterOptions)
+  const patchGenerationSettings = (patch: Partial<NonNullable<AgentTurnOptions['generation']>>) => {
+    setPromptError('')
+    if (mediaKind === 'image') setImageDraft(current => ({ ...current, ...generationSettings, ...patch, kind: 'image' }))
+    else setVideoDraft(current => ({ ...current, ...generationSettings, ...patch, kind: 'video' }))
+  }
+  const videoWorkflow = generationSettings.videoWorkflow ?? 'generate'
+  const inputImages = props.references.filter(reference => reference.kind !== 'video').length
+  const inputVideos = props.references.filter(reference => reference.kind === 'video').length
+  const videoInputIssue = composerMode === 'video' && !attachedSkill && mediaModel ? composerVideoInputIssue(generationSettings, parameterOptions, inputImages, inputVideos) : undefined
+  const videoModeSummary = mediaKind === 'video' ? AGENT_VIDEO_WORKFLOWS.find(option => option.value === videoWorkflow)?.label ?? '参考图/视频' : ''
+  const videoInheritsSource = mediaKind === 'video' && videoWorkflow === 'edit' && parameterOptions.editing?.inheritsSource
+  const parameterSummary = videoInheritsSource ? `视频编辑 · 跟随原视频 · ${generationSettings.count ?? 1}条` : [mediaKind === 'video' ? videoModeSummary : generationSettings.resolution?.toUpperCase(), generationSettings.aspectRatio,
+    mediaKind === 'video' && generationSettings.duration ? generationSettings.duration + '秒' : '',
+    (generationSettings.count ?? 1) + (mediaKind === 'image' ? '张' : '条')].filter(Boolean).join(' · ')
+  const draftOutputIntent = draftImageModel ? imageOutputIntent(generationSettings.output ? `输出格式：${IMAGE_OUTPUT_LABELS[generationSettings.output]}` : draftInvocationText, draftImageModel.outputs) : undefined
   const acceptsVideoReference = attachedSkill ? attachedSkill.kind === 'video' : composerMode !== 'image'
   const modeAcceptsReference = (reference: AgentImageReference) => reference.kind !== 'video' || acceptsVideoReference
   const modelMentionGroups = [
@@ -342,29 +404,6 @@ export function AgentPanel(props: Props) {
     setPromptError('')
     editorRef.current?.focus()
   }
-  useEffect(() => {
-    if (!previewResult) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setPreviewResult(null)
-      if (event.key === 'Tab') {
-        const buttons = [...(previewDialogRef.current?.querySelectorAll<HTMLButtonElement>('button') ?? [])]
-        if (!buttons.length) return
-        const currentIndex = buttons.indexOf(document.activeElement as HTMLButtonElement)
-        const nextIndex = event.shiftKey
-          ? (currentIndex <= 0 ? buttons.length - 1 : currentIndex - 1)
-          : (currentIndex < 0 || currentIndex >= buttons.length - 1 ? 0 : currentIndex + 1)
-        event.preventDefault()
-        buttons[nextIndex]?.focus()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    window.requestAnimationFrame(() => previewCloseRef.current?.focus())
-    return () => {
-      window.removeEventListener('keydown', onKeyDown)
-      previewTriggerRef.current?.focus()
-    }
-  }, [previewResult])
-
   ;[...props.candidates, ...props.references].forEach((reference) => referenceRegistryRef.current.set(reference.nodeId, reference))
 
   const savePanelPlacement = (placement: AgentPanelPlacement) => {
@@ -395,7 +434,7 @@ export function AgentPanel(props: Props) {
 
   const startPanelDrag = (event: ReactPointerEvent<HTMLElement>, edge?: AgentPanelResizeEdge) => {
     if (!panelFloating || !event.isPrimary || event.button !== 0 || panelDragRef.current) return
-    if (event.target instanceof Element && event.target.closest('button')) return
+    if (event.target instanceof Element && event.target.closest('button, .agent-custom-select')) return
     const panel = panelRef.current
     if (!panel) return
     const rect = panel.getBoundingClientRect()
@@ -643,28 +682,30 @@ export function AgentPanel(props: Props) {
     chip.contentEditable = 'false'
     chip.dataset.referenceId = reference.nodeId
     const isVideo = reference.kind === 'video' || /\.(?:mp4|webm|mov|m4v)(?:$|\?)/i.test(reference.name) || reference.url.startsWith('data:video/')
-    const image = document.createElement(isVideo ? 'video' : 'img')
-    image.src = reference.url
+    const image = document.createElement('img')
     image.setAttribute('aria-label', '')
-    if (image instanceof HTMLVideoElement) {
-      image.className = 'video-reference-thumbnail'
-      image.muted = true
-      image.defaultMuted = true
-      image.playsInline = true
-      image.preload = 'auto'
-      image.addEventListener('loadedmetadata', () => {
-        if (image.duration > 0) image.currentTime = Math.min(0.05, image.duration / 2)
-      }, { once: true })
-    }
+    const preview = document.createElement('span')
+    preview.className = 'video-reference-preview'
+    if (isVideo) {
+      const loading = document.createElement('span')
+      loading.className = 'agent-video-thumbnail-status'
+      loading.textContent = '…'
+      preview.title = translateUi('正在读取视频画面…')
+      preview.append(loading)
+      void loadVideoThumbnailPoster(reference).then(url => {
+        image.src = url; image.className = 'video-reference-thumbnail'; image.draggable = false
+        preview.replaceChildren(image); preview.title = reference.name
+      }).catch(() => { loading.textContent = translateUi('视频'); preview.title = translateUi('无法读取缩略图，请检查来源视频是否可以播放') })
+    } else image.src = reference.url
     const label = document.createElement('b')
     const existingIndex = props.references.findIndex((item) => item.nodeId === reference.nodeId)
-    label.textContent = `${isVideo ? '视频' : '图'}${existingIndex >= 0 ? existingIndex + 1 : props.references.length + 1} · ${compactReferenceName(reference.name)}`
+    label.textContent = `${translateUi(isVideo ? '视频' : '图')} ${existingIndex >= 0 ? existingIndex + 1 : props.references.length + 1} · ${compactReferenceName(reference.name)}`
     label.title = reference.name
     const remove = document.createElement('button')
     remove.type = 'button'
-    remove.setAttribute('aria-label', '移除引用')
+    remove.setAttribute('aria-label', translateUi('移除引用'))
     remove.textContent = 'x'
-    chip.append(image, label, remove)
+    chip.append(isVideo ? preview : image, label, remove)
     return chip
   }
   const clearMentionTrigger = () => {
@@ -735,7 +776,7 @@ export function AgentPanel(props: Props) {
         return
       }
       editor.replaceChildren(...parts.map((part) => chipByToken.get(part) ?? document.createTextNode(part)))
-      setPromptBackup({ conversationId, contents })
+      setPromptBackups((current) => [...current.filter((item) => item.conversationId === conversationId), { conversationId, contents }])
       savedRangeRef.current = null
       syncReferencesFromEditor()
     } catch {
@@ -746,10 +787,11 @@ export function AgentPanel(props: Props) {
   }
   const undoPromptOptimization = () => {
     const editor = editorRef.current
+    const promptBackup = promptBackups.at(-1)
     if (!editor || promptBackup?.conversationId !== props.activeConversationId) return
     editor.replaceChildren(...promptBackup.contents)
     savedRangeRef.current = null
-    setPromptBackup(undefined)
+    setPromptBackups((current) => current.slice(0, -1))
     setPromptError('')
     syncReferencesFromEditor()
     editor.focus()
@@ -848,11 +890,13 @@ export function AgentPanel(props: Props) {
       const number = reference ? referenceNumberById.get(reference.nodeId) : undefined
       const label = chip.querySelector('b')
       if (label && reference && number) {
-        label.textContent = `${reference.kind === 'video' ? '视频' : '图'}${number} · ${compactReferenceName(reference.name)}`
+        const editing = composerMode === 'video' && videoWorkflow === 'edit'
+        chip.dataset.mediaRole = editing ? reference.kind === 'video' ? 'edit-source' : 'edit-reference' : ''
+        label.textContent = `${translateUi(editing ? reference.kind === 'video' ? '原视频' : '辅助图' : reference.kind === 'video' ? '视频' : '图')}${editing ? '' : ` ${number}`} · ${compactReferenceName(reference.name)}`
         label.title = reference.name
       }
     })
-  }, [props.references])
+  }, [props.references, composerMode, videoWorkflow, interfaceLocale])
   useEffect(() => {
     setTurnStyles([])
     setTurnTextNodes([])
@@ -882,15 +926,21 @@ export function AgentPanel(props: Props) {
     const container = messagesRef.current
     if (!container) return
     const frame = window.requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight
-      pinnedToBottomRef.current = true
+      const directions = latestMessage?.directions?.length ? [...container.querySelectorAll<HTMLElement>('.agent-creative-directions')].at(-1) : undefined
+      const target = directions
+      container.scrollTo({ top: target ? container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 12 : container.scrollHeight, behavior: 'instant' })
+      pinnedToBottomRef.current = !target
     })
     return () => window.cancelAnimationFrame(frame)
   }, [props.activeConversationId])
   useEffect(() => {
     const container = messagesRef.current
     if (!container || !pinnedToBottomRef.current) return
-    const frame = window.requestAnimationFrame(() => container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' }))
+    const frame = window.requestAnimationFrame(() => {
+      const directions = latestMessage?.directions?.length ? [...container.querySelectorAll<HTMLElement>('.agent-creative-directions')].at(-1) : undefined
+      const target = directions
+      container.scrollTo({ top: target ? container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 12 : container.scrollHeight, behavior: target ? 'instant' : 'smooth' })
+    })
     return () => window.cancelAnimationFrame(frame)
   }, [props.messages.length, props.plans.length, props.videoPlans.length, props.textPlans.length, props.busy, props.filmRun?.nodeId])
   useEffect(() => {
@@ -898,17 +948,26 @@ export function AgentPanel(props: Props) {
     const frame = window.requestAnimationFrame(() => messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'instant' }))
     return () => window.cancelAnimationFrame(frame)
   }, [props.filmReview?.id])
-  const submit = (answers?: string) => {
+  const submit = (answers?: string, directionChoice?: AgentTurnOptions['directionChoice']) => {
     const invocationText = [answers, getInvocationText()].filter(Boolean).join('\n\n')
     const value = [answers, getEditorText()].filter(Boolean).join('\n\n')
     if (!value) return
-    if (!automaticModels && !attachedSkill && ((composerMode === 'image' && !props.imageModels.some(model => model.key === props.imageModelKey)) || (composerMode === 'video' && !props.videoModels.some(model => model.key === props.videoModelKey)))) {
-      setPromptError('请先选择可用的生成模型，或开启自动选择。')
+    if (composerMode !== 'agent' && !attachedSkill && directionChoice?.action !== 'refine' && !mediaModel) {
+      setPromptError('请先选择' + (mediaKind === 'image' ? '生图' : '视频') + '模型。')
+      return
+    }
+    if (composerMode !== 'agent' && !attachedSkill && directionChoice?.action !== 'refine' && (!generationSettings.aspectRatio || !generationSettings.resolution || (mediaKind === 'video' && !generationSettings.duration))) {
+      setPromptError('当前模型缺少可用的生成参数，请重新选择模型。')
       return
     }
     if (!props.textModels.some(({ key }) => key === props.textModelKey)) {
       props.onOpenApiSettings()
       return
+    }
+    if (composerMode === 'video' && !attachedSkill) {
+      const refs = getEditorReferences()
+      const issue = composerVideoInputIssue(generationSettings, parameterOptions, refs.filter(ref => ref.kind !== 'video').length, refs.filter(ref => ref.kind === 'video').length)
+      if (issue) { setPromptError(issue); setComposerMenu('parameters'); return }
     }
     if (turnStyles.some(({ id }) => !props.styleCandidates.some((item) => item.id === id))
       || turnTextNodes.some(({ id }) => !props.textCandidates.some((item) => item.id === id))) {
@@ -920,12 +979,15 @@ export function AgentPanel(props: Props) {
       setPromptError('当前生成模式不接收已添加的部分素材。请移除这些引用或切换生成模式。')
       return
     }
-    props.onSend(value, composerMode === 'agent' || attachedSkill || answers ? invocationText : `${composerMode === 'image' ? '请生成或编辑图像' : '请规划并生成视频'}：\n${invocationText}`, getEditorReferences().filter(modeAcceptsReference), undefined, teamEnabled && !attachedSkill, {
+    pinnedToBottomRef.current = true
+    props.onSend(value, composerMode === 'agent' || attachedSkill || answers ? invocationText : `${composerMode === 'image' ? '请生成或编辑图像' : '请规划并生成视频'}：\n${invocationText}`, getEditorReferences().filter(modeAcceptsReference), undefined, {
+      workflow: composerMode === 'agent' ? workflow : 'direct',
+      directionChoice,
       models: {
-        ...turnModels,
-        image: turnModels.image ?? (() => { const model = props.imageModels.find(item => item.key === props.imageModelKey); return model && { key: model.key, name: model.name } })(),
-        video: turnModels.video ?? (() => { const model = props.videoModels.find(item => item.key === props.videoModelKey); return model && { key: model.key, name: model.name } })(),
+        image: draftImageModel ? { key: draftImageModel.key, name: draftImageModel.name } : undefined,
+        video: draftVideoModel ? { key: draftVideoModel.key, name: draftVideoModel.name } : undefined,
       },
+      generation: composerMode !== 'agent' && !attachedSkill ? { ...generationSettings, ...(composerMode === 'video' ? { generationMode: composerVideoMode(generationSettings, parameterOptions, getEditorReferences().filter(ref => ref.kind !== 'video').length, getEditorReferences().filter(ref => ref.kind === 'video').length) } : {}) } : undefined,
       styleIds: turnStyles.map(({ id }) => id),
       textNodeIds: turnTextNodes.map(({ id }) => id),
       webReferences,
@@ -937,7 +999,7 @@ export function AgentPanel(props: Props) {
     setWebInputUrl(undefined)
     setWebDraftOpen(false)
     setDraftInvocationText('')
-    setPromptBackup(undefined)
+    setPromptBackups([])
     setPromptError('')
     setMentionOpen(false)
   }
@@ -964,8 +1026,27 @@ export function AgentPanel(props: Props) {
       referenceIssue: props.getImagePlanIssue(plan) ?? (referenceCount > maxReferences ? (maxReferences ? `当前模型最多接收 ${maxReferences} 张参考图，请移除多余参考或换模型。` : '当前模型不接收参考图，请更换模型。') : undefined) }
   }
 
+  const renderResultGroup = (plans: Array<AgentImagePlan | AgentVideoPlan>, kind: 'image' | 'video') => {
+    const finished = plans.filter(plan => plan.results?.length)
+    if (!finished.length) return null
+    const submitted = plans.filter(plan => !['proposed', 'ready'].includes(plan.status))
+    return <AgentMediaResults kind={kind} items={finished.flatMap(plan => (plan.results ?? []).map((result, index) => ({
+      ...result, id: `${plan.id}:${result.id}`, nodeId: plan.nodeId, label: plan.label ? `${plan.label}${(plan.results?.length ?? 0) > 1 ? ` · ${index + 1}` : ''}` : undefined,
+    })))} expected={submitted.reduce((count, plan) => count + plan.count, 0)} running={submitted.some(plan => plan.status === 'running')}
+      meta={[...new Set(finished.map(plan => 'videoModelId' in plan && plan.generationMode === 'edit' && props.videoModels.find(model => model.key === `${plan.videoConnectionId ?? ''}::${plan.videoModelId ?? ''}`)?.videoParameters?.editing?.inheritsSource
+        ? '视频编辑 · 跟随原视频 · 最高 720p'
+        : [plan.aspectRatio === 'auto' ? '自适应' : plan.aspectRatio, plan.resolution, 'duration' in plan ? `${plan.duration} 秒` : undefined].filter(Boolean).join(' · ')))].join(' / ')}
+      issues={finished.flatMap(plan => plan.error ? [`${plan.label ? `${plan.label}：` : ''}${plan.error}`] : [])}
+      onDownloadImage={props.onDownloadImage} onLocate={props.agentOnly ? undefined : props.onLocateCanvasNode}/>
+  }
   const renderPlan = (storedPlan: AgentImagePlan, collapsible = false) => {
     const { plan, model: imageModel, key: imageModelKey, outputIntent, referenceIssue } = reviewImagePlan(storedPlan)
+    if (props.automaticPlanIds?.includes(plan.id) && plan.status === 'ready' || plan.execution === 'automatic' && plan.status === 'running') return <section key={plan.id} className="agent-auto-progress" role="status">
+      <header><LoaderCircle size={15} className="is-spinning"/><strong>{plan.status === 'running' ? '正在生成图像' : '检查素材后开始生成'}</strong></header>
+      <p>{imageModel?.name} · {plan.aspectRatio} · {plan.resolution} · {plan.count} 张</p>
+      <details><summary>查看制作内容</summary><p>{plan.prompt}</p></details>
+      {plan.status === 'ready' && <button type="button" onClick={() => props.onCancelPlan(plan.id)}>取消本次生成</button>}
+    </section>
     const statusLabel = plan.status === 'ready' ? '待确认' : plan.status === 'running' ? '生成中' : plan.status === 'completed' ? '已完成' : plan.status === 'cancelled' ? '已取消' : '失败'
     const isCompact = plan.status === 'completed' || plan.status === 'cancelled' || Boolean(plan.results?.length)
     const queued = runningImageBatch.includes(plan.id)
@@ -984,25 +1065,7 @@ export function AgentPanel(props: Props) {
       : (plan.references ?? []).map((reference) => ({ ...reference, kind: reference.kind ?? 'image' as const }))
     if (isCompact) {
       if (plan.results?.length) {
-        return (
-          <section key={plan.id} className="agent-plan-card agent-result-card is-completed">
-            <header><span><ImagePlus size={15} />{plan.status === 'completed' ? '图像已生成' : '已保留生成结果'}</span><em>{plan.results.length} 张</em></header>
-            <div className={`agent-result-grid ${plan.results.length === 1 ? 'is-single' : ''}`}>
-              {plan.results.map((result, index) => <figure key={result.id}>
-                <button type="button" className="agent-result-preview" onClick={(event) => { previewTriggerRef.current = event.currentTarget; setPreviewResult(result) }} aria-label={`放大查看生成图片 ${index + 1}`}>
-                  <img src={result.url} alt={`生成结果 ${index + 1}`} />
-                  <span><Maximize2 size={15} />放大</span>
-                </button>
-                <button type="button" className="agent-result-download" onClick={() => props.onDownloadImage(result.url, result.fileName)}><Download size={14} />保存</button>
-              </figure>)}
-            </div>
-            <footer className="agent-result-meta">
-              <span>{plan.aspectRatio} · {plan.resolution}</span>
-              {!props.agentOnly && plan.nodeId && <button type="button" onClick={() => props.onLocateCanvasNode(plan.nodeId!)}><Focus size={13} />定位画布</button>}
-            </footer>
-            {plan.error && <p className="agent-plan-error">{plan.error}</p>}
-          </section>
-        )
+        return renderResultGroup([plan], 'image')
       }
       return (
         <button
@@ -1079,7 +1142,7 @@ export function AgentPanel(props: Props) {
             <div>{preset.references.map((reference) => <img src={reference.url} alt={reference.name} title={reference.name} key={reference.id} />)}</div>
           </div>)}
         </div>}
-        {plan.error && <p className="agent-plan-error">{plan.error}</p>}
+        {plan.reviewReason && plan.status === 'ready' && !plan.error && <p className="agent-image-plan-notice">{plan.reviewReason}</p>}{plan.error && <p className="agent-plan-error">{plan.error}</p>}
         {plan.status === 'ready' && <footer className="agent-plan-actions">
           <span className="agent-image-plan-confirm-note">{costLabel ? `预计 ${costLabel}` : '确认后才开始生成'}</span>
           <button type="button" className="agent-plan-cancel" disabled={disabled} onClick={() => props.onCancelPlan(plan.id)}>取消</button>
@@ -1103,10 +1166,16 @@ export function AgentPanel(props: Props) {
     </div>
   )
   const renderVideoPlan = (plan: AgentVideoPlan) => {
+    const inheritsSource = plan.generationMode === 'edit' && props.videoModels.find(model => model.key === `${plan.videoConnectionId ?? ''}::${plan.videoModelId ?? ''}`)?.videoParameters?.editing?.inheritsSource
+    if (props.automaticPlanIds?.includes(plan.id) && plan.status === 'ready') return <section key={plan.id} className="agent-auto-progress" role="status">
+      <header><LoaderCircle size={15} className="is-spinning"/><strong>检查素材后开始生成视频</strong></header>
+      <p>{inheritsSource ? '视频编辑 · 比例与时长跟随原视频 · 最高 720p' : `${plan.aspectRatio} · ${plan.resolution} · ${plan.duration} 秒`} · {plan.count} 条</p>
+      <button type="button" onClick={() => props.onCancelVideoPlan(plan.id)}>取消本次生成</button>
+    </section>
     const statusLabel = plan.status === 'ready' ? '待确认' : plan.status === 'running' ? '生成中' : plan.status === 'completed' ? '已完成' : plan.status === 'cancelled' ? '已取消' : '失败'
     if (plan.status !== 'ready') return <button type="button" key={plan.id} className={`agent-plan-card agent-video-plan-card is-${plan.status} is-collapsed`} disabled={!plan.nodeId} onClick={() => !props.agentOnly && plan.nodeId && props.onLocateCanvasNode(plan.nodeId)}>
       <span><Film size={15} /><strong>{plan.status === 'completed' ? '视频已生成' : plan.status === 'running' ? '视频生成中' : plan.status === 'failed' ? '视频生成失败' : '视频方案已取消'}</strong></span>
-      <span className="agent-plan-collapsed-meta">{plan.aspectRatio} · {plan.resolution} · {plan.duration} 秒 · {plan.count} 条</span>
+      <span className="agent-plan-collapsed-meta">{inheritsSource ? '视频编辑 · 跟随原视频' : `${plan.aspectRatio} · ${plan.resolution} · ${plan.duration} 秒`} · {plan.count} 条</span>
       {plan.error && <span className="agent-plan-error">{plan.error}</span>}
       {!props.agentOnly && plan.nodeId && <span className="agent-plan-locate"><Focus size={14} />定位画布</span>}
     </button>
@@ -1121,8 +1190,8 @@ export function AgentPanel(props: Props) {
       <header><span><Film size={15} />视频生成确认</span><em>{statusLabel}</em></header>
       {plan.label && <p className="agent-plan-brief-title">{plan.label}</p>}
       <p className="agent-plan-brief-specs" aria-label="视频生成规格">{[videoModel?.name,
-        plan.generationMode && { text: '文生视频', image: '图生视频', frames: '首尾帧', reference: '图片参考', omni: '全能参考' }[plan.generationMode],
-        `${plan.count} 条`, plan.aspectRatio === 'auto' ? '自适应' : plan.aspectRatio, plan.resolution.toUpperCase(), `${plan.duration} 秒/条`].filter(Boolean).join(' · ')}</p>
+        plan.generationMode && { text: '文生视频', image: '图生视频', frames: '首尾帧', reference: '图片参考', omni: '参考图/视频', edit: '视频编辑' }[plan.generationMode],
+        `${plan.count} 条`, ...(inheritsSource ? ['跟随原视频', '最高 720p'] : [plan.aspectRatio === 'auto' ? '自适应' : plan.aspectRatio, plan.resolution.toUpperCase(), `${plan.duration} 秒/条`])].filter(Boolean).join(' · ')}</p>
       {plan.modelMention && !videoModelAvailable && <p className="agent-image-plan-notice">指定模型 {plan.modelMention.name} 不可用。请在输入框重新选择模型并发送。</p>}
       {referenceIssue && <p className="agent-image-plan-notice" role="status">{referenceIssue}</p>}
       {!videoModelAvailable && !plan.modelLocked && <p className="mb-2 text-[11px] text-amber-300">原视频模型已不可用，请重新选择。</p>}
@@ -1137,9 +1206,12 @@ export function AgentPanel(props: Props) {
       }} />}</div>
       <textarea value={plan.prompt} onChange={(event) => props.onVideoPlanChange(plan.id, { prompt: event.target.value })} aria-label="编辑视频方案提示词" />
       <div className="agent-video-plan-settings">
+        {!inheritsSource && <>
         <AgentSelect ariaLabel="视频比例" value={plan.aspectRatio} placeholder="比例" options={videoModel?.videoParameters?.ratios ?? props.videoAspectOptions} icon={<SlidersHorizontal size={13} />} onChange={(aspectRatio) => props.onVideoPlanChange(plan.id, { aspectRatio })} />
         <AgentSelect ariaLabel="视频清晰度" value={plan.resolution} placeholder="清晰度" options={videoModel?.videoParameters?.resolutions ?? props.videoResolutionOptions} icon={<SlidersHorizontal size={13} />} onChange={(resolution) => props.onVideoPlanChange(plan.id, { resolution })} />
         <AgentSelect ariaLabel="视频时长" value={String(plan.duration)} placeholder="时长" options={videoModel?.videoParameters?.durations ?? props.videoDurationOptions} icon={<SlidersHorizontal size={13} />} onChange={(duration) => props.onVideoPlanChange(plan.id, { duration: Number(duration) })} />
+        </>}
+        {inheritsSource && <p className="video-mode-hint">比例与时长跟随原视频，清晰度最高 720p。</p>}
         <AgentSelect ariaLabel="视频数量" value={String(plan.count)} placeholder="数量" options={[1, 2, 3, 4].map((count) => ({ value: String(count), label: `${count} 条` }))} icon={<SlidersHorizontal size={13} />} onChange={(count) => props.onVideoPlanChange(plan.id, { count: Number(count) })} />
       </div>
       </details>
@@ -1147,7 +1219,7 @@ export function AgentPanel(props: Props) {
       {!!(plan.invokedStylePresets?.length || plan.invokedStyleReferences?.length) && <div className="agent-plan-invoked-styles">
         {(plan.invokedStylePresets?.length ? plan.invokedStylePresets : [{ id: 'legacy-video-style', name: '风格设定', keyword: plan.styleInvocationWord || '', references: plan.invokedStyleReferences ?? [] }]).map((preset) => <div className="agent-plan-invoked-style" key={preset.id}><span><Sparkles size={12} />{preset.name}{preset.keyword ? ` · ${preset.keyword}` : ''}</span><div>{preset.references.map((reference) => <img src={reference.url} alt={reference.name} title={reference.name} key={reference.id} />)}</div></div>)}
       </div>}
-      {plan.error && <p className="agent-plan-error">{plan.error}</p>}
+      {plan.reviewReason && plan.status === 'ready' && !plan.error && <p className="agent-image-plan-notice">{plan.reviewReason}</p>}{plan.error && <p className="agent-plan-error">{plan.error}</p>}
       <footer className="agent-plan-actions"><button type="button" className="agent-plan-cancel" onClick={() => props.onCancelVideoPlan(plan.id)}>取消</button><button type="button" className="agent-plan-confirm" disabled={!videoModelAvailable || Boolean(referenceIssue) || !plan.prompt.trim()} title={referenceIssue ?? (videoModelAvailable ? '使用所选模型生成视频' : '请先选择可用的视频模型')} onClick={() => props.onConfirmVideoPlan(plan.id)}><Check size={15} />确认生成视频</button></footer>
     </section>
   }
@@ -1163,6 +1235,7 @@ export function AgentPanel(props: Props) {
   }
   const renderDirectionChoices = (plans: AgentImagePlan[]) => {
     const selectablePlans = plans.filter((plan) => plan.deliverableIndex === undefined && (plan.status === 'proposed' || plan.status === 'ready'))
+    if (selectablePlans.length < 2) return null
     if (!selectablePlans.length) return null
     const planIds = selectablePlans.map((plan) => plan.id)
     const proposedIds = selectablePlans.filter((plan) => plan.status === 'proposed').map((plan) => plan.id)
@@ -1265,7 +1338,8 @@ export function AgentPanel(props: Props) {
         }}><Check size={15} aria-hidden="true" /><span>{busy ? '批量处理中…' : `确认所选 ${selectedImageCount} 张`}</span></button>
         </footer>
       </section>}
-      {plans.filter((plan) => plan.status !== 'proposed' && plan.status !== 'ready').map((plan) => renderPlan(plan))}
+      {renderResultGroup(plans, 'image')}
+      {plans.filter((plan) => !plan.results?.length && plan.status !== 'proposed' && plan.status !== 'ready').map((plan) => renderPlan(plan))}
       {ready.map((plan) => renderPlan(plan, showBatch && batch.includes(plan)))}
     </>
   }
@@ -1292,12 +1366,11 @@ export function AgentPanel(props: Props) {
           moveFloatingPanel(rect.left + offset.x, rect.top + offset.y)
           saveFloatingGeometry()
         }}>
-        <div className="agent-panel-title"><span className="disy-agent-avatar agent-panel-avatar" aria-hidden="true"><img className="agent-panel-logo" src="/disy-logo-ui.png" alt="" /></span><span><strong>Disy Agent</strong><small>和你一起构思，并在确认后生成</small></span>{props.backgroundRunCount > 0 && <span className="ml-2 inline-flex items-center gap-1 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-1 text-[10px] text-cyan-200" title="其他画布中的 Agent 正在后台运行"><LoaderCircle size={11} className="is-spinning" />后台 {props.backgroundRunCount}</span>}</div>
+        <div className="agent-panel-title"><span className="disy-agent-avatar agent-panel-avatar" aria-hidden="true"><img className="agent-panel-logo" src="/disy-logo-ui.png" alt="" /></span><span><span className="agent-title-name-row"><strong>Disy Agent</strong>
+          </span><small>{composerMode === 'image' ? '图像创作 · 按所选模型和参数制作' : composerMode === 'video' ? '视频创作 · 按所选模型和参数制作' : '一起找方向，也能直接开始制作'}</small></span>{props.backgroundRunCount > 0 && <span className="ml-2 inline-flex items-center gap-1 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-1 text-[10px] text-cyan-200" title="其他画布中的 Agent 正在后台运行"><LoaderCircle size={11} className="is-spinning" />后台 {props.backgroundRunCount}</span>}</div>
         <div className="agent-panel-header-actions">
           <div className="agent-project-buttons" aria-label="项目工具">
             <button type="button" aria-label="任务中心" title="任务中心" aria-pressed={projectView === 'tasks'} onClick={() => changeProjectView(projectView === 'tasks' ? null : 'tasks')}><ListTodo size={16} /></button>
-            <button type="button" aria-label="项目记忆" title="项目记忆" aria-pressed={projectView === 'memory'} onClick={() => changeProjectView(projectView === 'memory' ? null : 'memory')}><Brain size={16} /></button>
-            <button type="button" aria-label="团队协作" title={teamEnabled ? '团队协作已启用' : '团队协作'} aria-pressed={projectView === 'team'} data-team-active={teamEnabled} onClick={() => changeProjectView(projectView === 'team' ? null : 'team')}><UsersRound size={16} /></button>
             <button type="button" aria-label="Agent 使用指南" title="使用指南" aria-pressed={projectView === 'guide'} onClick={() => changeProjectView(projectView === 'guide' ? null : 'guide')}><CircleHelp size={16} /></button>
           </div>
           {props.agentOnly && <button className="agent-panel-api" onClick={props.onOpenApiSettings} title="配置 API"><KeyRound size={16} /><span>API 配置</span></button>}
@@ -1311,7 +1384,7 @@ export function AgentPanel(props: Props) {
       </header>
       {projectView ? <div className="agent-conversation-row agent-project-heading">
         <button type="button" onClick={() => changeProjectView(null)} aria-label="返回 Agent 对话"><ArrowLeft size={16} /></button>
-        <strong>{{ tasks: '任务中心', memory: '项目记忆', team: '团队协作', guide: '使用指南' }[projectView]}</strong>
+        <strong>{{ tasks: '任务中心', guide: '使用指南' }[projectView]}</strong>
       </div> : skillAuthoring ? <div className="agent-conversation-row agent-skill-mode">
         <button type="button" onClick={() => { setSkillAuthoring(false); window.requestAnimationFrame(() => skillButtonRef.current?.focus()) }} aria-label="返回 Agent 对话"><ArrowLeft size={16} /></button>
         <span><strong>Skill 创作</strong><small>新的 Skill</small></span>
@@ -1329,27 +1402,14 @@ export function AgentPanel(props: Props) {
         <button type="button" className="agent-new-chat-button" onClick={props.onNewConversation} title="新建对话"><Plus size={15} /></button>
         <button type="button" className="agent-delete-chat-button" onClick={props.onDeleteConversation} title="删除当前对话"><Trash2 size={15} /></button>
       </div>}
-      {previewResult && createPortal(<div ref={previewDialogRef} className="agent-result-lightbox" role="dialog" aria-modal="true" aria-label="生成图片预览" onClick={() => setPreviewResult(null)}>
-        <header onClick={(event) => event.stopPropagation()}>
-          <button type="button" onClick={() => props.onDownloadImage(previewResult.url, previewResult.fileName)}><Download size={16} />保存图片</button>
-          <button ref={previewCloseRef} type="button" onClick={() => setPreviewResult(null)} aria-label="关闭预览"><X size={18} /></button>
-        </header>
-        <img src={previewResult.url} alt="生成图片大图预览" onClick={(event) => event.stopPropagation()} />
-      </div>, document.body)}
       {projectView === 'tasks' && <AgentTasks key={props.projectId} tasks={props.tasks} onStop={props.onStopTask} onOpen={async (task) => {
         const opened = await props.onOpenTask(task)
         if (opened) changeProjectView(null)
         return opened
       }} />}
-      {projectView === 'memory' && <AgentMemory key={`${props.projectId}:${memorySeed?.id ?? ''}`} settings={props.projectSettings} save={props.onSaveProjectSettings} seed={memorySeed?.content} />}
-      {projectView === 'guide' && <AgentProjectGuide open={changeProjectView} />}
-      {projectView === 'team' && <AgentTeam key={props.projectId} settings={props.projectSettings} save={props.onSaveProjectSettings} models={props.textModels} enabled={teamEnabled} onEnabled={(enabled) => {
-        setTeamConversations((current) => {
-          const next = new Set(current)
-          if (enabled) next.add(props.activeConversationId)
-          else next.delete(props.activeConversationId)
-          return next
-        })
+      {projectView === 'guide' && <AgentProjectGuide open={changeProjectView} onExample={text => {
+        changeProjectView(null); setComposerMode('agent'); setComposerMenu(null)
+        window.requestAnimationFrame(() => { editorRef.current?.focus(); savedRangeRef.current=null; restoreSelection(); insertPlainTextAtSelection(`${getEditorText() ? '\n' : ''}${text}`); syncReferencesFromEditor() })
       }} />}
       {skillAuthoring && !projectView ? <AgentSkillCreator
         key={props.activeConversationId}
@@ -1371,17 +1431,38 @@ export function AgentPanel(props: Props) {
       /> : null}
       <div className="agent-panel-messages-wrap" hidden={skillAuthoring || Boolean(projectView)}>
         <div className="agent-panel-messages" ref={messagesRef}>
-          {!props.messages.length && !attachedSkill && <div className="agent-empty"><span><Sparkles size={19} /></span><strong>今天想创造什么？</strong><p>聊灵感、梳理画面，或让我准备一份可确认的图像方案。</p></div>}
+          {!props.messages.length && !attachedSkill && <div className="agent-empty"><span><Sparkles size={19} /></span><strong>今天想创造什么？</strong><p>没想法可以一起找方向，需求清楚就直接开始制作。</p></div>}
           {props.messages.map((message) => <Fragment key={message.id}>
-            <article className={`agent-message is-${message.role}`}>
-              <p>{message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}</p>
+            <article className={`agent-message is-${message.role} ${editingMessageId === message.id ? 'is-editing' : ''}`}>
+              {Number.isFinite(Date.parse(message.createdAt)) && <time className="agent-message-time" dateTime={message.createdAt} title={new Date(message.createdAt).toLocaleString(getIntlLocale())}>
+                {new Date(message.createdAt).toLocaleString(getIntlLocale(), { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}
+              </time>}
+              {editingMessageId === message.id ? <form className="agent-message-edit" onSubmit={async event => {
+                event.preventDefault()
+                if (messageEditBusy || props.busy || !editedMessageText.trim() || editedMessageText.trim() === message.content.trim()) return
+                setMessageEditBusy(true); setMessageActionError('')
+                try { if (await props.onEditMessage?.(message.id, editedMessageText)) setEditingMessageId(null) }
+                catch (error) { setMessageActionError(error instanceof Error ? error.message : '修改未能发送，请重试。') }
+                finally { setMessageEditBusy(false) }
+              }}>
+                <textarea ref={messageEditInput} aria-label="编辑已发送的消息" rows={2} value={editedMessageText} disabled={messageEditBusy} onChange={event => setEditedMessageText(event.target.value)}
+                  onKeyDown={event => { if (event.key === 'Escape' && !messageEditBusy) { event.preventDefault(); cancelMessageEdit() } if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }}/>
+                {messageActionError && <p className="agent-plan-error" role="alert">{messageActionError}</p>}
+                <footer><button type="button" disabled={messageEditBusy} onClick={cancelMessageEdit}>取消</button><button type="submit" disabled={messageEditBusy || props.busy || !editedMessageText.trim() || editedMessageText.trim() === message.content.trim()}>{messageEditBusy ? '发送中…' : '发送'}</button></footer>
+              </form> : <p className="agent-message-original"><OriginalText>{message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content}</OriginalText></p>}
+              {message.role === 'user' && <div className="agent-message-actions">
+                <button type="button" aria-label={copiedMessageId === message.id ? '已复制消息' : '复制消息'} title={copiedMessageId === message.id ? '已复制' : '复制'} onClick={async () => {
+                  try { await navigator.clipboard.writeText(message.content); setCopiedMessageId(message.id); setMessageActionError('') } catch { setMessageActionMessageId(message.id); setMessageActionError('复制失败，请选择文字后复制。') }
+                }}>{copiedMessageId === message.id ? <Check size={13}/> : <Copy size={13}/>}</button>
+                {props.onEditMessage && <button type="button" aria-label="编辑消息" title={props.busy ? '请等待回复完成，或先停止当前对话' : '编辑并重新发送'} disabled={props.busy} onClick={event => {
+                  messageEditTrigger.current=event.currentTarget; setMessageActionMessageId(message.id); setEditingMessageId(message.id); setEditedMessageText(message.content); setMessageActionError('')
+                }}><Pencil size={13}/></button>}
+              </div>}
+              {messageActionError && !editingMessageId && message.id === messageActionMessageId && <small className="agent-plan-error" role="status">{messageActionError}</small>}
               {message === latestMessage && canRetryLatest && <button type="button" className="agent-draft-action agent-retry-message" disabled={props.busy} onClick={() => props.onRetry(message.id)}><RotateCcw size={13} />重新发送</button>}
-              {message.role === 'user' && message.content.trim() && <button className="agent-message-memory" type="button" aria-label="将这条消息存为项目记忆" title="存为项目记忆" onClick={() => {
-                changeProjectView('memory')
-                setMemorySeed({ id: message.id, content: message.content.trim().slice(0, PROJECT_MEMORY_LENGTH) })
-              }}><Brain size={14} aria-hidden="true" /></button>}
-              {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <video className="video-reference-thumbnail" src={reference.url} muted playsInline preload="metadata" /> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}{reference.purpose ? ` · ${AGENT_REFERENCE_PURPOSES[reference.purpose]}` : ''}</span><Focus size={12} /></button>)}</div>}
-              {(message.turnOptions?.pace === 'quick' || message.turnOptions?.pace === 'deep' || message.turnOptions?.models?.text) && <p className="agent-turn-meta">{[
+              {!!message.references?.length && <div className="agent-message-references">{message.references.map((reference, index) => <button type="button" key={reference.nodeId} onClick={() => props.onLocateCanvasNode(reference.nodeId)} title={`${reference.name} · 定位到画布节点`}>{reference.kind === 'video' ? <VideoReferenceThumbnail reference={reference} name={reference.name} lazy/> : <img src={reference.url} alt="" />}<span>{reference.kind === 'video' ? '视频' : '图'}{index + 1} · {compactReferenceName(reference.name)}{reference.purpose ? ` · ${AGENT_REFERENCE_PURPOSES[reference.purpose]}` : ''}</span><Focus size={12} /></button>)}</div>}
+              {(message.turnOptions?.workflow || message.turnOptions?.pace === 'quick' || message.turnOptions?.pace === 'deep' || message.turnOptions?.models?.text) && <p className="agent-turn-meta">{[
+                AGENT_WORKFLOWS.find(item => item.value === message.turnOptions?.workflow)?.label,
                 message.turnOptions?.pace === 'quick' ? '快速' : message.turnOptions?.pace === 'deep' ? '深度' : '',
                 message.turnOptions?.models?.text?.name,
               ].filter(Boolean).join(' · ')}</p>}
@@ -1425,13 +1506,18 @@ export function AgentPanel(props: Props) {
                 </div>
               </section>
             })()}
+            {message.directions?.length && <AgentDirections directions={message.directions} disabled={props.busy || message !== latestMessage} onChoose={(direction, action) => {
+              submit(action === 'generate' ? `按「${direction.title}」生成。` : `继续细化「${direction.title}」，先不要生成。`, { messageId: message.id, directionId: direction.id, action })
+            }}/>}
             {renderAttachedPlans(plansByMessage.get(message.id) ?? [])}
-            {(videoPlansByMessage.get(message.id) ?? []).map(renderVideoPlan)}
+            {renderResultGroup(videoPlansByMessage.get(message.id) ?? [], 'video')}
+            {(videoPlansByMessage.get(message.id) ?? []).filter(plan => !plan.results?.length).map(renderVideoPlan)}
             {(textPlansByMessage.get(message.id) ?? []).map(renderTextPlan)}
           </Fragment>)}
           {props.busy && <div className="agent-thinking"><LoaderCircle size={14} className="is-spinning" /><span>正在理解你的创作目标...</span></div>}
           {renderAttachedPlans(orphanPlans)}
-          {orphanVideoPlans.map(renderVideoPlan)}
+          {renderResultGroup(orphanVideoPlans, 'video')}
+          {orphanVideoPlans.filter(plan => !plan.results?.length).map(renderVideoPlan)}
           {orphanTextPlans.map(renderTextPlan)}
           {props.filmReview && <AgentFilmReview key={props.filmReview.id} stage={props.filmReview.stage} onAnswer={props.filmReview.answer} />}
           {props.filmRun && <div className="agent-film-progress" role="status">
@@ -1442,9 +1528,8 @@ export function AgentPanel(props: Props) {
         </div>
       </div>
       <div className="agent-panel-composer" hidden={skillAuthoring || Boolean(projectView)}>
-        {teamEnabled && !attachedSkill && <button type="button" className="agent-team-indicator" onClick={() => changeProjectView('team')}><UsersRound size={14} aria-hidden="true" />{getAgentTeamTemplate(props.projectSettings.team.template).label} · {activeAgentTeamRoles(props.projectSettings.team).length} 个角色</button>}
         <div
-          className={`agent-composer-box reference-drop-zone ${referenceDropActive ? 'is-drop-active' : ''} `}
+          className={`agent-composer-box reference-drop-zone ${composerMode !== 'agent' ? 'is-media-mode' : ''} ${referenceDropActive ? 'is-drop-active' : ''} `}
           onDragEnter={(event) => {
             if (!Array.from(event.dataTransfer.items).some((item) => item.kind === 'file')) return
             event.preventDefault()
@@ -1470,6 +1555,12 @@ export function AgentPanel(props: Props) {
           }}
         >
           <span className="reference-drop-hint"><ImageUp size={15} />{acceptsVideoReference ? '松开以添加图片或视频参考' : '松开以添加参考图'}</span>
+          {composerMode === 'agent' && !attachedSkill && !guidedMessage && <div className="agent-workflow-control">
+            <div className="agent-action-hint"><AgentSelect className="agent-workflow-select" variant="floating" appearance="composer" minMenuWidth={272}
+              ariaLabel="Agent 工作方式" value={workflow} placeholder="智能模式" icon={<BrainCircuit size={16}/>} options={AGENT_WORKFLOWS.map(item => ({...item,icon:item.value === 'smart' ? <BrainCircuit size={16}/> : item.value === 'collaborate' ? <MessagesSquare size={16}/> : <Zap size={16}/>,label:item.value === 'smart' ? '智能模式' : item.value === 'collaborate' ? '协作模式' : item.label}))}
+              onChange={value => { const next=value as AgentWorkflow; setWorkflow(next); try { localStorage.setItem('disy-agent-workflow',next) } catch {} }} />
+              <span className="agent-action-tooltip" role="tooltip">{AGENT_WORKFLOWS.find(item => item.value === workflow)?.label} · {AGENT_WORKFLOWS.find(item => item.value === workflow)?.detail}</span></div>
+          </div>}
           {attachedSkill && <div className="agent-skill-attachment">
             <Wrench size={13} /><span title={attachedSkill.name}>{attachedSkill.name}</span>
             <button type="button" aria-label={`移除 Skill ${attachedSkill.name}`} onClick={() => { props.onRemoveSkill(); editorRef.current?.focus() }}><X size={13} /></button>
@@ -1517,6 +1608,7 @@ export function AgentPanel(props: Props) {
               else resizeEditor(editorRef.current.offsetHeight + (event.key === 'ArrowUp' ? 20 : -20))
             }}
           ><span aria-hidden="true" /></button>}
+          {composerMode === 'video' && !attachedSkill && videoWorkflow === 'edit' && <div className="agent-video-source-guide" role="status"><Film size={13}/><span>{inputVideos === 1 ? `原视频：${props.references.find(reference => reference.kind === 'video')?.name}${inputImages ? ` · ${inputImages} 张辅助图` : ''}` : '添加 1 段待编辑原视频；图片只作为辅助参考'}</span></div>}
           <div
             className={`agent-composer-input ${guidedMessage ? 'is-guided' : ''}`}
             style={!guidedMessage && editorHeight !== undefined ? { height: editorHeight, maxHeight: '56cqh' } : undefined}
@@ -1595,17 +1687,45 @@ export function AgentPanel(props: Props) {
           </motion.div>}</AnimatePresence>
           {!attachedSkill && draftOutputIntent?.message && <p className={`image-output-hint agent-image-output-hint ${draftOutputIntent.blocked ? 'is-unsupported' : ''}`} role="status">{draftOutputIntent.message}</p>}
           {promptError && <p className="agent-draft-error" role="status">{promptError}</p>}
+          <AnimatePresence initial={false}>{parameterHelpOpen && !mediaModel && composerMode !== 'agent' && <motion.p className="agent-parameter-help" role="status"
+            initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: reduceMenuMotion ? 0 : .18 }}>
+            <CircleHelp size={14} aria-hidden="true"/><span>{parameterLockReason}</span>
+          </motion.p>}</AnimatePresence>
+          <AnimatePresence initial={false}>{optimizingPrompt && <motion.p className="agent-draft-status" role="status"
+            initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: reduceMenuMotion ? 0 : .18 }}>正在优化提示词，原稿已保留。</motion.p>}</AnimatePresence>
           <footer className="agent-composer-footer">
             <div className="agent-composer-toolbar" ref={composerMenuRef}>
               <button type="button" className="agent-composer-add" aria-label="添加素材与工具" aria-expanded={composerMenu === 'add'} onClick={() => setComposerMenu(composerMenu === 'add' ? null : 'add')}><Plus size={20} /></button>
-              <AgentSelect className="agent-mode-select" variant="floating" minMenuWidth={180} ariaLabel="创作模式" value={composerMode} placeholder="Agent" icon={composerMode === 'image' ? <ImagePlus size={16} /> : composerMode === 'video' ? <Film size={16} /> : <MessageCircle size={16} />} options={[{ value: 'agent', label: 'Agent', detail: '对话、规划与自动创作' }, { value: 'image', label: '图像', detail: '生成或编辑图片' }, { value: 'video', label: '视频', detail: '通过 Agent 规划视频' }]} onChange={(value) => { setComposerMode(value); setPreferenceTab(value === 'video' ? 'video' : 'image'); setComposerMenu(null) }} />
+              <AgentSelect className="agent-mode-select" variant="floating" appearance="composer" minMenuWidth={216} ariaLabel="创作模式" value={composerMode} placeholder="Agent" icon={composerMode === 'image' ? <ImagePlus size={16} /> : composerMode === 'video' ? <Film size={16} /> : <MessageCircle size={16} />} options={[{ value: 'agent', label: 'Agent', detail: '对话、规划与自动创作' }, { value: 'image', label: '图像', detail: '生成或编辑图片' }, { value: 'video', label: '视频', detail: '选择模型与参数，规划视频' }]} onChange={(value) => { setComposerMode(value); if (value !== 'agent' && attachedSkill) props.onRemoveSkill(); setPromptError(''); setComposerMenu(null) }} />
+              {composerMode !== 'agent' && <>
+              <span className={`agent-parameter-control agent-action-hint ${!mediaModel ? 'is-locked' : ''} ${parameterHelpOpen ? 'is-explained' : ''}`} tabIndex={!mediaModel ? 0 : -1}
+                aria-label={!mediaModel ? '参数待解锁' : undefined} aria-describedby={!mediaModel ? `${mentionMenuId}-parameter-help` : undefined}
+                onClick={() => { if (!mediaModel) setParameterHelpOpen(true) }}
+                onKeyDown={event => { if (!mediaModel && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); setParameterHelpOpen(true) } }}>
+                <motion.button ref={parameterTriggerRef} type="button" className={`agent-parameter-summary ${composerMenu === 'parameters' && mediaModel ? 'is-open' : ''}`} disabled={!mediaModel}
+                  aria-label="生成参数" aria-expanded={Boolean(composerMenu === 'parameters' && mediaModel)} aria-describedby={!mediaModel ? `${mentionMenuId}-parameter-help` : undefined}
+                  title={mediaModel ? `调整生成参数 · ${parameterSummary}` : parameterLockReason} whileHover={reduceMenuMotion || !mediaModel ? undefined : { y: -1 }} whileTap={reduceMenuMotion || !mediaModel ? undefined : { scale: .97 }}
+                  onClick={() => { if (mediaModel) setComposerMenu(composerMenu === 'parameters' ? null : 'parameters') }}>
+                  {!mediaModel && <LockKeyhole size={12} aria-hidden="true"/>}<span>{mediaModel ? parameterSummary : '参数待解锁'}</span>
+                  {mediaModel && <motion.span className="agent-parameter-chevron" animate={{ rotate: composerMenu === 'parameters' ? 180 : 0 }} transition={{ duration: reduceMenuMotion ? 0 : .18 }}><ChevronDown size={12}/></motion.span>}
+                </motion.button>
+                {!mediaModel && <span id={`${mentionMenuId}-parameter-help`} className="agent-action-tooltip" role="tooltip">{parameterLockReason}</span>}
+              </span>
+              <AnimatePresence initial={false}>{composerMenu === 'parameters' && composerMode !== 'agent' && mediaModel && <AgentGenerationParameters
+                key={mediaKind} kind={mediaKind} modelName={mediaModel.name} options={parameterOptions} value={generationSettings} onChange={patchGenerationSettings} inputIssue={videoInputIssue}
+                onClose={() => { setComposerMenu(null); parameterTriggerRef.current?.focus() }} />}</AnimatePresence>
+
+              </>}
               {composerMenu === 'add' && <div className="agent-composer-popover agent-add-menu">
+                {!!draftInvocationText && <button type="button" className="agent-compact-prompt-action" disabled={optimizingPrompt || props.busy} onClick={() => { setComposerMenu(null); if (!props.textModelKey) props.onOpenApiSettings(); else void optimizePrompt() }}><WandSparkles size={16}/>{optimizingPrompt ? '正在优化提示词…' : '优化提示词'}</button>}
+                {promptBackups.at(-1)?.conversationId === props.activeConversationId && <button type="button" className="agent-compact-prompt-action" disabled={optimizingPrompt} onClick={() => { undoPromptOptimization(); setComposerMenu(null) }}><RotateCcw size={16}/>撤回提示词优化</button>}
                 <button type="button" onClick={() => { uploadInputRef.current?.click(); setComposerMenu(null) }}><ImageUp size={16} />上传素材</button>
                 {!props.agentOnly && <button type="button" onClick={() => { props.onPickFromCanvas(acceptsVideoReference ? 'video' : 'image', acceptsVideoReference ? 'omni' : undefined); setComposerMenu(null) }}><MousePointer2 size={16} />从画布选择</button>}
                 <button type="button" onClick={() => { setWebInputUrl(getInvocationText().match(/https?:\/\/[^\s<>"，。；！？）】]+/gi)?.[0] ?? ''); webInputVersion.current += 1; setComposerMenu(null) }}><Link2 size={16} />网页参考</button>
                 <button ref={skillButtonRef} type="button" onClick={() => { setSkillMenuOpen(true); setComposerMenu(null) }}><FilePlus2 size={16} />添加 Skill</button>
               </div>}
-              <button type="button" className={`agent-preferences-button ${props.imageModelKey || props.videoModelKey ? 'has-preference' : ''}`} aria-label="模型偏好" title="模型偏好" aria-expanded={composerMenu === 'models'} onClick={() => { setPreferenceTab(composerMode === 'video' ? 'video' : 'image'); setComposerMenu(composerMenu === 'models' ? null : 'models') }}><Box size={19} />{composerMode !== 'agent' && <span>{(composerMode === 'image' ? props.imageModels.find(m => m.key === props.imageModelKey) : props.videoModels.find(m => m.key === props.videoModelKey))?.name ?? (automaticModels ? '自动选择' : '选择模型')}</span>}</button>
+              {composerMode === 'agent' && <>
+              <button type="button" className={`agent-preferences-button ${props.imageModelKey || props.videoModelKey ? 'has-preference' : ''}`} aria-label="模型偏好" title="模型偏好" aria-expanded={composerMenu === 'models'} onClick={() => { setPreferenceTab('image'); setComposerMenu(composerMenu === 'models' ? null : 'models') }}><Box size={19} />{composerMode !== 'agent' && <span>{(composerMode === 'image' ? props.imageModels.find(m => m.key === props.imageModelKey) : props.videoModels.find(m => m.key === props.videoModelKey))?.name ?? (automaticModels ? '自动选择' : '选择模型')}</span>}</button>
               {composerMenu === 'models' && <section className="agent-composer-popover agent-preferences" aria-label="模型偏好设置">
                 <header><strong>模型偏好</strong><button type="button" onClick={() => setComposerMenu(null)} aria-label="关闭模型偏好"><X size={16} /></button></header>
                 <label className="agent-preferences-auto"><span>自动选择生成模型</span><input type="checkbox" role="switch" checked={automaticModels} onChange={(event) => {
@@ -1620,16 +1740,32 @@ export function AgentPanel(props: Props) {
                 {automaticModels ? <div className="agent-preferences-automatic"><Sparkles size={16} /><span>Agent 自动选择{preferenceTab === 'image' ? '图像' : '视频'}模型</span></div> : <AgentSelect variant="floating" minMenuWidth={245} ariaLabel="生成模型偏好" value={preferenceTab === 'image' ? props.imageModelKey : props.videoModelKey} placeholder={(preferenceTab === 'image' ? props.imageModels : props.videoModels).length ? '请选择具体模型' : '暂无可用模型，请先配置'} disabled={!(preferenceTab === 'image' ? props.imageModels : props.videoModels).length} options={(preferenceTab === 'image' ? props.imageModels : props.videoModels).map(model => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))} icon={<Sparkles size={14} />} onChange={preferenceTab === 'image' ? props.onImageModelChange : props.onVideoModelChange} />}
                 <p>{automaticModels ? '由 Agent 根据任务选择模型，可在生成确认卡中调整。' : '使用你指定的模型，生成确认卡中不再切换模型。'}</p>
               </section>}
+              </>}
               <input ref={uploadInputRef} className="agent-reference-upload-input" type="file" accept={acceptsVideoReference ? 'image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime' : 'image/png,image/jpeg,image/webp'} multiple aria-label="上传 Agent 参考素材" onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) void uploadReferences(files); event.target.value = '' }} />
             </div>
-            <div className="agent-composer-actions">
-              {promptBackup?.conversationId === props.activeConversationId && <button type="button" className="agent-draft-action" disabled={optimizingPrompt} onClick={undoPromptOptimization}><RotateCcw size={13} />撤回</button>}
-              {!!draftInvocationText && <button type="button" className="agent-draft-action" disabled={optimizingPrompt || props.busy} onClick={() => {
-                if (!props.textModelKey) { props.onOpenApiSettings(); return }
-                void optimizePrompt()
-              }}>{optimizingPrompt ? <LoaderCircle size={13} className="is-spinning" /> : <Sparkles size={13} />}{optimizingPrompt ? '优化中' : '优化'}</button>}
+            <div className="agent-composer-actions" ref={mediaControlsRef}>
+              {composerMode !== 'agent' && <>
+              {mediaModels.length ? <AgentSelect className="agent-composer-model" variant="floating" appearance="composer" menuAlign="end" minMenuWidth={280}
+                ariaLabel={mediaKind === 'image' ? '生图模型' : '视频模型'}
+                value={mediaModel?.key ?? ''}
+                placeholder={mediaKind === 'image' ? '选择生图模型' : '选择视频模型'}
+                options={mediaModels.map(model => ({ value: model.key, label: model.name, detail: model.connectionName, brand: getModelBrand(model.name) }))}
+                icon={mediaKind === 'image' ? <ImagePlus size={14}/> : <Film size={14}/>}
+                onChange={(key) => { (mediaKind === 'image' ? setManualImageModelKey : setManualVideoModelKey)(key); setPromptError('') }} />
+                : <button type="button" className="agent-configure-model" onClick={props.onOpenApiSettings}
+                  title={`配置 API 并启用${mediaKind === 'image' ? '图像' : '视频'}模型`}><SlidersHorizontal size={14}/>配置模型</button>}
+              </>}
+              {promptBackups.at(-1)?.conversationId === props.activeConversationId && <span className="agent-action-hint" tabIndex={optimizingPrompt ? 0 : -1}><motion.button type="button" className="agent-draft-action agent-undo-button" aria-label="撤回提示词优化" aria-describedby={`${mentionMenuId}-undo-help`} disabled={optimizingPrompt} onClick={undoPromptOptimization} whileTap={reduceMenuMotion ? undefined : { scale: .94 }}><RotateCcw size={14}/><span>撤回</span></motion.button><span id={`${mentionMenuId}-undo-help`} className="agent-action-tooltip" role="tooltip">{undoHint}</span></span>}
+              {!!draftInvocationText && <span className="agent-action-hint" tabIndex={optimizingPrompt || props.busy ? 0 : -1}><motion.button type="button" className={`agent-draft-action agent-optimize-button ${optimizingPrompt ? 'is-loading' : ''}`} aria-label={optimizingPrompt ? '正在优化提示词' : '优化提示词'} aria-busy={optimizingPrompt} aria-describedby={`${mentionMenuId}-optimize-help`} disabled={optimizingPrompt || props.busy}
+                whileHover={reduceMenuMotion || optimizingPrompt || props.busy ? undefined : { y: -1 }} whileTap={reduceMenuMotion ? undefined : { scale: .94 }} transition={{ type: 'spring', stiffness: 460, damping: 30 }} onClick={() => {
+                  if (!props.textModelKey) { props.onOpenApiSettings(); return }
+                  void optimizePrompt()
+                }}>{optimizingPrompt ? <LoaderCircle size={14} className="is-spinning"/> : <WandSparkles size={14}/>}<span>{optimizingPrompt ? '优化中' : '优化'}</span></motion.button><span id={`${mentionMenuId}-optimize-help`} className="agent-action-tooltip" role="tooltip">{optimizeHint}</span></span>}
               {props.busy && <button type="button" className="agent-stop-button" onClick={props.onStop} title="中止本次对话" aria-label="中止本次对话"><X size={16} /></button>}
-              {!guidedMessage && <button type="button" className="agent-send-button" onClick={() => submit()} title={props.busy ? '发送并调整方向' : '发送'} aria-label={props.busy ? '发送并调整方向' : '发送'}><ArrowUp size={17} /></button>}
+              {!guidedMessage && <span className={`agent-send-control ${videoInputIssue ? 'is-blocked' : ''}`} tabIndex={videoInputIssue ? 0 : -1} aria-describedby={videoInputIssue ? `${mentionMenuId}-send-help` : undefined}>
+                <button type="button" className="agent-send-button" disabled={Boolean(videoInputIssue)} aria-describedby={videoInputIssue ? `${mentionMenuId}-send-help` : undefined} onClick={() => submit()} title={videoInputIssue ?? (props.busy ? '发送并调整方向' : '发送')} aria-label={props.busy ? '发送并调整方向' : '发送'}><ArrowUp size={17} /></button>
+                {videoInputIssue && <span className="agent-send-requirement" id={`${mentionMenuId}-send-help`} role="tooltip">{videoInputIssue}</span>}
+              </span>}
             </div>
           </footer>
           <AnimatePresence>{skillMenuOpen && <AgentSkillMenu id={skillMenuId} menuRef={skillMenuRef} activeSkill={attachedSkill}

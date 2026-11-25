@@ -15,7 +15,9 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "jsxImportSource": "@disylab/i18n",
+    "paths": { "@disylab/i18n/*": ["./src/i18n/*"] }
   },
   "include": ["src"]
 }

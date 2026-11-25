@@ -2,7 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties
 import { Check, ChevronDown, MessageCircle } from 'lucide-react'
 
 type ModelBrand = 'openai' | 'gemini' | 'claude' | 'doubao' | 'jimeng' | 'kimi' | 'grok' | 'deepseek' | 'qwen' | 'glm' | 'minimax' | 'google' | 'generic'
-export type SelectOption = { value: string; label: string; detail?: string; brand?: ModelBrand }
+export type SelectOption = { value: string; label: string; detail?: string; brand?: ModelBrand; icon?: ReactNode }
 type SelectGroup = { label: string; options: SelectOption[] }
 
 const brandMeta: Record<ModelBrand, { label: string; glyph: string; color: string; background: string }> = {
@@ -64,7 +64,7 @@ function ModelBrandMark({ brand }: { brand: ModelBrand }) {
   )
 }
 
-export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [], icon, onChange, className = '', variant = 'default', disabled = false, minMenuWidth = 0 }: {
+export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [], icon, onChange, className = '', variant = 'default', disabled = false, minMenuWidth = 0, appearance = 'default', menuAlign = 'start' }: {
   ariaLabel: string
   value: string
   placeholder: string
@@ -76,6 +76,8 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
   variant?: 'default' | 'conversation' | 'floating'
   disabled?: boolean
   minMenuWidth?: number
+  appearance?: 'default' | 'composer'
+  menuAlign?: 'start' | 'end'
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -91,16 +93,22 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
     const trigger = triggerRef.current
     if (!menu || !trigger) return
     const rect = trigger.getBoundingClientRect()
-    const below = window.innerHeight - rect.bottom - 14
-    const above = rect.top - 14
+    const panel = appearance === 'composer' ? trigger.closest('.agent-panel')?.getBoundingClientRect() : undefined
+    const leftEdge = Math.max(12, (panel?.left ?? 0) + 12)
+    const rightEdge = Math.min(window.innerWidth - 12, (panel?.right ?? window.innerWidth) - 12)
+    const topEdge = Math.max(12, (panel?.top ?? 0) + 12)
+    const bottomEdge = Math.min(window.innerHeight - 12, (panel?.bottom ?? window.innerHeight) - 12)
+    const below = bottomEdge - rect.bottom - 8
+    const above = rect.top - topEdge - 8
     const upward = below < 210 && above > below
     menu.dataset.direction = upward ? 'up' : 'down'
-    const width = Math.min(Math.max(rect.width, minMenuWidth), window.innerWidth - 16)
-    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`
+    const width = Math.max(0, Math.min(Math.max(rect.width, minMenuWidth), rightEdge - leftEdge))
+    const preferredLeft = menuAlign === 'end' ? rect.right - width : rect.left
+    menu.style.left = `${Math.max(leftEdge, Math.min(preferredLeft, rightEdge - width))}px`
     menu.style.width = `${width}px`
-    menu.style.top = upward ? 'auto' : `${rect.bottom + 5}px`
-    menu.style.bottom = upward ? `${window.innerHeight - rect.top + 5}px` : 'auto'
-    menu.style.maxHeight = `${Math.min(260, upward ? above : below)}px`
+    menu.style.top = upward ? 'auto' : `${rect.bottom + 8}px`
+    menu.style.bottom = upward ? `${window.innerHeight - rect.top + 8}px` : 'auto'
+    menu.style.maxHeight = `${Math.max(0, Math.min(appearance === 'composer' ? 328 : 260, upward ? above : below))}px`
     menu.showPopover()
     const close = () => setOpen(false)
     const pane = trigger.closest('.agent-project-pane, .agent-panel-messages, .agent-reference-purposes')
@@ -111,7 +119,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
       window.removeEventListener('resize', close)
       if (menu.matches(':popover-open')) menu.hidePopover()
     }
-  }, [open, disabled, variant, minMenuWidth])
+  }, [open, disabled, variant, minMenuWidth, appearance, menuAlign])
 
   useEffect(() => {
     if (!open) return
@@ -151,12 +159,13 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
         window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.agent-select-trigger')?.focus())
       }}
     >
-      <span className="agent-select-option-main">
+      <span className="agent-select-option-main" title={option.label}>
         {option.brand && <ModelBrandMark brand={option.brand} />}
+        {!option.brand && option.icon && <span className="agent-select-option-icon" aria-hidden="true">{option.icon}</span>}
         {variant === 'conversation' && <MessageCircle size={15} aria-hidden="true" />}
         <span className="agent-select-option-text"><strong>{option.label}</strong>{option.detail && <small>{option.detail}</small>}</span>
       </span>
-      {option.value === value && <Check size={14} />}
+      {option.value === value && <Check size={14} aria-hidden="true" />}
     </button>
   )
 
@@ -180,7 +189,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
         }}
       >
         <span className="agent-select-icon" style={{ width: 20, display: 'inline-grid', placeItems: 'center' }}>
-          {selectedBrand ? <ModelBrandMark brand={selectedBrand} /> : icon}
+          {selectedBrand ? <ModelBrandMark brand={selectedBrand} /> : selected?.icon ?? icon}
         </span>
         <span className={`agent-select-value ${selected ? '' : 'is-placeholder'}`}>{selected?.label ?? placeholder}</span>
         <ChevronDown size={14} className="agent-select-chevron" />
@@ -188,7 +197,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
         <div
           ref={menuRef}
           id={menuId}
-          className={`agent-select-menu is-${variant}`}
+          className={`agent-select-menu is-${variant} ${appearance === 'composer' ? 'is-composer-menu' : ''}`}
           data-expanded={open && !disabled}
           popover={variant === 'floating' ? 'manual' : undefined}
           role="listbox"
@@ -212,6 +221,8 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
             }
           }}
         >
+          {appearance === 'composer' && <div className="agent-composer-menu-heading" aria-hidden="true"><span>{ariaLabel}</span><small>{availableOptions.length} 个选项</small></div>}
+          <div className={appearance === 'composer' ? 'agent-composer-menu-options' : 'agent-select-options'} role="presentation">
           {variant === 'conversation' && <div className="agent-select-menu-heading" aria-hidden="true">对话记录</div>}
           {options.map(renderOption)}
           {groups.filter((group) => group.options.length).map((group) => (
@@ -221,6 +232,7 @@ export function AgentSelect({ ariaLabel, value, placeholder, options, groups = [
             </div>
           ))}
           {!availableOptions.length && <p>暂无可用选项</p>}
+          </div>
         </div>
     </div>
   )

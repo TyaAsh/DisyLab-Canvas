@@ -16,6 +16,10 @@
  */
 
 :root {
+  --dialog-width: 1120px;
+  --dialog-height: 700px;
+  --dialog-surface: #17191b;
+  --dialog-radius: 17px;
   /* 全局字体。中文字体放在后面作为回退。 */
   --disy-font-family: 'Manrope', 'DM Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif;
 
@@ -43,6 +47,69 @@
   --line: rgba(245, 247, 242, .105);
   --canvas-dot: rgba(227, 232, 224, .17);
 }
+
+/* Shared outer shell: project, inspiration, assets, history, settings and Skills. */
+body .disy-shell :is(.project-modal,.prompt-library-panel,.asset-library-modal,.generation-history-modal,.api-manager-modal,.storage-modal,.skill-factory-modal) {
+  width: min(var(--dialog-width), calc(100vw - 48px));
+  height: min(var(--dialog-height), calc(100dvh - 48px));
+  max-width: calc(100vw - 48px);
+  max-height: calc(100dvh - 48px);
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--dialog-radius);
+  color: var(--ink);
+  background: var(--dialog-surface) !important;
+  box-shadow: 0 24px 84px rgba(0,0,0,.54) !important;
+  border-color: var(--line) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  overflow: hidden;
+}
+body .disy-shell :is(.project-modal-header,.prompt-library-header,.asset-library-header,.api-manager-heading) {
+  background: transparent;
+  box-shadow: none;
+}
+body .disy-shell .project-modal { display: flex; flex-direction: column; }
+body .disy-shell .project-modal :is(.project-grid,.project-list) { min-height:0; flex:1; overflow:auto; }
+body .disy-shell .settings-sidebar { background: transparent; }
+body .disy-shell :is(.api-manager-body,.api-connection-list,.api-connection-editor) { background-color: transparent; }
+.language-settings-panel { min-width:0; min-height:0; padding:28px; overflow:auto; }
+.prompt-library-filter-strip > div:not(.prompt-category-manager) { grid-template-columns:max-content minmax(0,1fr); column-gap:14px; }
+.prompt-library-filter-strip > div > strong { white-space:nowrap; min-width:max-content; }
+.prompt-filter-chips { min-width:0; gap:7px; }
+.prompt-filter-chips button { flex:none; white-space:nowrap; max-width:100%; }
+.image-output-toggles { display:grid; gap:8px; }
+.image-output-toggles > button { display:flex; width:100%; align-items:center; justify-content:space-between; gap:12px; border:1px solid var(--line); border-radius:9px; padding:10px 12px; color:var(--ink); background:transparent; cursor:pointer; transition:background .18s,border-color .18s; }
+.image-output-toggles > button[aria-checked="true"] { border-color:var(--accent-border); background:var(--accent-soft); }
+.image-output-toggles i { display:block; width:28px; height:16px; padding:2px; border-radius:10px; background:rgba(255,255,255,.16); }
+.image-output-toggles i:after { content:''; display:block; width:12px; height:12px; border-radius:50%; background:var(--muted); transition:transform .18s; }
+.image-output-toggles [aria-checked="true"] i { background:var(--accent); }
+.image-output-toggles [aria-checked="true"] i:after { transform:translateX(12px); background:#fff; }
+.language-settings-panel > header { display:flex; gap:12px; align-items:flex-start; margin-bottom:30px; }
+.language-settings-panel > header > svg { flex:none; color:var(--muted); margin-top:3px; }
+.language-settings-panel h3 { margin:0 0 5px; font-size:16px; }
+.language-settings-panel p { color:var(--muted); margin:0; line-height:1.7; }
+.language-settings-panel fieldset { border:0; padding:0; margin:0; max-width:540px; }
+.language-settings-panel legend { padding:0 0 12px; color:var(--muted); }
+.language-options { display:grid; gap:10px; }
+.language-settings-panel .language-options label { display:flex; gap:13px; align-items:center; min-height:76px; padding:14px 16px; margin:0; border:1px solid var(--line); border-radius:11px; color:var(--ink); cursor:pointer; transition:background .18s,border-color .18s; }
+.language-options label:hover { background:rgba(255,255,255,.025); }
+.language-options label.is-selected { border-color:var(--accent-border); background:var(--accent-soft); }
+.language-options label:focus-within { outline:2px solid var(--accent); outline-offset:2px; }
+.language-settings-panel .language-options input { width:16px; height:16px; margin:0; padding:0; accent-color:var(--accent); }
+.language-options label > span { display:grid; flex:1; gap:4px; }
+.language-options label small { color:var(--muted); font-weight:400; }
+.language-options label > svg { color:var(--accent); }
+.language-settings-panel .language-settings-note { max-width:540px; margin-top:22px; font-size:12px; }
+html[lang="en"] :is(.settings-sidebar,.canvas-tools,.agent-composer-footer) { letter-spacing:0; }
+html[lang="en"] .settings-sidebar button { white-space:normal; line-height:1.4; min-height:38px; }
+@media(max-width:640px) {
+  body .disy-shell :is(.project-modal,.prompt-library-panel,.asset-library-modal,.generation-history-modal,.api-manager-modal,.storage-modal,.skill-factory-modal) {
+    width:calc(100vw - 16px); height:calc(100dvh - 16px); max-width:calc(100vw - 16px); max-height:calc(100dvh - 16px); border-radius:14px;
+  }
+  .language-settings-panel { padding:20px 16px; }
+}
+@media(prefers-reduced-motion:reduce) { .language-options label { transition:none; } }
 
 html,
 body,

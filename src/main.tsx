@@ -14,6 +14,7 @@ import App from './App'
 import { DesktopWindowFrame } from './DesktopWindowFrame'
 import { isDesktopApp } from './providerTransport'
 import { installProductionSourceShield } from './sourceShield'
+import { LanguageProvider } from './i18n/react'
 import './tailwind.css'
 import './styles.css'
 import './theme-custom.css'
@@ -66,11 +67,11 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error
   }
 }
 
-const app = <AppErrorBoundary>
+const app = <LanguageProvider><AppErrorBoundary>
   <ReactFlowProvider>
     <App />
   </ReactFlowProvider>
-</AppErrorBoundary>
+</AppErrorBoundary></LanguageProvider>
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>{isDesktopApp() ? <DesktopWindowFrame>{app}</DesktopWindowFrame> : app}</StrictMode>,

@@ -30,17 +30,18 @@ test('a confirmed alternative retries with original request and stops on success
   }, { chooseNext: async (current, error) => { confirmations.push([current, error.message]); return 'claude' } })
   assert.equal(result, 'answer'); assert.deepEqual(attempted, ['gpt', 'claude']); assert.deepEqual(confirmations, [['gpt','503']])
 })
-test('hung request aborts and waits for approval even when provider ignores signals', async () => {
-  let firstSignal; let approve; const attempted = []
-  const promise = runTextModelRecovery(1, async (candidate, signal) => {
-    attempted.push(candidate)
-    if (candidate === 1) { firstSignal = signal; return new Promise(() => {}) }
-    return 'backup'
-  }, { attemptTimeoutMs: 10, chooseNext: () => new Promise(resolve => { approve = resolve }) })
-  await new Promise(resolve => setTimeout(resolve, 30))
-  assert.equal(firstSignal.aborted, true); assert.deepEqual(attempted, [1])
-  approve(2)
-  assert.equal(await promise, 'backup'); assert.deepEqual(attempted, [1,2])
+test('model requests have no local deadline and can finish after hours', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let finish; let asked = false; let signal
+  const result = runTextModelRecovery('model', (_, attemptSignal) => {
+    signal = attemptSignal
+    return new Promise(resolve => { finish = resolve })
+  }, { chooseNext: async () => { asked = true; return undefined } })
+  t.mock.timers.tick(24 * 60 * 60_000)
+  assert.equal(signal.aborted, false)
+  assert.equal(asked, false)
+  finish('模型完成了回复')
+  assert.equal(await result, '模型完成了回复')
 })
 test('user cancellation aborts the active provider without opening recovery', async () => {
   const controller = new AbortController(); let asked = false

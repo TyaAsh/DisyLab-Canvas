@@ -14,10 +14,12 @@ import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
+import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { onRequestGet as serveToolboxMedia } from './functions/toolbox/media.js'
 import { onRequest as relayProvider } from './functions/provider/[[path]].js'
+import { mediaHostAllowed } from './functions/apiyi/media.js'
 
 const rightsBanner = '/*! DisyLab v2.0.0 | Copyright (c) 2026 DisyLab. All rights reserved. | LicenseRef-DisyLab-Proprietary | ash::tya origin build | Unauthorized commercial use, redistribution, white-labeling, relicensing, or removal of this notice is prohibited. | Repository: https://github.com/TyaAsh/DisyLab-Canvas */'
 
@@ -269,11 +271,6 @@ const apiYiMediaRelayPlugin: Plugin = {
           return
         }
         let targetUrl = new URL(target)
-        const mediaHostAllowed = (url: URL) => url.protocol === 'https:'
-          && !url.username && !url.password && !url.port
-          && (/(?:^|\.)apiyi\.com$|(?:^|\.)volces\.com$|(?:^|\.)aliyuncs\.com$|(?:^|\.)visionary\.beer$|(?:^|\.)aixinai\.net$|(?:^|\.)gptgod\.online$|(?:^|\.)gptgod\.com$|^www\.qixinai\.net$|^file\.hfsyapi\.cn$|^file[1-9]\d?\.aitohumanize\.com$/i.test(url.hostname)
-            || ['vidgen.x.ai', 'veo-video.gptkey.asia'].includes(url.hostname)
-            || (url.hostname === '8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com' && url.pathname.startsWith('/video/')))
         if (!mediaHostAllowed(targetUrl)) {
           response.statusCode = 403
           response.end('media host not allowed')
@@ -331,13 +328,17 @@ const apiYiMediaRelayPlugin: Plugin = {
 }
 
 export default defineConfig({
+  optimizeDeps: { exclude: ['@disylab/i18n/jsx-runtime', '@disylab/i18n/jsx-dev-runtime'] },
   // React Flow must use the same React module instance as the application.
   // Without this, Vite's dependency optimizer can serve separate module
   // instances in development and trigger React's "Invalid hook call" error.
   resolve: {
     dedupe: ['react', 'react-dom'],
+    alias: { '@disylab/i18n': fileURLToPath(new URL('./src/i18n', import.meta.url)) },
   },
-  plugins: [tailwindcss(), react(), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin, {
+  // A source-root import prevents the JSX runtime from being prebundled with
+  // a second copy of the language store (which would require a page reload).
+  plugins: [tailwindcss(), react({ jsxImportSource: '/src/i18n' }), disyLabRightsBannerPlugin, apiYiMediaRelayPlugin, {
     name: 'official-provider-relay',
     configureServer(server) {
       server.middlewares.use('/provider', async (req, res) => {

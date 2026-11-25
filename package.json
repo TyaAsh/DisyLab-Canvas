@@ -17,15 +17,15 @@
   "scripts": {
     "dev": "vite --strictPort",
     "build": "tsc -b && vite build",
-    "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library",
+    "test": "npm run test:i18n && npm run test:providers && npm run test:relay && npm run test:toolbox && npm run check:prompt-library",
+    "test:i18n": "node --test src/i18n/i18n.test.mjs src/imageParameterOptions.test.mjs",
     "test:toolbox": "node --disable-warning=ExperimentalWarning --test src/watermark.test.mjs",
     "test:relay": "node --test functions/relay.test.mjs",
-    "test:providers": "node --test src/providerCatalogSync.test.mjs src/textModelPolicy.test.mjs src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/agentRuntime.test.mjs src/museWeb.test.mjs",
-    "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs"
+    "test:providers": "node --test src/providerCatalogSync.test.mjs src/store.test.mjs src/textModelPolicy.test.mjs src/textRequestHistory.test.mjs src/providerLifecycle.test.mjs src/imageApi.test.mjs src/nodeReferences.test.mjs src/videoReferenceImageFit.test.mjs src/videoThumbnail.test.mjs src/agentRuntime.test.mjs src/promptOptimization.test.mjs",
+    "check:prompt-library": "node scripts/check-prompt-library-integrity.mjs",
+    "start": "node scripts/start-local.mjs"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
@@ -38,6 +38,7 @@
     "handlebars": "^4.7.9",
     "idb": "^8.0.3",
     "lucide-react": "^0.546.0",
+    "opencc-js": "1.4.2",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^5.7.284",
     "react": "^19.2.6",
@@ -49,7 +50,6 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
-    "@tauri-apps/cli": "^2.12.4",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.185.4",

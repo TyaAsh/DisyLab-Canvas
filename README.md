@@ -21,95 +21,78 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-2.0.0-77bdf2" />
-  <img alt="React" src="https://img.shields.io/badge/React-19-149eca" />
-  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-6-3178c6" />
-  <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646cff" />
-  <img alt="Tailwind CSS" src="https://img.shields.io/badge/Tailwind_CSS-4-06b6d4" />
+  <img alt="Version" src="https://img.shields.io/badge/version-2.0.3-77bdf2" />
 </p>
 
 > [!IMPORTANT]
 > DisyLab 是源码公开可见（source-available）的专有软件，不是开源软件。未经书面许可，不得商用、售卖、白标、再分发或将本项目及其修改版本用于收费服务。详见[中文授权声明](LICENSE.zh-CN.md)与[英文许可证](LICENSE)。
 
-## 产品概览
+## 这是什么？
 
-DisyLab 将文本、参考图、生成图片、生成视频、资产和 Agent 对话组织在可追溯的无限画布中。项目数据默认保存在浏览器本地，API Key 仅保存在当前浏览器会话，不写入仓库，也不由 DisyLab 托管。
+DisyLab Canvas 是一张用来做设计和视频的 AI 无限画布。你可以把想法、参考图、视频、提示词和生成结果放在一起，边聊边做，不用在多个工具之间来回搬素材。
 
 ![DisyLab 无限画布](docs/assets/y2k-canvas-overview.png)
 
-## 核心能力
+## 第一次使用，跟着这四步走
 
-### 无限画布与创作资产
+1. 打开[在线版](https://disylab.pages.dev/)，新建一个项目。
+2. 在「设置 → API 设置」中填写自己的厂商地址和 API Key，获取模型后，勾选要用的文字、图像或视频模型。生成费用由你选择的厂商收取。
+3. 打开 Disy Agent，说出想做什么；有参考图或视频就一起添加。没有完整想法也可以先聊方向。
+4. 查看结果，不满意可以继续描述修改。完成后下载素材，或导出 `.disy` 项目包，留作备份。
 
-- 多项目、多画布、节点连接、组合、框选、小地图与可见区域性能优化。
-- 图层面板可悬浮或固定在左侧，支持打组、复制、重命名和拖动排序。
-- 文本、图片、视频、上传素材与工作流模板可在同一画布中组合。
-- 资产库、生成历史、输出历史及 `.disy` 工作区导入导出。
-- 系统剪贴板图片粘贴、参考素材引用和项目级风格预设。
+例如：“帮我做一张暖色咖啡海报，竖版 9:16，不要文字。”
 
-### Disy Agent
+**重要：**在线版的数据保存在当前浏览器，不是云端同步。清理浏览器数据或换设备前，请先导出项目。API Key 不会随项目包导出。
 
-- 基于当前项目、画布、选中节点、素材关系与历史对话构建上下文。
-- 根据用户意图自动识别讨论、规划和执行请求。
-- 项目记忆可复用项目约定，任务中心可查看执行状态，团队协作可按创作场景选择角色与模型。
-- 图片、视频和文本方案在执行前提供可编辑确认卡。
-- 每个图片或视频方案均可单独选择模型和支持的规格，图片方案还可调整生成数量。涉及画布编辑时，可先在对话中审阅改动。
-- Agent 在任务发起画布继续后台运行；用户可以切换到其他项目或画布，结果仍准确写回原位置。
-- 长对话自动压缩为上下文摘要，减少信息丢失与重复提问。
+## 最近更新
+
+- **三种界面语言**：在「设置 → 语言与显示」中切换简体中文、繁體中文或 English，立即生效，不需要刷新页面。
+- **更自然的 Agent 对话**：智能模式会根据需求清晰程度给建议或推进制作；协作模式先讨论方案；直接生成模式减少不必要的确认。重要信息缺失或需求有冲突时，仍会先说明。
+- **图片和视频自己选模型**：模型、比例、清晰度、时长等参数在输入区就能调整，可选范围跟随当前模型。视频提供参考图/视频、视频编辑、首尾帧三种工作方式，支持情况由模型决定。
+- **图像规格补齐**：补入 Seedream 5.5 的 21:9、9:21 等比例；支持的模型会显示透明背景、生成 GIF 开关。节点和 Agent 使用同一套能力配置，避免两边参数不一致。
+- **消息可复制、可编辑**：悬停到自己发送的消息即可操作。编辑在原消息内进行，底部输入框保留；对话消息显示时间。
+- **结果更容易找**：多张图片、多段视频可以打开列表查看和切换。输出历史展示成功、失败和真实错误，便于排查余额、权限或下载问题。
+- **参考素材更稳妥**：视频参考图居中适配目标画幅，避免硬拉伸；提示词明确要求保留完整内容时采用保留内容的处理方式。生成模型本身仍可能改变细节。
+- **界面更整齐**：项目、灵感库、资产库、生成历史和设置统一弹窗尺寸与外观，修复英文分类挤压及重复“自适应”。
+- 已移除项目记忆、旧团队协作入口及 MUSE 接入，减少理解和配置负担。
+
+## Disy Agent：从没想法到做出东西
+
+你可以只说用途和想要的感觉，也可以直接给出模型、画幅、数量及参考素材。Agent 会结合当前画布继续对话，必要时提供方向或可编辑确认卡；明确的制作要求可以直接推进。
+
+确认卡保留了模型、提示词与规格的调整入口。“先给方案，暂时不要生成”同样有效。提示词优化完成后可以撤回，恢复优化前的内容。
 
 ![Disy Agent 方案确认](docs/assets/y2k-agent-plans.png)
 
-### 图片与视频工作流
+## 在画布上整理素材与结果
 
-- 多 API 连接与模型目录，按文本、图片、视频能力分类。
-- 图片多结果、画廊浏览、下载、宫格切分、扩图、本地抠图与局部修改。
-- 文生视频、图生视频、首尾帧、图片参考和全能参考模式。
-- 生成视频优先归档为本地 Blob；远程链接受 CORS、防盗链或签名影响时通过受控同源转发恢复。
-- 视频支持下载、加入资产库、截取当前帧/首帧/尾帧、时间轴剪辑和画布内裁剪。
-- 厂商预设包括 GRS AI、HFSY API、万象 API、MiniMax、xAI 和火山方舟。可按文本、图像和视频启用所需模型。
+- 使用多个项目和画布整理不同任务，连接节点来说明素材关系。
+- 图片和视频支持上传、生成、下载，以及从多个结果中挑选主要版本。
+- 参考图、参考视频可以拖动排序；视频缩略图帮助你辨认素材。
+- 资产库用来收纳可重复使用的素材；生成历史和输出历史用来查找结果及任务记录。
+- 图片支持局部修改、扩图、抠图和宫格切分；视频支持截帧、裁剪及已有的编辑工具。
+- 灵感库提供参考案例；Skill 把常用的创作步骤整理成可复用流程，也能导入自己的 Skill。
+- 文件工具箱提供图片、视频、PDF 压缩和 PDF 合并等本地工具。
 
 ![DisyLab 资产库](docs/assets/y2k-assets.png)
 
-### 本地工具与提示库
-
-- 图片、视频和 PDF 压缩、PDF 合并，以及图片与视频的选区去水印。公开链接的读取取决于来源平台。
-- 内置可搜索提示库、参考案例和工作流模板。
-- 在 Disy Agent 中使用逐步引导 Skill，每次回答一个问题。文本、图片与视频节点可调用直接应用的 Skill，也支持导入自定义 Skill。
-
-### Windows 桌面版
-
-- Windows 桌面版暂时停止公开下载。可使用[网页版](https://disylab.pages.dev/)。
-- 即梦账号通过官方 CLI 授权。Muse 账号在独立的桌面网页会话中登录，可用模型取决于账号权限。
-- macOS 版稍后推出。
-
-## 隐私与安全
-
-- 项目、画布、资产、历史与 Agent 会话默认存储在 IndexedDB 或浏览器存储中。
-- API Key 只保存在 `sessionStorage`，不会写入项目文件或 `.disy` 工作区包。
-- 使用 HFSY 生成视频时，选中的本地参考图会临时上传到 DisyLab 的参考图服务，供 HFSY 读取，四小时后自动过期。
-- 媒体代理仅允许受支持的 HTTPS 域名，并限制重定向目标。
-- 请勿在 Issue、截图、聊天记录或提交中公开 API Key；发生泄露后应立即在服务商控制台撤销。
-
-## 技术栈
-
-| 分类 | 技术 |
-|---|---|
-| 前端 | React 19、TypeScript 6、Vite 8 |
-| 样式 | Tailwind CSS 4、少量复杂画布/媒体交互 CSS |
-| 画布与状态 | React Flow 12、Zustand 5、IndexedDB |
-| 动效与 3D | Framer Motion、GSAP、Three.js |
-| 文档与本地推理 | PDF.js、pdf-lib、Transformers.js |
-| 校验与模板 | Zod、Handlebars |
-| 桌面端 | Tauri 2、Rust、WebView2 |
-| 边缘层 | Cloudflare Pages、Pages Functions |
-
 ## 本地运行
 
-### 环境要求
+### Windows 双击启动
 
-- Node.js 22.12 或更高版本
-- npm 10.8 或更高版本
-- 最新版 Chrome 或 Edge
+先安装 **Node.js 22.12 或以上版本**。第一次下载项目后，在项目文件夹打开终端，运行一次：
+
+```bash
+npm ci
+```
+
+以后双击项目中的 **“启动 DisyLab.vbs”** 即可。启动器会检查本地服务，未运行就自动启动，然后打开浏览器；再次双击会复用已经运行的服务。
+
+默认地址：`http://127.0.0.1:1420/`。浏览器关掉后本地服务仍可继续运行；重启电脑后，再双击启动器即可。
+
+遇到启动问题时，查看项目内 `.local/run/startup-error.txt` 或 `server.log`。这些本机日志不会上传到仓库。
+
+### 使用命令行
 
 ```bash
 git clone https://github.com/TyaAsh/DisyLab-Canvas.git
@@ -118,82 +101,34 @@ npm ci
 npm run dev
 ```
 
-默认地址：`http://127.0.0.1:1420/`
+这个仓库当前发布网页版源码，不包含桌面安装包工程。双击启动器启动的也是本地网页版。
 
-在应用内打开「API 设置」，添加自己的连接并启用所需模型。
+## 数据与隐私
 
-### Windows 桌面开发
+- 项目、画布、素材、历史与对话默认保存在当前设备的浏览器存储中。请定期导出 `.disy` 项目包。
+- API Key 只保留在当前浏览器标签页会话中，不写入项目包或代码仓库。
+- 请求生成时，提示词和所选参考素材会发送给你配置的模型厂商。
+- HFSY 视频需要公网参考素材时，所选本地素材会临时上传到参考素材服务，供厂商读取，通常四小时后过期。
+- 不要在截图、Issue 或公开聊天里贴 API Key。若已泄露，请到厂商控制台撤销并更换。
 
-安装 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 WebView2 后运行：
+## 部署与检查
 
-```powershell
-npm run desktop:dev
-npm run desktop:build
-```
-
-安装包输出到 `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`。
-
-## 质量检查
+在线应用：[disylab.pages.dev](https://disylab.pages.dev/)；[项目介绍页](https://tyaash.github.io/DisyLab-Canvas/)与在线应用分开发布。
 
 ```bash
-npm run typecheck
 npm test
-npm run build
-```
-
-测试覆盖模型供应商生命周期、媒体转发安全、Agent 模式与上下文运行时、节点引用、故事板和提示库完整性。
-
-## 项目结构
-
-```text
-src/                  React 应用、画布、Agent、媒体与本地数据层
-functions/            Cloudflare Pages Functions 与受控媒体/API 转发
-public/               运行时静态资源、提示库与工作流封面
-scripts/              提示库完整性与工作流检查
-src-tauri/            Windows 桌面应用与安装包配置
-docs/assets/          产品文档配图
-site/                 GitHub Pages 项目介绍页
-.github/workflows/     GitHub Pages 自动发布工作流
-```
-
-主要入口：
-
-- `src/App.tsx`：画布、项目、节点、资产与设置主界面。
-- `src/AgentPanel.tsx`：Disy Agent 对话与方案确认界面。
-- `src/agent.ts`：Agent 上下文、意图识别、方案解析与运行状态。
-- `src/imageApi.ts`：模型目录、生成任务、轮询、媒体归档与错误诊断。
-- `src/localDb.ts`：IndexedDB 工作区、画布、资产和 Agent 会话存储。
-- `functions/apiyi/media.js`：生产环境媒体转发与安全校验。
-
-## 部署
-
-生产应用部署在 [Cloudflare Pages](https://disylab.pages.dev/)：
-
-- Build command：`npm run build`
-- Build output：`dist`
-- Node.js：22.12+
-- Pages Functions：仓库根目录 `functions/`
-
-命令行发布：
-
-```bash
 npm run build
 npx wrangler pages deploy dist --project-name disylab --branch main
 ```
 
-`site/` 是独立的项目介绍页，由 `.github/workflows/pages.yml` 发布到 GitHub Pages；在线应用以 Cloudflare Pages 为准。
+第一次部署需要登录自己的 Cloudflare 账号。使用其他项目名时，把命令里的 `disylab` 换成你的 Pages 项目名。
 
-## 当前边界
+## 反馈与联系
 
-当前提供网页版，项目数据保存在当前设备。跨设备可通过 `.disy` 项目包迁移。macOS、简易视频剪辑台和剧本工厂列在项目介绍页的路线图中。
+反馈问题时，请说明操作步骤、想得到的结果、实际结果，以及浏览器和模型名称；附图会更容易定位。请勿附带 API Key。
 
-## 文档与反馈
-
-- [2.0 正式版发布说明](https://github.com/TyaAsh/DisyLab-Canvas/releases/tag/v2.0.0)
+- [提交问题](https://github.com/TyaAsh/DisyLab-Canvas/issues)
 - [项目路线图](https://tyaash.github.io/DisyLab-Canvas/#roadmap)
-
-反馈建议包含复现步骤、预期结果、浏览器/系统版本和模型名称；请勿附带 API Key。
-
 - 小红书：Disy宇宙电波
 - 邮箱：ashhaveaniceday@gmail.com
 
@@ -201,9 +136,9 @@ npx wrangler pages deploy dist --project-name disylab --branch main
 
 Copyright © 2026 DisyLab. All rights reserved.
 
+DisyLab 是源码公开可见的专有软件，公开可见或可 fork 不代表获得商用、分发或衍生作品授权。
+
 - [中文授权声明](LICENSE.zh-CN.md)
 - [English License](LICENSE)
 - [权利标记与第三方边界](NOTICE.md)
 - [商业授权咨询](COMMERCIAL-LICENSE.md)
-
-公开可见或可 fork 不代表获得商用、分发或衍生作品授权。任何商业许可均须由版权所有者另行书面确认。

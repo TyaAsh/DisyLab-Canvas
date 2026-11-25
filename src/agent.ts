@@ -9,6 +9,7 @@
  */
 import type { AgentCanvasEditDraft, AgentCanvasEditProposal } from './agentCanvasEdits'
 import type { AgentImageOperationDraft } from './agentImageOperations'
+import type { AgentCreativeDirection, AgentWorkflow } from './agentInteraction'
 
 export type AgentMessage = {
   id: string
@@ -19,6 +20,7 @@ export type AgentMessage = {
   turnOptions?: AgentTurnOptions
   skillUseId?: string
   questions?: AgentQuestion[]
+  directions?: AgentCreativeDirection[]
   mediaBrief?: { requests: string[]; referenceRequests?: string[]; replaces?: string }
   canvasEditDraft?: AgentCanvasEditDraft
   canvasEditTargetQuestion?: boolean
@@ -27,7 +29,6 @@ export type AgentMessage = {
     userMessageId: string
     invocationText: string
     videoGenerationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
-    useTeam: boolean
     legacyStoryboardPlanId?: string
   }
   filmPlan?: {
@@ -59,17 +60,32 @@ export type AgentPace = 'auto' | 'quick' | 'deep'
 export type AgentWebReference = { url: string; title: string; summary: string; observations: string[]; limitation: string; readAt: string; pasted?: boolean }
 export type AgentModelMention = { key: string; name: string }
 export type AgentTurnOptions = {
+  workflow?: AgentWorkflow
+  directionChoice?: { messageId: string; directionId: string; action: 'generate' | 'refine' }
   pace?: AgentPace
   models?: Partial<Record<'text' | 'image' | 'video', AgentModelMention>>
   styleIds?: string[]
   textNodeIds?: string[]
   webReferences?: AgentWebReference[]
+  generation?: AgentGenerationSettings
+}
+
+export type AgentGenerationSettings = Pick<AgentMediaSpecs, 'aspectRatio' | 'resolution' | 'detail' | 'duration' | 'count' | 'generationMode'> & { kind: 'image' | 'video'; output?: import('./imageApi').ImageOutput; videoWorkflow?: 'generate' | 'edit' | 'frames' }
+
+/** Visible composer settings take precedence over model proposals and text defaults. */
+export function agentTurnMediaSpecs(requests: readonly string[], kind: 'image' | 'video', settings?: AgentGenerationSettings): AgentMediaSpecs {
+  const specs = agentMediaSpecs(requests, kind)
+  if (settings?.kind !== kind) return specs
+  return {
+    ...specs,
+    ...Object.fromEntries(Object.entries(settings).filter(([key, value]) => key !== 'kind' && key !== 'videoWorkflow' && value !== undefined)),
+  }
 }
 
 export function agentPaceGuide(pace: AgentPace | undefined) {
-  if (pace === 'quick') return '用户希望简洁回复。目标清楚就直接准备方案，只问会影响交付的问题。'
+  if (pace === 'quick') return '用户希望简洁回复。目标清楚就按对话方式推进制作，只问会影响交付的问题。'
   if (pace === 'deep') return '用户希望深入推敲。讨论会影响成品的取舍、交付依赖和审核点，按已确认的约束继续。'
-  return '按任务复杂度和用户在对话中的要求决定回复深度。简单需求直接给出方案。复杂合作只说明当前需要决定的创意取舍、推荐方向和下一步，信息足够时准备交付卡。'
+  return '按任务复杂度决定回复深度。简单需求按所选对话方式推进。复杂合作只说明当前要决定的创意取舍、推荐方向和下一步，不重复已经确定的信息。'
 }
 
 export function agentReferencePurposeGuide(references: ReadonlyArray<Pick<AgentImageReference, 'name' | 'purpose' | 'kind'>>) {
@@ -149,6 +165,8 @@ export type AgentImagePlan = {
     mediaId?: string
   }>
   error?: string
+  execution?: 'automatic' | 'review'
+  reviewReason?: string
 }
 
 export type AgentInteractionMode = 'answer' | 'clarify' | 'plan' | 'execute' | 'inspect'
@@ -172,7 +190,6 @@ export type AgentRun = {
   updatedAt: string
   title?: string
   stage?: string
-  team?: boolean
 }
 
 export type AgentCanvasContextSnapshot = {
@@ -191,6 +208,7 @@ export type AgentVideoPlan = {
   status: 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
   label?: string
   prompt: string
+  referenceFitInstruction?: string
   referenceNodeIds: string[]
   references?: AgentImageReference[]
   contextReferences?: AgentContextReference[]
@@ -201,7 +219,7 @@ export type AgentVideoPlan = {
   resolution: string
   duration: number
   count: number
-  generationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni'
+  generationMode?: 'text' | 'image' | 'frames' | 'reference' | 'omni' | 'edit'
   firstFrameAspect?: number
   videoConnectionId?: string
   videoModelId?: string
@@ -210,7 +228,10 @@ export type AgentVideoPlan = {
   assistantMessageId?: string
   createdAt?: string
   nodeId?: string
+  results?: Array<{ id: string; url?: string; mediaId?: string; fileName: string }>
   error?: string
+  execution?: 'automatic' | 'review'
+  reviewReason?: string
 }
 
 export type AgentTextPlan = {
@@ -222,6 +243,21 @@ export type AgentTextPlan = {
   assistantMessageId?: string
   createdAt?: string
   nodeId?: string
+}
+
+/** Keep delivered videos in the conversation even after their canvas node is removed. */
+export function agentVideoResultEntries(stored: AgentVideoPlan['results'], source?: {
+  videoVariants?: Array<{ id: string; mediaId?: string; sourceUrl?: string; fileName: string }>
+  videoMediaId?: string; videoUrl?: string; fileName?: string
+}) {
+  const results = [...(stored ?? [])]
+  for (const variant of source?.videoVariants ?? []) {
+    if (!results.some(result => result.id === variant.id || result.mediaId && result.mediaId === variant.mediaId)) {
+      results.push({ id: variant.id, mediaId: variant.mediaId, url: variant.sourceUrl, fileName: variant.fileName })
+    }
+  }
+  if (!results.length && (source?.videoMediaId || source?.videoUrl)) results.push({ id: source.videoMediaId || source.videoUrl!, mediaId: source.videoMediaId, url: source.videoUrl, fileName: source.fileName || 'disy-video.mp4' })
+  return results.length === (stored?.length ?? 0) ? stored : results
 }
 
 export type AgentConversation = {
@@ -238,6 +274,7 @@ export interface CanvasAgentService {
 
 export type AgentReply = {
   reply: string
+  directions?: AgentCreativeDirection[]
   questions?: AgentQuestion[]
   filmDraft?: { subject: string; values: Record<string, unknown> }
   decision?: AgentDecision
@@ -382,6 +419,7 @@ export function agentMediaSpecs(requests: readonly string[], kind: 'image' | 'vi
       const duration = durationWord && parsePlanCountText(durationWord)
       if (duration) specs.duration = duration
       if (/使用现有参考素材|恢复参考素材/.test(text)) delete specs.generationMode
+      else if (/视频编辑|(?:编辑|修改)(?:这|这个|这段|原|已有|现有|上传|提供)?(?:段)?视频|(?:修改|替换|移除|删除)[^。；;]{0,24}(?:原视频|视频\s*\d*\s*[里中])|(?:原视频|视频\s*\d*\s*[里中])[^。；;]{0,24}(?:修改|替换|移除|删除|换成)|\bedit (?:(?:this|the|my|original) )?video\b/i.test(text)) specs.generationMode = 'edit'
       else if (/首尾帧|首[、和与]尾帧|首帧[^。；;]{0,60}尾帧|(?:作(?:为)?|当|做)尾帧|first and last frames/i.test(text)) specs.generationMode = 'frames'
       else if (/图生视频|(?:让|把).{0,18}(?:图|画面).{0,10}动起来|作为首帧|首帧图|animate (?:this|the) image/i.test(text)) specs.generationMode = 'image'
       else if (/全能参考|参考视频|视频参考/.test(text)) specs.generationMode = 'omni'
@@ -406,7 +444,7 @@ export function resolveAgentMediaContinuation(history: readonly AgentMessage[], 
     if (messageExpectsVideoPlans(text) && messageExpectsImagePlans(prior) && !messageExpectsVideoPlans(prior)) return
     if (messageExpectsImagePlans(text) && messageExpectsVideoPlans(prior) && !messageExpectsImagePlans(prior)) return
   }
-  if (!previous.questions?.length
+  if (!previous.questions?.length && !previous.directions?.length
     && previous.decision?.mode !== 'clarify'
     && !/(?:其他|其余)不变/.test(text)
     && !/^(?:改成|改为|把.{0,12}(?:改|换)|还是用|其余不变|其他不变|保持其他|按这个|就按|选第|用第|(?:比例|时长|画幅|数量|背景|配色|风格|构图).{0,9}(?:改|调|换|增加|减少|一点))|^(?:比例|画幅|时长|数量|清晰度|画质)\s*[:：]|^\d{1,3}\s*:\s*\d{1,3}\s*[。！!]?$/.test(text)) return
@@ -472,6 +510,7 @@ export function bindAgentVideoFrames(references: readonly AgentImageReference[],
 
 export function resolveAgentVideoMode(specs: AgentMediaSpecs, suggested: AgentVideoPlan['generationMode'], imageCount: number, videoCount: number) {
   if (specs.generationMode) return specs.generationMode
+  if (videoCount === 1 && suggested === 'edit') return 'edit'
   if (videoCount) return 'omni'
   if (!imageCount) return 'text'
   if (imageCount >= 2 && suggested === 'frames') return 'frames'
@@ -535,8 +574,8 @@ export function inferAgentInteractionMode(content: string): AgentDecision {
   return { mode: 'answer', confidence: .62, needsApproval: false, reason: '未发现明确执行或规划指令' }
 }
 
-export function agentReplyAllowsProposals(local: AgentDecision, reply: Pick<AgentReply, 'decision' | 'questions'>) {
-  return local.mode !== 'inspect' && reply.decision?.mode !== 'inspect' && reply.decision?.mode !== 'clarify' && !reply.questions?.length
+export function agentReplyAllowsProposals(local: AgentDecision, reply: Pick<AgentReply, 'decision' | 'questions' | 'directions'>) {
+  return local.mode !== 'inspect' && reply.decision?.mode !== 'inspect' && reply.decision?.mode !== 'clarify' && !reply.questions?.length && !reply.directions?.length
 }
 
 export function requestsAgentCanvasTextEdits(content: string, hasSelectedText: boolean) {
@@ -584,7 +623,7 @@ function extractFirstJsonContainer(value: string) {
 function normalizeAgentReplyRecord(value: unknown): Record<string, unknown> | null {
   if (Array.isArray(value)) {
     const records = value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode', 'textEdits', 'filmDraft', 'questions'].some((field) => field in record))
+    const protocolRecords = records.filter((record) => ['reply', 'decision', 'imagePlan', 'imagePlans', 'videoPlan', 'videoPlans', 'textNode', 'textEdits', 'filmDraft', 'directions', 'questions'].some((field) => field in record))
     return protocolRecords.length ? Object.assign({}, ...protocolRecords) : null
   }
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -617,13 +656,13 @@ function extractMalformedReply(value: string) {
 
 function looksLikeAgentProtocolPayload(value: string) {
   const cleaned = value.trim()
-  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)(?:["']|\\["'])?\s*:/i.test(cleaned)
+  const hasProtocolField = /(?:["']|\\["'])?(?:reply|decision|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|directions|questions)(?:["']|\\["'])?\s*:/i.test(cleaned)
   if (!hasProtocolField) return false
   return /^```(?:json|js)?/i.test(cleaned)
     || /^[\[{"']/.test(cleaned)
-    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
-    || /^(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
-    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|questions)\s*:/i.test(cleaned)
+    || /\{[\s\S]*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|directions|questions)\s*:/i.test(cleaned)
+    || /^(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|directions|questions)\s*:/i.test(cleaned)
+    || /(?:^|\n)\s*(?:reply|imagePlans?|videoPlans?|textNode|textEdits|filmDraft|directions|questions)\s*:/i.test(cleaned)
 }
 
 export function normalizeAgentMessageContent(content: string) {
@@ -638,7 +677,8 @@ export function buildAgentConversationContext(messages: AgentMessage[], recentCo
     return `${message.role === 'user' ? '用户' : 'Disy'}：${content.slice(0, 180)}`
   }).join('\n')
   const transcript = recent.map((message, index) => {
-    const content = message.role === 'assistant' ? normalizeAgentMessageContent(message.content) : message.content
+    const content = message.role === 'assistant' ? [normalizeAgentMessageContent(message.content), message.directions?.map((direction, index) =>
+      `创意方向${index + 1}「${direction.title}」：${direction.description}\n要求：${direction.brief.slice(0, 700)}`).join('\n')].filter(Boolean).join('\n') : message.content
     const bounded = index === recent.length - 1 || content.length <= 1600 ? content : `${content.slice(0, 1100)}\n[中段略]\n${content.slice(-480)}`
     return `${message.role === 'user' ? '用户' : 'Disy'}：${bounded}`
   }).join('\n')
@@ -651,6 +691,19 @@ export function parseAgentReply(raw: string): AgentReply {
     const value = parseAgentReplyRecord(cleaned)
     if (!value) throw new Error('Invalid Agent response payload')
     const reply = typeof value.reply === 'string' ? value.reply.trim() : ''
+    const directions: AgentCreativeDirection[] = []
+    if (Array.isArray(value.directions)) {
+      for (const item of value.directions) {
+        if (!item || typeof item !== 'object' || (item.kind !== 'image' && item.kind !== 'video')) continue
+        const title = typeof item.title === 'string' ? item.title.trim().slice(0, 50) : ''
+        const description = typeof item.description === 'string' ? item.description.trim().slice(0, 360) : ''
+        const brief = typeof item.brief === 'string' ? item.brief.trim().slice(0, 6000) : ''
+        if (!title || !description || !brief || directions.some(direction => direction.title === title)) continue
+        directions.push({ id: `direction-${directions.length + 1}`, title, description, brief, kind: item.kind,
+          recommended: item.recommended === true && !directions.some(direction => direction.recommended) })
+        if (directions.length === 3) break
+      }
+    }
     const questions: AgentQuestion[] = []
     if (Array.isArray(value.questions)) {
       for (const item of value.questions.slice(0, 4)) {
@@ -713,7 +766,7 @@ export function parseAgentReply(raw: string): AgentReply {
           aspectRatio: typeof candidate.aspectRatio === 'string' ? candidate.aspectRatio : '',
           resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '',
           duration: Number.isFinite(Number(candidate.duration)) ? Math.min(30, Math.max(0, Number(candidate.duration))) : 0,
-          generationMode: (['text', 'image', 'frames', 'reference', 'omni'] as const).find((mode) => mode === candidate.generationMode),
+          generationMode: (['text', 'image', 'frames', 'reference', 'omni', 'edit'] as const).find((mode) => mode === candidate.generationMode),
           count: Math.min(4, Math.max(1, Number(candidate.count) || 1)),
         }
       })
@@ -734,6 +787,7 @@ export function parseAgentReply(raw: string): AgentReply {
     }) : []
     return {
       reply: reply
+        || (directions.length ? '我整理了几个不同的创意方向，可以直接选一个开始，也可以继续细化。' : '')
         || (questions.length ? '先确认几个细节，我们就能继续。' : '')
         || (imagePlans.length ? `我已整理好${imagePlans.length > 1 ? `${imagePlans.length}份` : '一份'}图像方案，请选择并确认后生成。` : '')
         || (videoPlans.length ? `我已整理好${videoPlans.length > 1 ? `${videoPlans.length}份` : '一份'}视频方案，请确认后生成。` : '')
@@ -741,6 +795,7 @@ export function parseAgentReply(raw: string): AgentReply {
         || (textEdits.length ? '修改建议已整理好，确认后才会更新画布。' : '')
         || (textNode ? '最终文本已整理好，确认后可加入画布。' : '这次回复格式异常，请重新发送一次。'),
       decision,
+      directions: directions.length ? directions : undefined,
       questions: questions.length ? questions : undefined,
       filmDraft,
       imagePlanIntent: value.imagePlanIntent === 'deliverables' || value.imagePlanIntent === 'alternatives' ? value.imagePlanIntent : undefined,

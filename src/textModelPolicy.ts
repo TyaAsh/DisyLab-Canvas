@@ -41,9 +41,9 @@ export function mainstreamTextModelIds<T extends TextModelDescriptor>(models: re
   }))
 }
 
-/** One bounded attempt at a time; another model is used only after explicit approval. */
+/** Wait for completion or explicit cancellation; retries require user approval. */
 export async function runTextModelRecovery<T>(initial: T, request: (candidate: T, signal: AbortSignal) => Promise<string>, options: {
-  signal?: AbortSignal; attemptTimeoutMs?: number
+  signal?: AbortSignal
   chooseNext?: (current: T, error: unknown) => Promise<T | undefined>
   onAttempt?: (candidate: T) => void
 } = {}): Promise<string> {
@@ -53,7 +53,6 @@ export async function runTextModelRecovery<T>(initial: T, request: (candidate: T
     const controller = new AbortController()
     const forwardAbort = () => controller.abort(options.signal?.reason)
     options.signal?.addEventListener('abort', forwardAbort, { once: true })
-    const timer = setTimeout(() => controller.abort(new DOMException('模型响应超时', 'TimeoutError')), options.attemptTimeoutMs ?? 40_000)
     let onAbort: (() => void) | undefined
     let failure: unknown
     try {
@@ -70,7 +69,6 @@ export async function runTextModelRecovery<T>(initial: T, request: (candidate: T
       options.signal?.throwIfAborted()
       failure = error
     } finally {
-      clearTimeout(timer)
       options.signal?.removeEventListener('abort', forwardAbort)
       if (onAbort) controller.signal.removeEventListener('abort', onAbort)
     }

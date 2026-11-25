@@ -14,7 +14,6 @@ const catalog = asModule(await compile('./modelCatalog.ts'))
 const transport = asModule(await compile('./providerTransport.ts'))
 const providers = asModule(await compile('./apiProviders.ts'))
 const jimeng = asModule((await compile('./jimengCli.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
-const museWeb = asModule((await compile('./museWeb.ts')).replace("'./providerTransport'", JSON.stringify(transport)))
 const { resolveDesktopProviderRequest } = await import(transport)
 const referenceMediaModule = asModule(await compile('./referenceMediaValidation.ts'))
 const api = await import(asModule((await compile('./imageApi.ts'))
@@ -24,8 +23,214 @@ const api = await import(asModule((await compile('./imageApi.ts'))
   .replace("'./providerTransport'", JSON.stringify(transport))
   .replace("'./apiProviders'", JSON.stringify(providers))
   .replace("'./jimengCli'", JSON.stringify(jimeng))
-  .replace("'./museWeb'", JSON.stringify(museWeb))
   .replaceAll("'./modelCatalog'", JSON.stringify(catalog))))
+
+test('official image ratio catalogs retain portrait and landscape ultrawide choices',()=>{
+  for(const [baseUrl,model] of [['https://ark.cn-beijing.volces.com/api/v3','doubao-seedream-5-5-261028'],['https://www.hfsyapi.cn/v1','seedream-5.5']]){
+    const caps=api.getImageModelCapabilities(baseUrl,model)
+    for(const ratio of ['21:9','9:21','3:4']){
+      assert.ok(caps.ratios.includes(ratio),`${model}: ${ratio}`)
+      assert.equal(api.resolveImageModelOptions(baseUrl,model,{aspectRatio:ratio,resolution:'2K'}).aspectRatio,ratio)
+    }
+  }
+  const flash=api.getImageModelCapabilities('https://generativelanguage.googleapis.com/v1beta/openai','gemini-3.1-flash-image')
+  for(const ratio of ['1:4','4:1','1:8','8:1'])assert.ok(flash.ratios.includes(ratio))
+  assert.ok(!api.getImageModelCapabilities('https://generativelanguage.googleapis.com/v1beta/openai','gemini-3-pro-image').ratios.includes('1:8'))
+})
+
+test('official GPT formats reach JSON and multipart requests without flattening GIF bytes',async t=>{
+  const previousWindow=globalThis.window
+  globalThis.window={setTimeout,clearTimeout}
+  t.after(()=>{if(previousWindow===undefined)delete globalThis.window;else globalThis.window=previousWindow})
+  const requests=[]
+  t.mock.method(globalThis,'fetch',async(url,init)=>{
+    if (!init?.body) return new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5v8AAAAASUVORK5CYII=','base64'),{headers:{'Content-Type':'image/png'}})
+    requests.push(init.body instanceof FormData?Object.fromEntries(init.body):JSON.parse(init.body))
+    return Response.json({data:[{b64_json:'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'}]})
+  })
+  const settings={baseUrl:'https://api.openai.com/v1',apiKey:'test',model:'gpt-image-2.6-flare'}
+  assert.ok(api.getImageModelCapabilities(settings.baseUrl,settings.model).outputs.includes('gif'))
+  assert.ok(api.getImageModelCapabilities(settings.baseUrl,'gpt-image-2').outputs.includes('transparent-png'))
+  assert.ok(!api.getImageModelCapabilities(settings.baseUrl,'gpt-image-2.5-flare').outputs.includes('gif'))
+  const gif=await api.generateRemoteImages(settings,{prompt:'loop',count:1,aspectRatio:'1:1',resolution:'1K',output:'gif'})
+  assert.match(gif[0].url,/^data:image\/gif;base64,/)
+  await api.generateRemoteImages(settings,{prompt:'icon',count:1,aspectRatio:'1:1',resolution:'1K',output:'transparent-png'})
+  await api.generateRemoteImages(settings,{prompt:'edit',count:1,aspectRatio:'1:1',output:'transparent-png',referenceImages:['data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB']}).catch(error=>assert.fail(error.detail))
+  assert.equal(requests[0].output_format,'gif')
+  for(const body of requests.slice(1)){assert.equal(body.background,'transparent');assert.equal(body.output_format,'png')}
+})
+
+test('Seedream RGBA constraints are checked before billing and 5.5 receives native background fields',async t=>{
+  const requests=[]
+  t.mock.method(globalThis,'fetch',async(url,init)=>{requests.push(JSON.parse(init.body));return Response.json({data:[{url:'https://example.test/transparent.png'}]})})
+  const base={baseUrl:'https://ark.cn-beijing.volces.com/api/v3',apiKey:'test'}
+  const options={prompt:'transparent icon',count:1,aspectRatio:'9:21',resolution:'2K',output:'transparent-png'}
+  await assert.rejects(api.generateRemoteImages({...base,model:'doubao-seedream-5-0-pro-260628'},options),/透明背景需要/)
+  assert.equal(requests.length,0)
+  await api.generateRemoteImages({...base,model:'doubao-seedream-5-5-261028'},options)
+  assert.equal(requests[0].background,'transparent');assert.equal(requests[0].output_format,'png')
+  const [w,h]=requests[0].size.split('x').map(Number);assert.ok(Math.abs(w/h-9/21)<.01)
+})
+
+test('removed model families cannot issue text, image or video generation requests',async t=>{
+  let requests=0
+  t.mock.method(globalThis,'fetch',async()=>{requests++;throw Error('must not submit')})
+  const base={baseUrl:'https://www.hfsyapi.cn/v1',apiKey:'fake'}
+  await assert.rejects(api.generateRemoteVideo({...base,model:'muse_video'},{prompt:'test',seconds:5,size:'16:9'}),/此模型已移除/)
+  await assert.rejects(api.generateRemoteImages({...base,model:'MUSE-image'},{prompt:'test',count:1}),/此模型已移除/)
+  await assert.rejects(api.generateRemoteText({...base,model:'muse-spark'},'test'),/此模型已移除/)
+  const removed={baseUrl:'https://api.meta.ai/v1',apiKey:'fake',model:'legacy-alias'}
+  await assert.rejects(api.fetchRemoteModels(removed),/此厂商已移除/)
+  await assert.rejects(api.validateApiCredentials(removed),/此厂商已移除/)
+  await assert.rejects(api.generateRemoteText(removed,'test'),/此厂商已移除/)
+  assert.equal(requests,0)
+})
+
+test('refreshing authenticated HFSY models removes retired families from both account and marketplace catalogs',async t=>{
+  t.mock.method(globalThis,'fetch',async url=>{
+    if(String(url).includes('/api/pricing')) return Response.json({success:true,data:['muse-video','wan-3.0-720','Doubao-Seedance-2.0'].map(model_name=>({model_name,tags:['视频'],enable_groups:['default'],supported_endpoint_types:['video']}))})
+    return Response.json({data:[{id:'muse-video'},{id:'MUSE_image'},{id:'alias',name:'Muse Spark'},{id:'wan-3.0-720'},{id:'Doubao-Seedance-2.0'}]})
+  })
+  const models=await api.fetchRemoteModels({baseUrl:'https://www.hfsyapi.cn/v1',apiKey:'fake'})
+  assert.deepEqual(models.map(x=>x.id).sort(),['Doubao-Seedance-2.0','wan-3.0-720'].sort())
+  assert.ok(models.every(x=>x.capability==='video'))
+})
+
+test('video workflows expose editing only on verified connections across Seedance, WAN and native Grok families',async()=>{
+  const composer=await import(asModule(await compile('./agentComposer.ts')))
+  const families=[
+    ['https://www.hfsyapi.cn/v1','Doubao-Seedance-2.0',true,true],
+    ['https://api.hfsyapi.cn/v1','Doubao-Seedance-2.0-fast',true,true],
+    ['https://www.hfsyapi.cn/v1','Doubao-Seedance-2.5',true,true],
+    ['https://www.hfsyapi.cn/v1','sd-2-fast-480',true,true],
+    ['https://www.hfsyapi.cn/v1','sd-2.5-720',true,true],
+    ['https://ark.cn-beijing.volces.com/api/v3','doubao-seedance-2-0-260128',true,true],
+    ['https://ark.cn-beijing.volces.com/api/v3','doubao-seedance-2-5-260628',true,true],
+    ['https://www.hfsyapi.cn/v1','wan-3.0-720',true,true],
+    ['https://api.x.ai/v1','grok-imagine-video',true,false],
+    ['https://api.x.ai/v1','grok-imagine-video-1.5',false,true],
+    ['https://api.apimart.ai/v1','seedance-2.5',false,true],
+    ['https://api.minimaxi.com/v1','MiniMax-H3',false,true],
+    ['https://jimeng.jianying.com/cli','seedance2.0fast',false,false],
+  ]
+  for(const [base,model,canEdit,frames] of families){
+    const editing=api.videoEditingCapabilities(base,model),rules=api.videoReferenceRules(base,model)
+    const options={ratios:[],resolutions:[],editing,modes:composer.videoGenerationModes(rules,true,editing)}
+    assert.equal(editing.supported,canEdit,`${base} ${model}`)
+    assert.equal(options.modes.some(x=>x.value==='frames'),frames,model)
+    assert.equal(composer.composerVideoInputIssue({kind:'video',videoWorkflow:'edit'},options,0,1)===undefined,canEdit,model)
+    assert.equal(composer.composerVideoInputIssue({kind:'video',videoWorkflow:'frames'},options,2,0)===undefined,frames,model)
+  }
+})
+
+test('WAN and Seedance editing preserve the original video URL and use documented media fields', async (t) => {
+  const bodies=[]
+  const original='https://cdn.example.test/original.mp4?signature=original'
+  const helper='https://cdn.example.test/coat.png'
+  t.mock.method(globalThis,'fetch',async(_url,init={})=>{
+    if(init.method==='POST') {
+      bodies.push(JSON.parse(init.body))
+      return Response.json({id:'completed-edit',status:'completed',result_url:'https://cdn.example.test/edited.mp4',content:{video_url:'https://cdn.example.test/edited.mp4'}})
+    }
+    return new Response('edited bytes',{headers:{'content-type':'video/mp4'}})
+  })
+  const cases=[
+    {baseUrl:'https://www.hfsyapi.cn/v1',model:'wan-3.0-720',marker:'@video1'},
+    {baseUrl:'https://www.hfsyapi.cn/v1',model:'sd-2.5-720',marker:'@video1'},
+    {baseUrl:'https://www.hfsyapi.cn/v1',model:'Doubao-Seedance-2.0',marker:'视频1'},
+    {baseUrl:'https://ark.cn-beijing.volces.com/api/v3',model:'doubao-seedance-2-0-260128',marker:'视频1'},
+  ]
+  for(const {marker,...settings} of cases) {
+    const logs=[]
+    const result=await api.generateRemoteVideo({...settings,apiKey:'fake-test-key'},{prompt:'只把外套换成红色',seconds:5,size:'1280x720',aspectRatio:'16:9',resolution:'720p',mode:'video_edit',referenceVideos:[original],referenceImages:[helper],captureAdminLog:entry=>logs.push(entry)})
+    assert.equal(await result.blob.text(),'edited bytes')
+    const body=bodies.at(-1)
+    const prompt=body.prompt??body.content.find(x=>x.type==='text').text
+    assert.ok(prompt.includes(`严格编辑${marker}`))
+    assert.match(prompt,/未要求修改.*尽量保持原样/)
+    assert.match(prompt,/只把外套换成红色/)
+    if(body.content) {
+      assert.deepEqual(body.content.filter(x=>x.type==='video_url'),[{type:'video_url',video_url:{url:original},role:'reference_video'}])
+      assert.deepEqual(body.content.filter(x=>x.type==='image_url'),[{type:'image_url',image_url:{url:helper},role:'reference_image'}])
+    } else {
+      assert.deepEqual(body.videos,[original]);assert.deepEqual(body.images,[helper])
+      assert.equal('mode' in body,false)
+    }
+    assert.equal(JSON.parse(logs[0].requestJson).mode,'video_edit')
+  }
+  const rules=api.videoReferenceRules('https://www.hfsyapi.cn/v1','wan-3.0-720')
+  assert.deepEqual(rules.media({kind:'video',publicUrl:original}).seconds,[3,10])
+  assert.deepEqual(rules.media({kind:'video',publicUrl:original}).side,[720,2160])
+  assert.equal(rules.totals.maxVideoSeconds,15)
+})
+
+test('unsupported editing and invalid original clips are rejected before any provider request', async (t) => {
+  let requests=0
+  t.mock.method(globalThis,'fetch',async()=>{requests++;throw Error('must not call provider')})
+  const source='https://cdn.example.test/original.mp4'
+  const options={prompt:'只改衣服颜色',seconds:5,size:'16:9',mode:'video_edit'}
+  for(const [settings,extra,reason] of [
+    [{baseUrl:'https://unknown.example/v1',model:'wan-3.0-720'},{referenceVideos:[source]},/尚未接通视频编辑/],
+    [{baseUrl:'https://api.apiyi.com/v1',model:'wan2.7-videoedit'},{referenceVideos:[source]},/尚未接通视频编辑/],
+    [{baseUrl:'https://www.hfsyapi.cn/v1',model:'sd-2.5-720'},{},/只接受 1 段/],
+    [{baseUrl:'https://www.hfsyapi.cn/v1',model:'sd-2.5-720'},{referenceVideos:[source,source+'2']},/只接受 1 段/],
+    [{baseUrl:'https://www.hfsyapi.cn/v1',model:'wan-3.0-720'},{referenceVideos:[source],firstFrame:'https://cdn.example.test/first.png'},/不能同时指定首尾帧/],
+    [{baseUrl:'https://api.x.ai/v1',model:'grok-imagine-video'},{referenceVideos:[source],referenceImages:['https://cdn.example.test/coat.png']},/最多接收 0 张/],
+  ]) await assert.rejects(api.generateRemoteVideo({...settings,apiKey:'fake'}, {...options,...extra}),error=>reason.test(error.detail))
+  assert.equal(requests,0)
+})
+
+test('explicit native Grok editing omits output parameters which the official API does not accept', async (t) => {
+  const source='https://cdn.example.test/original.mp4'
+  let posted
+  t.mock.method(globalThis,'fetch',async(url,init={})=>{
+    if(init.method==='POST') {
+      assert.match(String(url),/videos\/edits$/)
+      posted=JSON.parse(init.body)
+      return Response.json({request_id:'edit-one'})
+    }
+    if(String(url).endsWith('/videos/edit-one')) return Response.json({status:'done',video:{url:'https://vidgen.x.ai/result.mp4'}})
+    return new Response('edited bytes',{headers:{'content-type':'video/mp4'}})
+  })
+  browserGlobal(t,'window',{location:{href:'http://localhost/'},setTimeout:callback=>setTimeout(callback,0),clearTimeout})
+  const result=await api.generateRemoteVideo({baseUrl:'https://api.x.ai/v1',model:'grok-imagine-video',apiKey:'fake'}, {prompt:'改成黏土风格',mode:'video_edit',seconds:30,size:'21:9',aspectRatio:'21:9',resolution:'1080p',referenceVideos:[source]})
+  assert.deepEqual(Object.keys(posted).sort(),['model','prompt','video'])
+  assert.deepEqual(posted.video,{url:source})
+  assert.equal(await result.blob.text(),'edited bytes')
+  assert.equal(api.videoEditingCapabilities('https://api.x.ai/v1','grok-imagine-video').inheritsSource,true)
+  assert.equal(api.videoReferenceSettingsIssue('https://api.x.ai/v1','grok-imagine-video','video_edit',30,1,'1080p'),undefined)
+})
+
+test('recovery exposes progress and fresh task URLs without ever creating a generation', async (t) => {
+  const events=[]
+  const source='https://v11-octo-download.jianying.com/video/result.mp4?download=true'
+  t.mock.method(globalThis,'fetch',async(url,init={})=>{
+    assert.notEqual(init.method,'POST')
+    if(String(url).includes('/video/query?')) return Response.json({success:true,data:{status:'completed',video_url:source}})
+    assert.equal(String(url),source)
+    events.push('download')
+    return new Response('complete recovered video',{headers:{'content-type':'video/mp4'}})
+  })
+  const result=await api.readRecoverableVideo({taskId:'original-paid-task',settings:{baseUrl:'https://api.hfsyapi.cn/v1',apiKey:'test-key',model:'sd-2-fast-480'},onProgress:(_,status)=>events.push(status),onResultUrl:(url,id)=>events.push([url,id])})
+  assert.equal(await result.blob.text(),'complete recovered video')
+  assert.ok(events.findIndex(value=>Array.isArray(value)&&value[0]===source)<events.indexOf('download'))
+  assert.ok(events.includes('downloading'));assert.ok(events.includes('completed'))
+})
+
+test('failed video downloads preserve HTTP status and server diagnostics for the user', async (t) => {
+  browserGlobal(t,'window',{location:{href:'http://localhost/'},setTimeout:callback=>setTimeout(callback,0),clearTimeout})
+  t.mock.method(globalThis,'fetch',async()=>new Response('media host not allowed',{status:403}))
+  const source='https://v11-octo-download.jianying.com/video/result.mp4?signature=private'
+  await assert.rejects(api.downloadGeneratedVideoBlob(source),error=>{
+    assert.match(error.detail,/HTTP 403/)
+    assert.match(error.detail,/media host not allowed/)
+    assert.doesNotMatch(error.detail,/没有使用这个模型的权限/)
+    assert.match(error.detail,/下载转发/)
+    assert.equal(error.detail.includes('signature=private'),false)
+    assert.deepEqual(error.resultUrls,[source])
+    return true
+  })
+})
 
 test('HFSY fast-720 recovery queries an existing task and downloads its nested result without a POST', async (t) => {
   const source = 'https://8899c23401e9d8eb6bf66cf5e6a08877.r2.cloudflarestorage.com/video/clean/mock.mp4?signature=mock'
@@ -314,12 +519,12 @@ test('HFSY text uses chat completions, handles SSE chunks and reports error enve
   const settings = { baseUrl: 'https://www.hfsyapi.cn', model: 'gpt-5.5', apiKey: 'test' }
   assert.equal(await api.generateRemoteText(settings, '你好'), '普通回答')
   assert.equal(await api.generateRemoteText(settings, '你好', { stream: true }), '你好世界')
-  await assert.rejects(() => api.generateRemoteText(settings, '你好'), (error) => error.detail === '模型未授权')
+  await assert.rejects(() => api.generateRemoteText(settings, '你好'), (error) => error.category === 'api' && /模型未授权/.test(error.detail))
   assert.deepEqual(requests[0], ['https://www.hfsyapi.cn/v1/chat/completions', { model: 'gpt-5.5', messages: [{ role: 'user', content: '你好' }], stream: false }, 'Bearer test'])
   assert.equal(requests[1][1].stream, true)
 })
 
-test('HFSY routes MiniMax, Kling, Muse and native Seedance using their own fields', async (t) => {
+test('HFSY routes MiniMax, Kling and native Seedance using their own fields', async (t) => {
   const bodies = []
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     if (init?.method === 'POST') {
@@ -333,15 +538,13 @@ test('HFSY routes MiniMax, Kling, Muse and native Seedance using their own field
   await assert.rejects(() => api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, base), /视频参数不符合模型要求/)
   await api.generateRemoteVideo({ ...settings, model: 'minimax-h3' }, { ...base, referenceImages: ['https://cdn.example.test/image.png'], referenceAudios: ['https://cdn.example.test/voice.mp3'] })
   await api.generateRemoteVideo({ ...settings, model: 'kling-o3' }, { ...base, size: 'square' })
-  await api.generateRemoteVideo({ ...settings, model: 'muse_video' }, { ...base, seconds: 1 })
   await api.generateRemoteVideo({ ...settings, model: 'Doubao-Seedance-2.0-fast' }, {
     ...base, mode: 'first_last_frame', firstFrame: 'https://cdn.example.test/first.png', lastFrame: 'https://cdn.example.test/last.png',
     resolution: '720p', generateAudio: false, referenceAudios: ['asset://reviewed-audio'],
   })
   assert.deepEqual(bodies[0], { model: 'minimax-h3', prompt: 'test', duration: 5, orientation: 'portrait', images: ['https://cdn.example.test/image.png'], audios: ['https://cdn.example.test/voice.mp3'] })
   assert.equal(bodies[1].orientation, 'square')
-  assert.deepEqual(bodies[2], { model: 'muse_video', prompt: 'test', duration: 1, ratio: '9:16' })
-  assert.deepEqual(bodies[3], {
+  assert.deepEqual(bodies[2], {
     model: 'Doubao-Seedance-2.0-fast', duration: 5, ratio: '9:16', resolution: '720p', generate_audio: false,
     content: [
       { type: 'text', text: 'test' },
@@ -433,8 +636,6 @@ test('new vendor adapters use native video paths and archive the completed resul
     if (path.endsWith('/videos/xai-1')) return Response.json({ status: 'done', video: { url: result } })
     if (path === '/provider/minimax/v2/video_generation') return Response.json({ task: { id: 'mini-1', status: 'processing' } })
     if (path.endsWith('/query/video_generation/mini-1')) return Response.json({ task: { status: 'succeeded', content: { url: result } } })
-    if (path === '/hfsy/v1/video/create') return Response.json({ id: 'muse-1', status: 'IN_PROGRESS' })
-    if (path.endsWith('/video/query/muse-1')) return Response.json({ success: true, data: { status: 'completed', result_url: result } })
     return new Response(new Blob(['video'], { type: 'video/mp4' }))
   })
   globalThis.window = win
@@ -449,13 +650,10 @@ test('new vendor adapters use native video paths and archive the completed resul
     const mini = await api.generateRemoteVideo({ baseUrl: 'https://api.minimaxi.com/v1', apiKey: 'test', model: 'MiniMax-H3' }, { ...options, aspectRatio: '16:9' })
     assert.equal(mini.taskId, 'mini-1')
     assert.equal(requests.find(({ path }) => path.endsWith('/v2/video_generation')).body.ratio, '16:9')
-    const muse = await api.generateRemoteVideo({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'muse-video' }, { ...options, aspectRatio: '9:16' })
-    assert.equal(muse.taskId, 'muse-1')
-    assert.equal(requests.find(({ path }) => path.endsWith('/video/query/muse-1')).method, 'POST')
   } finally { delete globalThis.window }
 })
 
-test('vendor catalog supports Muse and Grok image requests and does not offer retired presets', async (t) => {
+test('vendor catalog supports Grok image requests and does not offer retired presets', async (t) => {
   const { API_PROVIDER_PRESETS } = await import(providers)
   assert.deepEqual(API_PROVIDER_PRESETS.slice(0, 2).map(({ id }) => id), ['grsai', 'hfsy'])
   assert.equal(API_PROVIDER_PRESETS.some(({ id }) => id === 'evolink'), false)
@@ -466,10 +664,7 @@ test('vendor catalog supports Muse and Grok image requests and does not offer re
   })
   const config = { prompt: 'test', count: 2, aspectRatio: '3:4', resolution: '2K' }
   await api.generateRemoteImages({ baseUrl: 'https://api.x.ai/v1', apiKey: 'test', model: 'grok-imagine-image-2.0' }, config)
-  await api.generateRemoteImages({ baseUrl: 'https://api.meta.ai/v1', apiKey: 'test', model: 'muse-image-1.0' }, config)
   assert.deepEqual(calls[0], ['https://api.x.ai/v1/images/generations', { model: 'grok-imagine-image-2.0', prompt: 'test', n: 2, aspect_ratio: '3:4', resolution: '2k', quality: 'auto', response_format: 'b64_json' }])
-  assert.equal(calls[1][0], 'https://api.meta.ai/v1/images/generations')
-  assert.equal(calls[1][1].n, 2)
 })
 
 test('OpenAI GPT Image sends official size and quality fields for manual and automatic framing', async (t) => {
@@ -788,6 +983,98 @@ test('custom text API preserves endpoint queries, configurable auth and native A
   assert.equal(requests[0].headers.has('authorization'), false)
   assert.equal(requests[1].url, 'https://api.anthropic.com/v1/messages')
   assert.deepEqual(requests[1].body.messages[0].content[1], { type: 'image', source: { type: 'url', url: 'https://cdn.example.com/reference.png' } })
+})
+
+test('external timeout reasons remain visible without claiming a local deadline', () => {
+  const error = api.normalizeGenerationError(new DOMException('模型响应超时', 'TimeoutError'))
+  assert.equal(error.category, 'network')
+  assert.match(error.message, /接口或连接报告超时/)
+  assert.match(error.detail, /模型响应超时/)
+})
+
+test('text API errors inside HTTP 200 are failures with provider request IDs', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ error: { message: 'upstream overloaded', code: 'overloaded' } }, { headers: { 'x-request-id': 'upstream-123' } }))
+  await assert.rejects(api.generateRemoteText({ baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }, 'hello'), (error) => {
+    assert.equal(error.category, 'api')
+    assert.equal(error.requestId, 'upstream-123')
+    assert.match(error.detail, /upstream overloaded/)
+    return true
+  })
+})
+
+test('insufficient credits preserve the real provider reason and error code for HTTP and wrapped errors', async (t) => {
+  const settings = { baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }
+  for (const response of [
+    Response.json({ error: { code: 'insufficient_quota', message: '余额不足，请充值后重试' } }, { status: 429, headers: { 'x-request-id': 'credit-http' } }),
+    Response.json({ success: false, message: '余额不足，请充值后重试', code: 'insufficient_quota' }),
+    Response.json({ data: { error: { code: 'insufficient_quota', message: 'Insufficient balance' } } }),
+  ]) {
+    t.mock.method(globalThis, 'fetch', async () => response)
+    await assert.rejects(api.generateRemoteText(settings, 'hello'), error => {
+      assert.equal(error.category, 'api')
+      assert.match(error.message, /余额或可用额度不足/)
+      assert.match(error.detail, /insufficient_quota/)
+      assert.match(error.detail, /余额不足|Insufficient balance/)
+      return true
+    })
+  }
+})
+
+test('image and video creation preserve balance errors even with HTTP 200', async (t) => {
+  const settings = { baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'test-model' }
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ error: { code: 'insufficient_quota', message: '余额不足，请充值' } }, { headers: { 'x-request-id': 'media-credit' } }))
+  for (const request of [
+    () => api.generateRemoteImages(settings, { prompt: 'test', count: 1, size: '1024x1024' }),
+    () => api.generateRemoteVideo(settings, { prompt: 'test', seconds: 5, size: '16:9', mode: 'text2video' }),
+  ]) {
+    await assert.rejects(request(), error => {
+      assert.equal(error.category, 'api')
+      assert.match(error.message, /余额或可用额度不足/)
+      assert.match(error.detail, /insufficient_quota/)
+      assert.equal(error.requestId, 'media-credit')
+      return true
+    })
+  }
+})
+
+test('malformed text JSON retains response diagnostics and is classified as an API response issue', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('{"broken":', { headers: { 'content-type': 'application/json', 'x-request-id': 'broken-123' } }))
+  await assert.rejects(api.generateRemoteText({ baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }, 'hello'), (error) => {
+    assert.equal(error.category, 'api')
+    assert.equal(error.status, 200)
+    assert.equal(error.requestId, 'broken-123')
+    assert.match(error.detail, /broken/)
+    return true
+  })
+})
+
+test('text SSE is recognized even when a gateway sends the wrong content type', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('data: {"choices":[{"delta":{"content":"正常回复"}}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'application/json' } }))
+  assert.equal(await api.generateRemoteText({ baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }, 'hello'), '正常回复')
+})
+
+test('timeouts while reading the response body retain the original cancellation reason', async (t) => {
+  const controller = new AbortController()
+  const timeout = new DOMException('本地等待上限', 'TimeoutError')
+  t.mock.method(globalThis, 'fetch', async () => ({
+    ok: true, status: 200, headers: new Headers({ 'content-type': 'application/json' }),
+    text: async () => { controller.abort(timeout); throw new DOMException('body aborted', 'AbortError') },
+  }))
+  await assert.rejects(api.generateRemoteText({ baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }, 'hello', { signal: controller.signal }), error => error === timeout)
+})
+
+test('SSE failures and malformed events never return partial text as a successful result', async (t) => {
+  const settings = { baseUrl: 'https://gateway.example.com', apiKey: 'key', model: 'gpt-next' }
+  let logs = []
+  for (const tail of ['{"type":"response.failed","response":{"error":{"message":"overloaded"}}}', '{"broken":']) {
+    t.mock.method(globalThis, 'fetch', async () => new Response(`data: {"choices":[{"delta":{"content":"partial"}}]}\n\ndata: ${tail}\n\n`, { headers: { 'content-type': 'text/event-stream', 'x-request-id': 'stream-123' } }))
+    await assert.rejects(api.generateRemoteText(settings, 'hello', { captureAdminLog: log => logs.push(log) }), (error) => {
+      assert.equal(error.category, 'api')
+      assert.equal(error.requestId, 'stream-123')
+      return true
+    })
+  }
+  assert.deepEqual(logs.map(log => log.resultType), ['failed', 'failed'])
 })
 
 test('Responses SSE prefers the completed text instead of duplicating deltas', async (t) => {
@@ -1509,4 +1796,50 @@ test('deadline covers hung response headers and respects explicit cancellation',
   const pending = withProviderDeadline(async () => new Promise(() => {}), controller.signal, 1000)
   controller.abort()
   await assert.rejects(pending, { name: 'AbortError' })
+})
+
+test('HFSY video jobs can finish hours later without another generation request', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  let clock = Date.now(), queries = 0
+  t.mock.method(Date, 'now', () => clock)
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    assert.notEqual(init.method, 'POST')
+    if (String(url).includes('/video/query')) {
+      queries++
+      clock += 2 * 60 * 60_000
+      return Response.json(queries === 1 ? { status: 'PROCESSING' } : { status: 'SUCCESS', result_url: 'https://example.test/late.mp4' })
+    }
+    return new Response('late video', { headers: { 'Content-Type': 'video/mp4' } })
+  })
+  const result = await api.resumeHfsyVideoTask({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-mini-720' }, 'late-video')
+  assert.equal(queries, 2)
+  assert.equal(await result.blob.text(), 'late video')
+})
+
+test('HFSY image jobs keep polling after hours and preserve explicit cancellation', async (t) => {
+  browserGlobal(t, 'window', { setTimeout(callback) { callback(); return 1 }, clearTimeout() {} })
+  let clock = Date.now(), queries = 0
+  t.mock.method(Date, 'now', () => clock)
+  t.mock.method(globalThis, 'fetch', async (_url, init = {}) => {
+    if (init.method === 'POST') return Response.json({ id: 'late-image', status: 'queued' })
+    queries++; clock += 2 * 60 * 60_000
+    return Response.json(queries === 1 ? { status: 'processing' } : { status: 'completed', images: [{ url: 'https://example.test/late.png' }] })
+  })
+  const settings = { baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'gpt-image-2' }
+  assert.equal((await api.generateRemoteImages(settings, { prompt: 'draw', count: 1 })).length, 1)
+  assert.equal(queries, 2)
+  const controller = new AbortController()
+  t.mock.method(globalThis, 'fetch', async () => { controller.abort(); return Response.json({ status: 'PROCESSING' }) })
+  await assert.rejects(api.resumeHfsyVideoTask({ ...settings, model: 'sd-2-mini-720' }, 'cancel-task', { signal: controller.signal }), { name: 'AbortError' })
+})
+
+test('HFSY task failures retain nested vendor codes and redact credentials in details', async () => {
+  const failure = { status: 'FAILED', fail_reason: '暂时无法生成', data: { error: { message: 'insufficient_balance', code: 'BALANCE_NOT_ENOUGH' } }, api_key: 'private-test-key' }
+  await assert.rejects(api.resumeHfsyVideoTask({ baseUrl: 'https://www.hfsyapi.cn/v1', apiKey: 'test', model: 'sd-2-mini-720' }, 'failed-task', {}, failure), error => {
+    assert.equal(error.requestId, 'failed-task')
+    assert.match(error.detail, /暂时无法生成/)
+    assert.match(error.detail, /BALANCE_NOT_ENOUGH/)
+    assert.doesNotMatch(error.detail, /private-test-key/)
+    return true
+  })
 })

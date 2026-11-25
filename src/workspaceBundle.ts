@@ -213,7 +213,7 @@ export async function blobToDataUrl(blob: Blob) {
 
 const MEDIA_KEYS = new Set(['url', 'imageUrl', 'styleReferenceUrl', 'referenceImageUrl', 'videoUrl'])
 const MEDIA_ID_KEYS = ['mediaId', 'imageMediaId', 'referenceImageMediaId', 'videoMediaId', 'videoReferenceMediaId',
-  'videoReferenceImageMediaId', 'videoFirstFrameMediaId', 'videoLastFrameMediaId'] as const
+  'videoReferenceImageMediaId', 'videoFirstFrameMediaId', 'videoLastFrameMediaId', 'originalMediaId'] as const
 const MEDIA_ID_BY_URL: Record<string, string | undefined> = {
   url: 'mediaId',
   imageUrl: 'imageMediaId',

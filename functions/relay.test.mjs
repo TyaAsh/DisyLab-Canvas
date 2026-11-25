@@ -1,8 +1,24 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { onRequest as mediaRelay } from './apiyi/media.js'
+import { onRequest as mediaRelay, mediaHostAllowed } from './apiyi/media.js'
 import { onRequest as hfsyRelay } from './hfsy/[[path]].js'
 import { onRequest as providerRelay } from './provider/[[path]].js'
+
+test('media relay accepts the actual HFSY Jianying download family without forwarding API keys', async (t) => {
+  for (const host of ['v11-octo-download.jianying.com','v6-octo-download.jianying.com']) assert.equal(mediaHostAllowed(new URL(`https://${host}/video/file.mp4`)),true)
+  for (const url of ['https://v11-octo-download.jianying.com.attacker.test/video','https://other.jianying.com/video','http://v11-octo-download.jianying.com/video','https://key@v11-octo-download.jianying.com/video','https://v11-octo-download.jianying.com:8443/video']) assert.equal(mediaHostAllowed(new URL(url)),false,url)
+  const source='https://v11-octo-download.jianying.com/video/result.mp4?download=true'
+  t.mock.method(globalThis,'fetch',async(url,init)=>{
+    assert.equal(String(url),source)
+    assert.equal(init.headers.get('authorization'),null)
+    assert.equal(init.headers.get('x-disylab-media-authorization'),null)
+    return new Response('video bytes',{headers:{'content-type':'video/mp4'}})
+  })
+  const response=await mediaRelay({request:new Request(`https://app.test/apiyi/media?url=${encodeURIComponent(source)}`,{headers:{'x-disylab-media-authorization':'Bearer local-test-key'}})})
+  assert.equal(response.status,200)
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'),'*')
+  assert.equal(await response.text(),'video bytes')
+})
 
 test('provider relay limits credentials to the configured vendor, route and method', async (t) => {
   const upstream = t.mock.method(globalThis, 'fetch', async (url, init) => {

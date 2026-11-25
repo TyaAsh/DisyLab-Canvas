@@ -1,4 +1,7 @@
 node_modules/
+.local/
+artifacts/
+src-tauri/
 dist/
 dist.old.*/
 src-tauri/target/

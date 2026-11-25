@@ -229,6 +229,7 @@ export async function checkReferenceMedia(
   loadBlob: (id: string) => Promise<Blob | undefined>,
   signal: AbortSignal,
   totals?: { maxImageBytes?: number; maxVideoSeconds?: number },
+  fitImageMetadata?: (metadata: MediaMetadata, limits: MediaLimits) => MediaMetadata,
 ) {
   let imageBytes = 0
   let videoSeconds = 0
@@ -279,7 +280,8 @@ export async function checkReferenceMedia(
     if (limits.fps && bytesForType && (type === 'video/mp4' || type === 'video/quicktime')) {
       metadata.fps = await readIsoVideoFrameRate(bytesForType).catch(() => undefined)
     }
-    const issue = referenceMediaIssue(metadata, limits)
+    const fitted = entry.kind === 'image' && fitImageMetadata ? fitImageMetadata(metadata, limits) : metadata
+    const issue = referenceMediaIssue(fitted, limits)
     if (issue) return `${label}的${issue}`
     if (entry.kind === 'image') imageBytes += bytes ?? 0
     if (entry.kind === 'video') videoSeconds += metadata.duration ?? 0

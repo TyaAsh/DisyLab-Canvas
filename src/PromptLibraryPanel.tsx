@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useState, type DragEvent } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { OriginalText } from './i18n/react'
 import {
   ArrowUpRight,
   BookOpen,
@@ -910,8 +911,8 @@ export function PromptLibraryPanel({
                   </button>
                 </div>
                 <div className="prompt-case-copy">
-                  <strong>{item.title}</strong>
-                  <p>{item.nanoPrompt || item.prompt}</p>
+                  <strong>{typeof item.id === 'string' ? <OriginalText>{item.title}</OriginalText> : item.title}</strong>
+                  <p translate="no">{item.nanoPrompt || item.prompt}</p>
                 </div>
               </motion.article>
             ))}
@@ -987,7 +988,7 @@ export function PromptLibraryPanel({
                         ? "我的创作"
                         : `CASE ${selected.id}`}
                   </small>
-                  <h3>{selected.title}</h3>
+                  <h3>{typeof selected.id === 'string' ? <OriginalText>{selected.title}</OriginalText> : selected.title}</h3>
                 </div>
                 <div className="prompt-detail-title-actions">
                   {selected.sourceUrl && (

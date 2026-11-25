@@ -8,6 +8,25 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const references = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+
+test('removing video frame references clears durable IDs, legacy aliases and cached prompt across save/load', () => {
+  for (const [id,urlKey,mediaKey] of [['video-first-frame','videoFirstFrameUrl','videoFirstFrameMediaId'],['video-last-frame','videoLastFrameUrl','videoLastFrameMediaId'],['video-reference-image','videoReferenceImageUrl','videoReferenceImageMediaId'],['video-reference-video','videoReferenceUrl','videoReferenceMediaId']]) {
+    const original={body:'@素材 做视频',promptText:'@素材 old cached prompt',[urlKey]:'blob:old',[mediaKey]:'durable-original',referenceImages:[{id:'legacy-alias',url:'blob:old',mediaId:'durable-original'}],videoReferenceOrder:[id,'legacy-alias','other'],videoLastFrameUrl:id==='video-last-frame'?'blob:old':'blob:other',videoLastFrameMediaId:id==='video-last-frame'?'durable-original':'durable-other'}
+    const saved=JSON.parse(JSON.stringify(references.clearVideoReference(original,{id,mention:'@素材',mediaId:'durable-original'})))
+    assert.equal(saved[urlKey],undefined);assert.equal(saved[mediaKey],undefined)
+    assert.equal(saved.promptText,undefined);assert.equal(saved.body.includes('@素材'),false)
+    assert.deepEqual(saved.referenceImages,[]);assert.deepEqual(saved.videoReferenceOrder,['other'])
+    assert.equal(original[mediaKey],'durable-original')
+    if(id!=='video-last-frame')assert.equal(saved.videoLastFrameMediaId,'durable-other')
+  }
+})
+test('removing an ordinary video reference preserves unrelated assets and clears matching primary aliases',()=>{
+  const original={body:'@one @two',videoReferenceImageUrl:'blob:one',videoReferenceImageMediaId:'one',referenceImages:[{id:'one',url:'blob:one',mediaId:'one'},{id:'two',url:'blob:two',mediaId:'two'}]}
+  const next=references.clearVideoReference(original,{id:'one',mention:'@one',mediaId:'one'})
+  assert.equal(next.videoReferenceImageMediaId,undefined);assert.equal(next.videoReferenceImageUrl,undefined)
+  assert.deepEqual(next.referenceImages,[original.referenceImages[1]])
+  assert.equal(next.body,'@two')
+})
 const layerSource = await readFile(new URL('./canvasLayers.ts', import.meta.url), 'utf8')
 const layerModule = ts.transpileModule(layerSource, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },

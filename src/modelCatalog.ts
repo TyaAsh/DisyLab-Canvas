@@ -2,6 +2,15 @@ import type { ModelCapability } from './store'
 
 export type CatalogModel = { id: string; name: string; capability: ModelCapability }
 
+/** Retired models stay excluded even when an upstream catalog still lists them. */
+export function isRemovedModel(model: { id: string; name?: string }) {
+  return /muse/i.test(`${model.id} ${model.name ?? ''}`)
+}
+
+export function isRemovedProvider(connection: { baseUrl: string }) {
+  try { return /(?:^|\.)(?:meta|muse)\.ai$/i.test(new URL(connection.baseUrl.trim()).hostname) } catch { return false }
+}
+
 export function inferModelCapability(modelId: string): ModelCapability {
   if (/audio|suno|tts|voice|speech|music/i.test(modelId)) return 'audio'
   // Image markers must run before generic gpt/gemini chat families.
@@ -9,7 +18,7 @@ export function inferModelCapability(modelId: string): ModelCapability {
   if (/video|seedance|sora|veo|gemini-omni|apimart-zoe|kling|runway|hailuo|minimax-h3|happyhorse|wan(?:2\.\d)?|(?:^|[-_.])sd-2(?:[.\d-]|$)|(?:^|[-_.])(?:t2v|i2v|r2v)(?:[-_.]|$)/i.test(modelId)) return 'video'
   // Providers often omit modality metadata for chat models; classify known LLM families as text.
   if (/(?:^|[-_.\/])(?:gpt|o[1-9]|claude|gemini|deepseek|qwen|glm|moonshot|kimi|mistral|llama|grok|command-r)(?:[-_.\/]|$)/i.test(modelId)
-    || /chat|instruct|completion|^(?:doubao-seed-|minimax-m|muse-(?:spark|wonder|ember))/i.test(modelId)) return 'text'
+    || /chat|instruct|completion|^(?:doubao-seed-|minimax-m)/i.test(modelId)) return 'text'
   return 'unknown'
 }
 
@@ -51,7 +60,7 @@ export function parseRemoteModelCatalog(payload: unknown): CatalogModel[] {
     const id = String(item.id ?? item.model ?? item.model_id ?? item.model_name ?? item.slug ?? item.key ?? '').trim()
     const name = String(item.name ?? item.display_name ?? item.displayName ?? item.title ?? id).trim()
     return readModelAvailability(item) ? { id, name, capability: readDeclaredCapability(item, id) } : { id: '', name: '', capability: 'unknown' as const }
-  }).filter((model) => model.id)
+  }).filter((model) => model.id && !isRemovedModel(model))
   return Array.from(new Map(models.map((model) => [model.id, model])).values()).sort((a, b) => a.name.localeCompare(b.name))
 }
 
@@ -69,7 +78,8 @@ export function parseHfsyMarketplaceCatalog(payload: unknown): CatalogModel[] {
     const endpoints = Array.isArray(item.supported_endpoint_types) ? item.supported_endpoint_types : []
     const tagText = tags.join(' ')
     const capability: ModelCapability = /视频/.test(tagText) ? 'video' : /图片|图像/.test(tagText) ? 'image' : /文本/.test(tagText) ? 'text' : 'unknown'
-    if (!id || capability === 'unknown' || groups.length === 0 || endpoints.length === 0 || !readModelAvailability(item)) continue
+    const name = String(item.name ?? item.display_name ?? item.displayName ?? id)
+    if (!id || isRemovedModel({ id, name }) || capability === 'unknown' || groups.length === 0 || endpoints.length === 0 || !readModelAvailability(item)) continue
     models.push({ id, name: id, capability })
   }
   return Array.from(new Map(models.map((model) => [model.id, model])).values()).sort((a, b) => a.name.localeCompare(b.name))

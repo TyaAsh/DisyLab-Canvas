@@ -16,6 +16,7 @@ export type PendingVideoResult = {
   taskId?: string
   sourceUrl?: string
   binding: VideoResultBinding
+  error?: string
 }
 
 type VideoVersions = {

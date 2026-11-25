@@ -8,6 +8,19 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const agent = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+
+test('agent video deliveries retain partial results, recovered variants and legacy media after a canvas node is removed', () => {
+  const original = [{ id:'first', mediaId:'local-one', fileName:'1.mp4' }]
+  const restored = agent.agentVideoResultEntries(original, {videoVariants:[
+    {id:'duplicate-id',mediaId:'local-one',fileName:'1.mp4'},
+    {id:'recovered',mediaId:'local-two',fileName:'2.mp4',sourceUrl:'https://example.test/2.mp4'},
+  ]})
+  assert.equal(restored.length,2)
+  assert.equal(restored[1].mediaId,'local-two')
+  assert.equal(agent.agentVideoResultEntries(restored,undefined),restored)
+  assert.equal(agent.agentVideoResultEntries(restored,{videoVariants:[]}),restored)
+  assert.equal(agent.agentVideoResultEntries(undefined,{videoMediaId:'legacy-local',fileName:'legacy.mp4'})[0].mediaId,'legacy-local')
+})
 const compileModule = async (path) => ts.transpileModule(await readFile(new URL(path, import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
@@ -23,7 +36,149 @@ const skillPrompt = await import(asModule((await compileModule('./skills/prompt.
 const filmManifestModule = asModule(await compileModule('./skills/manifests/official/film.ts'))
 const { moveCanvasLayer } = await import(asModule(await compileModule('./canvasLayers.ts')))
 const { resolveAgentTextEditTargets, prepareAgentCanvasEdits, applyAgentCanvasEdits, revertAgentCanvasEdits } = await import(asModule(await compileModule('./agentCanvasEdits.ts')))
-const { activeAgentTeamRoles, normalizeAgentProjectSettings, projectMemoryPrompt, runAgentTeam } = await import(asModule(await compileModule('./agentProject.ts')))
+const { withoutLegacyAgentSettings } = await import(asModule(await compileModule('./agentProject.ts')))
+const { normalizeComposerSettings, videoGenerationModes, composerVideoReferenceIssue, composerVideoMode, composerVideoInputIssue, AGENT_VIDEO_WORKFLOWS } = await import(asModule(await compileModule('./agentComposer.ts')))
+const interaction = await import(asModule(await compileModule('./agentInteraction.ts')))
+
+test('three Agent workflows resolve real adapter modes and preserve edit intent across model changes', () => {
+  assert.deepEqual(AGENT_VIDEO_WORKFLOWS.map(x=>x.label), ['参考图/视频','视频编辑','首尾帧'])
+  const editing={supported:true,maxImages:9,inheritsSource:false,detail:'editable'}
+  const options={ratios:[{value:'16:9'}],resolutions:[{value:'720p'}],durations:[{value:'5'}],editing,modes:videoGenerationModes({images:9,videos:3,frames:true},true,editing)}
+  const generate=normalizeComposerSettings('video',{videoWorkflow:'generate'},options)
+  for(const [images,videos,expected] of [[0,0,'text'],[1,0,'omni'],[0,1,'omni']]) {
+    assert.equal(composerVideoMode(generate,options,images,videos),expected)
+    assert.equal(composerVideoInputIssue(generate,options,images,videos),undefined)
+  }
+  const single={...options,modes:videoGenerationModes({images:1,videos:0,frames:false},false)}
+  assert.equal(composerVideoMode(generate,single,1,0),'reference')
+  assert.match(composerVideoInputIssue(generate,single,0,1),/不能参考视频/)
+  const frameOnly={...single,modes:videoGenerationModes({framesOnly:true})}
+  assert.equal(composerVideoMode(generate,frameOnly,1,0),'image')
+  const edit=normalizeComposerSettings('video',{videoWorkflow:'edit',generationMode:'edit'},options)
+  assert.match(composerVideoInputIssue(edit,options,0,0),/待编辑/)
+  assert.match(composerVideoInputIssue(edit,options,0,2),/只接受 1/)
+  assert.equal(composerVideoInputIssue(edit,options,2,1),undefined)
+  const unsupported={...single,editing:{...editing,supported:false,detail:'此连接尚未接通编辑'}}
+  const changed=normalizeComposerSettings('video',edit,unsupported)
+  assert.equal(changed.videoWorkflow,'edit')
+  assert.equal(composerVideoInputIssue(changed,unsupported,0,1),'此连接尚未接通编辑')
+  const native={...options,editing:{...editing,maxImages:0,inheritsSource:true}}
+  assert.match(composerVideoInputIssue(edit,native,1,1),/移除辅助图片/)
+  assert.equal(composerVideoInputIssue(edit,native,0,1),undefined)
+  const frames={...generate,videoWorkflow:'frames'}
+  for(const [images,videos] of [[0,0],[1,0],[3,0],[2,1]]) assert.match(composerVideoInputIssue(frames,options,images,videos),/2 张图片/)
+  assert.equal(composerVideoInputIssue(frames,options,2,0),undefined)
+  assert.match(composerVideoInputIssue(frames,single,2,0),/不支持首尾帧/)
+  assert.equal(videoGenerationModes({exclusiveVideo:true,images:7,videos:1},true,native.editing).some(x=>x.value==='omni'),false)
+})
+
+test('natural video editing differs from reference generation and explicit composer choice takes priority', () => {
+  for(const text of ['修改这个视频，把背景换成雪山','将视频1中的帽子替换成红色','视频编辑：移除原片字幕','edit this video to look like clay']) {
+    assert.equal(agent.agentMediaSpecs([text],'video').generationMode,'edit',text)
+  }
+  assert.equal(agent.agentMediaSpecs(['参考视频运镜，生成一条咖啡广告'],'video').generationMode,'omni')
+  const explicit=agent.agentTurnMediaSpecs(['修改这个视频'],'video',{kind:'video',videoWorkflow:'generate',generationMode:'omni'})
+  assert.equal(explicit.generationMode,'omni')
+  assert.equal('videoWorkflow' in explicit,false)
+  assert.equal(agent.resolveAgentVideoMode(explicit,'edit',0,1),'omni')
+  assert.equal(agent.resolveAgentVideoMode({},'edit',0,1),'edit')
+})
+
+test('composer video modes obey adapter capabilities and explicit choices reach generation specs', () => {
+  const all = videoGenerationModes({ images:9, videos:3, frames:true })
+  assert.deepEqual(all.map(x => x.value), ['text','omni','image','frames','reference'])
+  assert.deepEqual(videoGenerationModes({textOnly:true}).map(x=>x.value), ['text'])
+  assert.deepEqual(videoGenerationModes({framesOnly:true}).map(x=>x.value), ['image','frames'])
+  assert.deepEqual(videoGenerationModes({wanSuffix:'i2v'}).map(x=>x.value), ['image'])
+  assert.deepEqual(videoGenerationModes({wanSuffix:'videoedit'}), [])
+  assert.equal(videoGenerationModes({images:1,videos:0,frames:false},false).some(x=>x.value==='omni'),false)
+  const options = {ratios:[{value:'16:9'}],resolutions:[{value:'720p'}],durations:[{value:'5'}],modes:all}
+  const explicit = normalizeComposerSettings('video',{generationMode:'frames'},options)
+  assert.equal(explicit.generationMode,'frames')
+  assert.equal(agent.agentTurnMediaSpecs(['用这两张图生成视频'],'video',explicit).generationMode,'frames')
+  assert.equal(normalizeComposerSettings('video',{generationMode:'frames'},{...options,modes:[{value:'text'}]}).generationMode,undefined)
+})
+
+test('video composer validates media without spending a model call', () => {
+  assert.match(composerVideoReferenceIssue('frames',1,0),/2 张/)
+  assert.match(composerVideoReferenceIssue('image',2,0),/1 张/)
+  assert.match(composerVideoReferenceIssue('text',1,0),/只使用文字/)
+  assert.match(composerVideoReferenceIssue('reference',1,1),/不接收视频/)
+  assert.match(composerVideoReferenceIssue('omni',0,0),/至少/)
+  assert.equal(composerVideoReferenceIssue('frames',2,0),undefined)
+  assert.equal(composerVideoReferenceIssue(undefined,2,1),undefined)
+})
+
+const executionInput = (patch = {}) => ({ workflow: 'smart', requests: ['生成一张咖啡海报，竖屏9:16，暖色调'],
+  decision: { mode: 'execute', confidence: .9, needsApproval: true, reason: '目标清楚' }, plans: [{ kind: 'image', status: 'ready', count: 1 }], ...patch })
+
+test('smart media execution follows clear user intent and checks quantity independently of model approval', () => {
+  assert.equal(interaction.decideAgentMediaExecution(executionInput()).automatic, true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({ requests: ['按参考视频的运镜，制作一条8秒咖啡广告'], plans: [{ kind:'video', status:'ready', count:1 }] })).automatic, true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({ plans: [{ kind:'image', status:'ready', count:4 }] })).automatic, false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({ requestedImageCount:4, plans:[{kind:'image',status:'ready',count:4}] })).automatic, true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({ plans:[{kind:'image',status:'ready',count:1},{kind:'video',status:'ready',count:1}] })).automatic, false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({ plans:[{kind:'image',status:'proposed',count:1}] })).automatic, false)
+})
+
+test('review requests take precedence over every workflow, including references and explicit specs', () => {
+  for (const workflow of ['smart','collaborate','direct']) {
+    for (const request of ['用图1，9:16，先给方案不要生成','先别直接生成，给我看看创意','先给我一张海报方案','我确认后再生成','只要方向，不要自动替我生成']) {
+      assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow,requests:[request]})).automatic, false, `${workflow}: ${request}`)
+    }
+  }
+})
+
+test('collaboration waits for a genuine start and smart mode retains an earlier review-only constraint', () => {
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow:'collaborate'})).automatic, false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow:'collaborate',requests:['先给方案','按这版开始生成']})).automatic, true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({requests:['先给方案','背景改成暖色']})).automatic, false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({requests:['先给方案','我选第一个']})).automatic, false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({requests:['帮我做张咖啡海报，还没想法','温暖实拍风格，竖版']})).automatic, true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow:'direct',requests:['帮我做张咖啡海报，没想法，你决定'],decision:{mode:'plan'}})).automatic,true)
+  for (const request of ['不要问了，直接生成一张海报','不用确认，直接做','我没想法，你帮我决定，直接生成','不要方案，直接生成']) {
+    assert.equal(interaction.agentExplicitlyStarts(request),true,request)
+  }
+})
+
+test('questions, creative directions, analysis and protected operations never automatically generate', () => {
+  for (const patch of [{questions:[{}]}, {directions:[{}]}, {protectedTask:true}, {decision:{mode:'inspect'}}, {decision:{mode:'clarify'}}]) {
+    assert.equal(interaction.decideAgentMediaExecution(executionInput(patch)).automatic,false)
+  }
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({requests:['这个比例有什么区别？'],decision:{mode:'answer'}})).automatic,false)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow:'collaborate',directionApproved:true,requests:['按选定方向生成']})).automatic,true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({workflow:'smart',directionApproved:true,currentRequest:'按「街角开门了」生成。',requests:['先不要生成素材','按已选方向直接生成图像：方向说明，先给方案不要生成素材']})).automatic,true)
+  assert.equal(interaction.decideAgentMediaExecution(executionInput({directionApproved:true,currentRequest:'按这个方向继续，先不要生成',requests:['直接生成图像']})).automatic,false)
+})
+
+test('creative directions are bounded and exclusive, with stable application IDs and no double execution cards', () => {
+  const raw = { title:'东方诡谲', description:'东方美学与异变结合', brief:'为角色设计一张国风人设立绘',kind:'image',recommended:true }
+  const reply = agent.parseAgentReply(JSON.stringify({ directions:[raw, raw, {...raw,title:'废土机能'}, {...raw,title:'都市异能'}, {...raw,title:'多余'}], imagePlans:[{prompt:'must not execute'}] }))
+  assert.equal(reply.directions.length,3)
+  assert.equal(reply.directions.filter(item=>item.recommended).length,1)
+  assert.equal(reply.directions[0].id,'direction-1')
+  assert.equal(agent.agentReplyAllowsProposals({mode:'execute'},reply),false)
+  const history = [{id:'ideas',role:'assistant',directions:reply.directions,mediaBrief:{requests:['做一个游戏人设提案']}}]
+  assert.equal(interaction.resolveAgentDirectionChoice(history,{messageId:'ideas',directionId:'direction-1',action:'generate'}).title,raw.title)
+  assert.equal(interaction.resolveAgentDirectionChoice([...history,{id:'new',role:'user'}],{messageId:'ideas',directionId:'direction-1',action:'generate'}),undefined)
+  assert.equal(agent.resolveAgentMediaContinuation(history,'按这个生成').requests[0],'做一个游戏人设提案')
+})
+
+test('editing a message preserves its references and workflow while excluding future conversation and stale direction approvals', () => {
+  const refs=[{nodeId:'cup',name:'杯子',url:'https://example.test/cup.png'}]
+  const messages=[{id:'before',role:'assistant',content:'方向建议'},{id:'user',role:'user',content:'做海报',references:refs,turnOptions:{workflow:'collaborate',models:{image:{key:'provider::image',name:'Image'}},directionChoice:{messageId:'before',directionId:'direction-1',action:'generate'}}},{id:'after',role:'assistant',content:'旧回复'}]
+  const edit=interaction.prepareAgentMessageEdit(messages,'user','做竖版海报，先聊方案')
+  assert.deepEqual(edit.history,[messages[0]])
+  assert.deepEqual(edit.source.references,refs)
+  assert.equal(edit.options.workflow,'collaborate')
+  assert.equal(edit.options.models.image.key,'provider::image')
+  assert.equal(edit.options.directionChoice,undefined)
+  assert.equal(messages[1].content,'做海报')
+  assert.equal(messages.length,3)
+  assert.equal(interaction.prepareAgentMessageEdit(messages,'before','不能编辑助手回复'),undefined)
+  assert.equal(interaction.prepareAgentMessageEdit(messages,'user','   '),undefined)
+  assert.equal(interaction.prepareAgentMessageEdit(messages,'user','做海报'),undefined)
+})
 const { OFFICIAL_FILM_SKILLS } = await import(filmManifestModule)
 const skillConversation = await import(asModule((await compileModule('./skills/conversation.ts'))
   .replace("'./manifests/official/film'", JSON.stringify(filmManifestModule))
@@ -77,23 +232,53 @@ test('ordinary clarification and explicit inspection never expose mutation propo
   assert.equal(agent.agentReplyAllowsProposals(write, {}), true)
 })
 
-test('project team templates choose distinct roles and the last role receives the prior work and memory', async () => {
-  const settings = normalizeAgentProjectSettings({
-    memory: [{ id: 'one', kind: 'constraint', text: '成片用竖版' }],
-    team: { template: 'production', models: { producer: 'local::model-a' }, disabled: ['screenwriter'] },
+test('retired Agent settings are removed while project content remains intact', () => {
+  const saved = { id: 'project', name: '咖啡广告', canvasIds: ['canvas'], agentSettings: { team: { template: 'production' }, memory: [{ text: 'old' }] } }
+  const clean = withoutLegacyAgentSettings(saved)
+  assert.deepEqual(clean, { id: 'project', name: '咖啡广告', canvasIds: ['canvas'] })
+  assert.ok(saved.agentSettings)
+  assert.deepEqual(withoutLegacyAgentSettings(clean), clean)
+})
+
+test('selected image parameters override prose defaults and survive into plan specifications', () => {
+  const generation = { kind: 'image', aspectRatio: '9:16', resolution: '2K', detail: 'high', count: 3 }
+  assert.deepEqual(agent.agentTurnMediaSpecs(['生成一张方形图片，1K'], 'image', generation), {
+    aspectRatio: '9:16', resolution: '2K', detail: 'high', count: 3,
   })
-  const roles = activeAgentTeamRoles(settings.team)
-  assert.deepEqual(roles.map(({ id }) => id), ['producer', 'director', 'productionReview'])
-  assert.deepEqual(activeAgentTeamRoles(normalizeAgentProjectSettings({ team: { template: 'copy' } }).team).map(({ id }) => id), ['copywriter', 'copyReview'])
-  const calls = []
-  const reply = await runAgentTeam(roles, projectMemoryPrompt(settings.memory), new AbortController().signal, async (role, prompt) => {
-    calls.push({ id: role.id, prompt })
-    return `交付 ${role.label}`
+  assert.deepEqual(agent.agentTurnMediaSpecs(['生成 8 秒视频'], 'video', generation), agent.agentMediaSpecs(['生成 8 秒视频'], 'video'))
+})
+
+test('video composer settings preserve the selected ratio, resolution, duration and quantity', () => {
+  const generation = { kind: 'video', aspectRatio: '16:9', resolution: '1080p', duration: 8, count: 2 }
+  const result = agent.agentTurnMediaSpecs(['生成 5 秒 720p 的竖屏视频'], 'video', generation)
+  assert.equal(result.duration, 8)
+  assert.equal(result.resolution, '1080p')
+  assert.equal(result.aspectRatio, '16:9')
+  assert.equal(result.count, 2)
+})
+
+test('switching image model replaces unsupported settings with supported options', () => {
+  const choices = values => values.map(value => ({ value, label: value }))
+  const result = normalizeComposerSettings('image', { aspectRatio: '21:9', resolution: '4K', detail: 'high', count: 3 }, {
+    ratios: choices(['1:1', '9:16']), resolutions: choices(['1K', '2K']), qualities: choices(['medium']),
   })
-  assert.equal(reply, '交付 执行制片')
-  assert.match(calls.at(-1).prompt, /成片用竖版/)
-  assert.match(calls.at(-1).prompt, /交付 制片人/)
-  assert.match(calls.at(-1).prompt, /交付 分镜导演/)
+  assert.deepEqual(result, { kind: 'image', aspectRatio: '1:1', resolution: '1K', detail: 'medium', count: 3 })
+})
+
+test('image output switches survive supported model changes and reset for unsupported models',()=>{
+  const options={ratios:[{value:'1:1',label:'1:1'}],resolutions:[{value:'1K',label:'1K'}],outputs:['png','transparent-png','gif']}
+  const selected=normalizeComposerSettings('image',{output:'gif'},options)
+  assert.equal(selected.output,'gif')
+  assert.equal(normalizeComposerSettings('image',selected,{...options,outputs:['png']}).output,undefined)
+  assert.equal(normalizeComposerSettings('image',{output:'transparent-png'},options).output,'transparent-png')
+})
+
+test('video parameters use the model duration list and do not inherit image quality', () => {
+  const choices = values => values.map(value => ({ value, label: value }))
+  const result = normalizeComposerSettings('video', { detail: 'high', duration: 20, count: 9 }, {
+    ratios: choices(['16:9']), resolutions: choices(['1080p']), durations: choices(['4', '8']),
+  })
+  assert.deepEqual(result, { kind: 'video', aspectRatio: '16:9', resolution: '1080p', duration: 4, count: 4, videoWorkflow: 'generate' })
 })
 
 test('canvas text suggestions stay within explicitly selected or uniquely named targets', () => {

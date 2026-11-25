@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowLeft, Check, ChevronRight, Clapperboard, FileCheck2, GripHorizontal, Layers3, LoaderCircle, Route, Sparkles, WandSparkles, X } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Clapperboard, FileCheck2, GripHorizontal, Layers3, LoaderCircle, RotateCcw, Route, Sparkles, WandSparkles, X } from 'lucide-react'
 import type { CompositeWorkbenchConfig } from '../skills/compositeBlueprints'
 import type { SkillManifest } from '../skills/types'
 import { GlassSelect } from './GlassSelect'
@@ -32,18 +32,49 @@ export function CompositeSkillWorkbench({ skill, onClose, onCreate, onOptimize }
   const [position, setPosition] = useState({ x: Math.max(18, window.innerWidth - 760), y: 44 })
   const [size, setSize] = useState({ width: Math.min(720, window.innerWidth - 36), height: Math.min(720, window.innerHeight - 88) })
   const [optimizingField, setOptimizingField] = useState('')
+  const [optimizationHistory, setOptimizationHistory] = useState<Partial<Record<keyof CompositeWorkbenchConfig, string[]>>>({})
+  const [optimizationError, setOptimizationError] = useState('')
+  const optimizationVersion = useRef(0)
+  const configRef = useRef(config)
+  configRef.current = config
   const dragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null)
   const resizeRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null)
-  useEffect(() => { if (skill) { setStep(0); setConfig(defaults(skill)) } }, [skill])
+  useEffect(() => {
+    optimizationVersion.current++
+    setOptimizingField(''); setOptimizationHistory({}); setOptimizationError('')
+    if (skill) { setStep(0); setConfig(defaults(skill)) }
+    return () => { optimizationVersion.current++ }
+  }, [skill])
   const stages = skill?.composite?.stages ?? []
-  const patch = (next: Partial<CompositeWorkbenchConfig>) => setConfig((current) => current ? { ...current, ...next } : current)
-  const optimize = async (key: keyof CompositeWorkbenchConfig, label: string) => {
-    const value = String(config?.[key] ?? '').trim()
-    if (!value || optimizingField) return
-    setOptimizingField(String(key))
-    try { patch({ [key]: await onOptimize(label, value) }) } finally { setOptimizingField('') }
+  const patch = (next: Partial<CompositeWorkbenchConfig>) => {
+    if (configRef.current) configRef.current = { ...configRef.current, ...next }
+    setConfig(configRef.current)
   }
-  const optimizeButton = (key: keyof CompositeWorkbenchConfig, label: string) => <button type="button" className="composite-field-optimize" disabled={!String(config?.[key] ?? '').trim() || Boolean(optimizingField)} title={`优化${label}`} aria-label={`优化${label}`} onClick={() => void optimize(key, label)}>{optimizingField === key ? <LoaderCircle className="is-spinning" size={13}/> : <WandSparkles size={13}/>}<span>优化</span></button>
+  const optimize = async (key: keyof CompositeWorkbenchConfig, label: string) => {
+    const original = String(configRef.current?.[key] ?? '')
+    const value = original.trim()
+    if (!value || optimizingField) return
+    const version = ++optimizationVersion.current
+    setOptimizationError('')
+    setOptimizingField(String(key))
+    try {
+      const result = (await onOptimize(label, value)).trim()
+      if (version !== optimizationVersion.current || configRef.current?.[key] !== original || !result || result === value) return
+      setOptimizationHistory((current) => ({ ...current, [key]: [...(current[key] ?? []), original] }))
+      patch({ [key]: result })
+    } catch {
+      if (version === optimizationVersion.current) setOptimizationError(`${label}优化失败，请重试。`)
+    } finally { if (version === optimizationVersion.current) setOptimizingField('') }
+  }
+  const optimizeButton = (key: keyof CompositeWorkbenchConfig, label: string) => <div className="composite-field-actions">
+    {!!optimizationHistory[key]?.length && <button type="button" className="composite-field-optimize" disabled={Boolean(optimizingField)} title={`撤回${label}到上次优化前`} aria-label={`撤回${label}优化`} onClick={() => {
+      const history = optimizationHistory[key] ?? []
+      patch({ [key]: history.at(-1)! })
+      setOptimizationHistory((current) => ({ ...current, [key]: history.slice(0, -1) }))
+      setOptimizationError('')
+    }}><RotateCcw size={13}/><span>撤回</span></button>}
+    <button type="button" className="composite-field-optimize" disabled={!String(config?.[key] ?? '').trim() || Boolean(optimizingField)} title={`优化${label}`} aria-label={`优化${label}`} onClick={() => void optimize(key, label)}>{optimizingField === key ? <LoaderCircle className="is-spinning" size={13}/> : <WandSparkles size={13}/>}<span>优化</span></button>
+  </div>
   const canContinue = useMemo(() => {
     if (!config) return false
     if (step === 0) return Boolean(config.projectName.trim() && config.concept.trim())
@@ -92,6 +123,7 @@ export function CompositeSkillWorkbench({ skill, onClose, onCreate, onOptimize }
       </header>
       <div className="composite-workbench-stagebar">{stages.map((stage, index) => <button type="button" key={stage.id} className={index === step ? 'is-active' : index < step ? 'is-done' : ''} disabled={index > step} onClick={() => index < step && setStep(index)}><i>{index < step ? <Check size={12}/> : String(index + 1).padStart(2, '0')}</i><span>{stage.label}</span></button>)}</div>
       <main className="composite-workbench-main">
+        {optimizationError && <p className="agent-plan-error" role="alert">{optimizationError}</p>}
         <div className="composite-workbench-intro"><small>{String(step + 1).padStart(2, '0')} / {stages[step]?.id.toUpperCase()}</small><h3>{stages[step]?.label}</h3><p>{stages[step]?.description}</p></div>
         {step === 0 && <div className="composite-workbench-form"><label><span>项目名称</span><input autoFocus value={config.projectName} onChange={(e) => patch({ projectName: e.target.value })}/></label><label className="is-wide"><span>核心想法 / 项目目标</span><div className="composite-field-control"><textarea value={config.concept} placeholder="一句话也可以。说明你想拍什么、希望观众感受到什么。" onChange={(e) => patch({ concept: e.target.value })}/>{optimizeButton('concept', '核心想法与项目目标')}</div></label><div className="composite-workbench-note"><Sparkles size={18}/><span><b>{skill.composite.promise}</b><small>系统不会在这一阶段生成昂贵素材。</small></span></div></div>}
         {step === 1 && <div className="composite-workbench-form"><label className="is-wide"><span>目标受众</span><input value={config.audience} onChange={(e) => patch({ audience: e.target.value })}/></label><label className="is-wide"><span>角色 / 产品 / 场景不可变要求</span><div className="composite-field-control"><textarea value={config.assetNotes} onChange={(e) => patch({ assetNotes: e.target.value })}/>{optimizeButton('assetNotes', '不可变要求')}</div></label><div className="composite-workbench-note"><Layers3 size={18}/><span><b>母版是下游唯一事实来源</b><small>修改母版后，受影响的分镜和视频会重新进入待审核状态。</small></span></div></div>}

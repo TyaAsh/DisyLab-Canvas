@@ -1,4 +1,5 @@
 import { isRetiredProvider } from './providerCatalogSync'
+import { isRemovedModel } from './modelCatalog'
 /*!
  * Copyright (c) 2026 DisyLab. All rights reserved.
  * Proprietary source-available software under LicenseRef-DisyLab-Proprietary.
@@ -10,7 +11,6 @@ import { isRetiredProvider } from './providerCatalogSync'
  */
 import { create } from 'zustand'
 import { isJimengCliBase, JIMENG_LOCAL_CREDENTIAL } from './jimengCli'
-import { isMuseWebBase, MUSE_WEB_CONNECTION } from './museWeb'
 import { isDesktopApp } from './providerTransport'
 
 const API_SETTINGS_KEY = 'disy-api-settings'
@@ -120,8 +120,7 @@ function readApiSettings(): ApiSettings {
           id,
           name: typeof connection.name === 'string' ? connection.name : 'API 连接',
           baseUrl,
-          apiKey: isDesktopApp() && isMuseWebBase(baseUrl) ? MUSE_WEB_CONNECTION
-            : isDesktopApp() && isJimengCliBase(baseUrl) ? JIMENG_LOCAL_CREDENTIAL : secrets[id] ?? '',
+          apiKey: isDesktopApp() && isJimengCliBase(baseUrl) ? JIMENG_LOCAL_CREDENTIAL : secrets[id] ?? '',
           authMode: ['auto', 'bearer', 'x-api-key', 'api-key', 'x-goog-api-key'].includes(String(connection.authMode)) ? connection.authMode as ApiAuthMode : 'auto',
           balanceToken: typeof balanceTokens[id] === 'string' ? balanceTokens[id] : '',
           models: Array.isArray(connection.models)
@@ -129,6 +128,7 @@ function readApiSettings(): ApiSettings {
                 if (!candidate || typeof candidate !== 'object') return []
                 const model = candidate as Partial<ApiModelConfig>
                 if (typeof model.id !== 'string' || !model.id.trim() || !['text', 'image', 'video', 'audio', 'unknown'].includes(String(model.capability))) return []
+                if (isRemovedModel({ id: model.id, name: model.name })) return []
                 // Older saved catalogs may have treated unrecognised HFSY
                 // video IDs (such as sd-2.5-720) as text. Correct those
                 // entries on load without changing user-selected image/audio types.
@@ -149,12 +149,14 @@ function readApiSettings(): ApiSettings {
           disconnected: connection.disconnected === true,
         }
       })
-      // APIYI and standalone Muse providers are no longer offered. Remove saved entries during
+      // Retired providers are no longer offered. Remove saved entries during
       // loading so they cannot remain selectable after this update, and erase
       // their session-only credentials at the same time.
       const removedApiYiIds = loadedConnections.filter(connection => isApiYiConnection(connection) || isRetiredProvider(connection)).map((connection) => connection.id)
       const connections = loadedConnections.filter((connection) => !isApiYiConnection(connection) && !isRetiredProvider(connection))
-      if (removedApiYiIds.length) {
+      const removedModels = value.connections.some((item, index) => item && typeof item === 'object'
+        && Array.isArray(item.models) && item.models.length !== loadedConnections[index].models.length)
+      if (removedApiYiIds.length || removedModels) {
         removeSessionCredentials(removedApiYiIds)
         try {
           localStorage.setItem(API_SETTINGS_KEY, JSON.stringify({
@@ -185,8 +187,13 @@ function readApiSettings(): ApiSettings {
     const baseUrl = typeof value.baseUrl === 'string' ? value.baseUrl : ''
     const legacySecret = sessionStorage.getItem(LEGACY_API_SECRET_KEY) ?? ''
     if (baseUrl || legacySecret) {
+      if (isRetiredProvider({ baseUrl }) || isApiYiConnection({ baseUrl })) {
+        sessionStorage.removeItem(LEGACY_API_SECRET_KEY)
+        localStorage.setItem(API_SETTINGS_KEY, JSON.stringify({ connections: [] }))
+        return { connections: [] }
+      }
       const id = 'connection-migrated'
-      const modelId = typeof value.model === 'string' ? value.model : ''
+      const modelId = typeof value.model === 'string' && !isRemovedModel({ id: value.model }) ? value.model : ''
       const legacyCapability = inferLegacyCapability(modelId)
       return {
         connections: [{
@@ -211,7 +218,7 @@ function persistApiSettings(settings: ApiSettings) {
     ...settings,
     connections: settings.connections.map(({ apiKey: _apiKey, balanceToken: _balanceToken, ...connection }) => connection),
   }
-  const secretMap = Object.fromEntries(settings.connections.filter((connection) => connection.apiKey && !isJimengCliBase(connection.baseUrl) && !isMuseWebBase(connection.baseUrl)).map((connection) => [connection.id, connection.apiKey]))
+  const secretMap = Object.fromEntries(settings.connections.filter((connection) => connection.apiKey && !isJimengCliBase(connection.baseUrl)).map((connection) => [connection.id, connection.apiKey]))
   const balanceTokenMap = Object.fromEntries(settings.connections.filter((connection) => connection.balanceToken).map((connection) => [connection.id, connection.balanceToken]))
   const previousSecrets = sessionStorage.getItem(API_SECRETS_KEY)
   sessionStorage.setItem(API_SECRETS_KEY, JSON.stringify(secretMap))
@@ -243,6 +250,10 @@ export const useDisyStore = create<DisyStore>((set) => ({
   apiSettings: initialApiSettings,
   setActivePanel: (activePanel) => set({ activePanel }),
   saveApiSettings: (apiSettings) => {
+    const connections = apiSettings.connections.filter(connection => !isRetiredProvider(connection) && !isApiYiConnection(connection))
+      .map(connection => ({ ...connection, models: connection.models.filter(model => !isRemovedModel(model)) }))
+    const retainedSelection = (selection: ModelSelection | undefined) => selection && connections.some(connection => connection.id === selection.connectionId && connection.models.some(model => model.id === selection.modelId)) ? selection : undefined
+    apiSettings = { ...apiSettings, connections, selectedTextModel: retainedSelection(apiSettings.selectedTextModel), selectedImageModel: retainedSelection(apiSettings.selectedImageModel) }
     persistApiSettings(apiSettings)
     set({
       apiSettings,
