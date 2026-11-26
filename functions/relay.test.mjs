@@ -4,6 +4,23 @@ import { onRequest as mediaRelay, mediaHostAllowed } from './apiyi/media.js'
 import { onRequest as hfsyRelay } from './hfsy/[[path]].js'
 import { onRequest as providerRelay } from './provider/[[path]].js'
 
+test('HFSY R2 image results use the scoped media relay without changing signatures or forwarding credentials',async t=>{
+  const host='38c0cdaab27ccdf82263188fbcf94809.r2.cloudflarestorage.com'
+  const source=`https://${host}/images/result.png?X-Amz-Signature=test-only&X-Amz-Expires=3600`
+  assert.equal(mediaHostAllowed(new URL(source)),true)
+  for(const invalid of [`https://${host}.attacker.test/image.png`,`https://other.r2.cloudflarestorage.com/image.png`,`http://${host}/image.png`,`https://key@${host}/image.png`,`https://${host}:8443/image.png`])assert.equal(mediaHostAllowed(new URL(invalid)),false,invalid)
+  t.mock.method(globalThis,'fetch',async(url,init)=>{
+    assert.equal(String(url),source)
+    assert.equal(init.headers.get('authorization'),null)
+    assert.equal(init.headers.get('cookie'),null)
+    return new Response('image bytes',{headers:{'content-type':'image/png'}})
+  })
+  const response=await mediaRelay({request:new Request(`https://app.test/apiyi/media?url=${encodeURIComponent(source)}`,{headers:{authorization:'Bearer private-test',cookie:'private=test'}})})
+  assert.equal(response.status,200)
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'),'*')
+  assert.equal(await response.text(),'image bytes')
+})
+
 test('media relay accepts the actual HFSY Jianying download family without forwarding API keys', async (t) => {
   for (const host of ['v11-octo-download.jianying.com','v6-octo-download.jianying.com']) assert.equal(mediaHostAllowed(new URL(`https://${host}/video/file.mp4`)),true)
   for (const url of ['https://v11-octo-download.jianying.com.attacker.test/video','https://other.jianying.com/video','http://v11-octo-download.jianying.com/video','https://key@v11-octo-download.jianying.com/video','https://v11-octo-download.jianying.com:8443/video']) assert.equal(mediaHostAllowed(new URL(url)),false,url)

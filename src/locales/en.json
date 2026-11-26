@@ -4204,5 +4204,10 @@
   "已找回": "Recovered",
   "已恢复到当前画布，原文件仍保留在数据库中": "Restored to the current canvas. The original file remains in the database",
   "历史媒体": "Stored media",
-  "项": "items"
+  "项": "items",
+  "图片暂时无法读取": "Image temporarily unavailable",
+  "取回原图": "Retrieve original image",
+  "正在取回原图，不会重新生成或扣费": "Retrieving the original image without generating or charging again",
+  "原图已取回并保存到本机，没有重新生成": "Original image retrieved and saved locally without generating again",
+  "取回原图失败：{0}。原记录和地址仍保留，可稍后继续取回。": "Could not retrieve the original image: {0}. The record and source address are retained so you can try retrieving it later."
 }

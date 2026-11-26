@@ -10973,6 +10973,34 @@ function App() {
     })
   }
 
+  const retryHistoryImageDownload = async (record: GenerationRecord) => {
+    if(historyArchiveAttemptedRef.current.has(record.id))return
+    historyArchiveAttemptedRef.current.add(record.id)
+    setToastMessage('正在取回原图，不会重新生成或扣费')
+    try {
+      const stored=record.mediaId ? await loadHistoryMedia(record.mediaId) : null
+      let archived:GenerationRecord
+      if(stored?.blob.size){
+        const imageUrl=historyMediaObjectUrlsRef.current.get(stored.id) ?? URL.createObjectURL(stored.blob)
+        historyMediaObjectUrlsRef.current.set(stored.id,imageUrl)
+        archived={...record,imageUrl,mediaId:stored.id}
+      }else{
+        archived=await archiveHistoryRecord({...record,mediaId:undefined,imageUrl:record.sourceUrl || record.imageUrl})
+      }
+      setGenerationHistory(current=>current.map(item=>item.id===record.id?archived:item))
+      setBrokenHistoryIds(current=>current.filter(id=>id!==record.id))
+      const matches=(url?:string)=>Boolean(url&&(url===record.imageUrl||url===record.sourceUrl))
+      setNodes(current=>current.map(node=>({...node,data:{...node.data,
+        ...(matches(node.data.imageUrl)?{imageUrl:archived.imageUrl,imageMediaId:archived.mediaId}:{}),
+        imageVariants:node.data.imageVariants?.map(variant=>matches(variant.url)||matches(variant.sourceUrl)?{...variant,url:archived.imageUrl,mediaId:archived.mediaId,sourceUrl:archived.sourceUrl || variant.sourceUrl}:variant),
+      }})))
+      setToastMessage('原图已取回并保存到本机，没有重新生成')
+    }catch(error){
+      const normalized=normalizeGenerationError(error)
+      setToastMessage(`取回原图失败：${normalized.message}。原记录和地址仍保留，可稍后继续取回。`)
+    }finally{historyArchiveAttemptedRef.current.delete(record.id)}
+  }
+
   const repairGenerationHistoryImage = async (record: GenerationRecord, file: File) => {
     if (!file.type.startsWith('image/')) {
       setToastMessage('请选择图片文件')
@@ -19135,7 +19163,8 @@ function App() {
                             {record.kind !== 'video' && brokenHistoryIds.includes(record.id) && (
                               <div className="history-image-broken" draggable={false} onClick={(event) => event.stopPropagation()}>
                                 <Info size={16} />
-                                <span>原图片链接已失效</span>
+                                <span>图片暂时无法读取</span>
+                                <button type="button" onClick={()=>void retryHistoryImageDownload(record)}><RefreshCw size={12}/>取回原图</button>
                                 <label>
                                   <Upload size={12} />重新上传
                                   <input

@@ -131,6 +131,7 @@ const GRSAI_IMAGE_POLL_INTERVAL_MS = 2_500
 const GRSAI_MAX_CONSECUTIVE_POLL_ERRORS = 24
 const GRSAI_MEDIA_HOST = /^file[1-9]\d?\.aitohumanize\.com$/i
 const HFSY_MEDIA_HOST = 'file.hfsyapi.cn'
+const HFSY_R2_IMAGE_HOST = '38c0cdaab27ccdf82263188fbcf94809.r2.cloudflarestorage.com'
 const VISIONARY_POLL_INTERVAL_MS = 3_000
 const VISIONARY_MAX_CONSECUTIVE_POLL_ERRORS = 5
 const VISIONARY_SUCCESS_WITHOUT_URL_RETRIES = 20
@@ -185,7 +186,7 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
       // Route those known result hosts through the same-origin media relay.
       if (typeof window !== 'undefined' && (
         host === 'aixinai.net' || host.endsWith('.aixinai.net')
-        || host === 'www.qixinai.net' || host === HFSY_MEDIA_HOST
+        || host === 'www.qixinai.net' || host === HFSY_MEDIA_HOST || host === HFSY_R2_IMAGE_HOST
         || host === 'gptgod.online' || host.endsWith('.gptgod.online')
         || host === 'gptgod.com' || host.endsWith('.gptgod.com')
         || GRSAI_MEDIA_HOST.test(host)
@@ -203,9 +204,9 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
       signal?.addEventListener('abort', abortReferenceRead, { once: true })
       const referenceTimeout = window.setTimeout(() => referenceController.abort(), REFERENCE_IMAGE_READ_TIMEOUT_MS)
       try {
-        const separator = readableSource.includes('?') ? '&' : '?'
-        const attemptSource = attempt > 1 && /^https?:/i.test(readableSource) ? `${readableSource}${separator}disy_retry=${attempt}` : readableSource
-        const response = await providerFetch(attemptSource, { signal: referenceController.signal, cache: 'no-store' })
+        // A presigned CDN/R2 URL covers its complete query string. Adding cache
+        // busters invalidates that signature; retry the exact URL with no-store.
+        const response = await providerFetch(readableSource, { signal: referenceController.signal, cache: 'no-store' })
         if (!response.ok) throw new Error(`图片读取失败（${response.status}）`)
         sourceBlob = await response.blob()
         break
@@ -232,7 +233,7 @@ export async function readImageSourceBlob(source: string, signal?: AbortSignal, 
       } catch { return '无法识别的图片地址' }
     })()
     throw new GenerationRequestError(
-      'platform',
+      'network',
       `${referenceLabel}${lastReadError instanceof DOMException && lastReadError.name === 'AbortError' ? '读取超时' : '无法读取'}`,
       `来源：${sourceDescription}。已自动重试 ${REFERENCE_IMAGE_READ_ATTEMPTS} 次。${lastReadError instanceof Error ? `${lastReadError.name}: ${lastReadError.message}` : String(lastReadError)}。`,
     )
@@ -1051,7 +1052,7 @@ function browserReadableImageResult(source: string, settings: ApiRequestSettings
   if (typeof window !== 'undefined') {
     try {
       const url = new URL(source)
-      if (url.protocol === 'https:' && (url.hostname === 'www.qixinai.net' || url.hostname === HFSY_MEDIA_HOST || GRSAI_MEDIA_HOST.test(url.hostname))) return apiYiGeneratedMediaUrl(source)
+      if (url.protocol === 'https:' && (url.hostname === 'www.qixinai.net' || url.hostname === HFSY_MEDIA_HOST || url.hostname === HFSY_R2_IMAGE_HOST || GRSAI_MEDIA_HOST.test(url.hostname))) return apiYiGeneratedMediaUrl(source)
     } catch { /* data/blob and relative URLs retain their existing handling */ }
   }
   if (typeof window === 'undefined' || !isVisionaryBaseUrl(settings.baseUrl) || !/^https?:\/\//i.test(source)) return source

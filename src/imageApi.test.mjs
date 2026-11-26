@@ -1157,6 +1157,33 @@ test('archive reader routes existing Qixinai URLs through the relay and preserve
   assert.equal(await image.text(), await original.text())
 })
 
+test('R2 generated images and saved references use the media relay with the original signed URL',async t=>{
+  browserGlobal(t,'window',{setTimeout,clearTimeout,location:{href:'http://localhost/'}})
+  const source='https://38c0cdaab27ccdf82263188fbcf94809.r2.cloudflarestorage.com/image/result.png?X-Amz-Signature=test-only&X-Amz-Expires=3600'
+  const calls=[]
+  t.mock.method(globalThis,'fetch',async(url,init)=>{
+    calls.push(String(url))
+    if(String(url).includes('/image/create'))return Response.json({status:'completed',images:[{url:source}]})
+    assert.equal(init.cache,'no-store')
+    if(calls.filter(url=>url.includes('/apiyi/media')).length===1)throw new TypeError('Failed to fetch')
+    return new Response(new Blob(['stored image'],{type:'image/png'}))
+  })
+  const [image]=await api.generateRemoteImages({baseUrl:'https://www.hfsyapi.cn/v1',apiKey:'test',model:'gpt-image-2'},{prompt:'draw',count:1})
+  const relay=`/apiyi/media?url=${encodeURIComponent(source)}`
+  assert.equal(image.url,relay)
+  assert.equal(await (await api.readImageSourceBlob(source)).text(),'stored image')
+  assert.deepEqual(calls.slice(1),[relay,relay])
+})
+
+test('direct signed image retries never append cache-busting query parameters',async t=>{
+  browserGlobal(t,'window',{setTimeout,clearTimeout,location:{href:'http://localhost/'}})
+  const source='https://cdn.example.test/result.png?signature=private-test'
+  const calls=[]
+  t.mock.method(globalThis,'fetch',async(url)=>{calls.push(String(url));if(calls.length===1)throw new TypeError('Failed to fetch');return new Response(new Blob(['image'],{type:'image/png'}))})
+  await api.readImageSourceBlob(source)
+  assert.deepEqual(calls,[source,source])
+})
+
 test('archive reader repairs mislabeled GIF and PNG MIME types without re-encoding', async (t) => {
   browserGlobal(t, 'window', { setTimeout, clearTimeout, location: { href: 'http://localhost/' } })
   const samples = [

@@ -3400,6 +3400,11 @@ body.is-resizing-node-editor { cursor: ns-resize !important; user-select: none !
 .history-image-broken > span { font-size: 9px; font-weight: 650; }
 .history-image-broken > label { height: 27px; padding: 0 9px; border: 1px solid var(--accent-border); border-radius: 8px; display: inline-flex; align-items: center; gap: 5px; color: var(--accent); background: var(--accent-soft); font-size: 9px; font-weight: 750; cursor: pointer; }
 .history-image-broken > label:hover { color: #101421; background: var(--brand-gradient); }
+.history-image-broken > button { height:27px; padding:0 9px; border:1px solid var(--accent-border); border-radius:8px; display:inline-flex; align-items:center; gap:5px; color:var(--accent); background:var(--accent-soft); font-size:9px; font-weight:750; cursor:pointer; }
+.history-image-broken > button:hover { background:var(--accent); color:var(--surface); }
+.history-image-broken:has(> button) { gap:4px; padding:7px; }
+.history-image-broken:has(> button) > svg { display:none; }
+.history-image-broken:has(> button) > label { height:20px; border-color:transparent; background:transparent; font-weight:500; color:var(--muted); }
 .history-image-broken input { display: none; }
 .asset-select-toggle { position: absolute; z-index: 3; left: 7px; top: 7px; width: 22px; height: 22px; padding: 0; border: 1px solid rgba(255,255,255,.48); border-radius: 7px; display: grid; place-items: center; color: #fff; background: rgba(8,10,9,.46); box-shadow: 0 4px 13px rgba(0,0,0,.18); backdrop-filter: blur(8px); opacity: .72; }
 .asset-select-toggle:hover { opacity: 1; background: rgba(18,21,19,.82); }
