@@ -497,10 +497,27 @@ test('HFSY native images use documented pixel sizes, transparency and GET pollin
   assert.deepEqual(progress, [[undefined, 'queued'], [42, 'in_progress']])
   assert.deepEqual(images, [{ url: `/apiyi/media?url=${encodeURIComponent(url)}`, revisedPrompt: 'draw' }])
   assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, 'gpt-image-2.6').resolutions, ['1K'])
-  assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, 'gpt-image-2.6-sunburst').outputs, ['png', 'transparent-png'])
-  for (const output of ['gif', 'svg']) await assert.rejects(() => api.generateRemoteImages(settings, { ...options, output }), /HFSY 图片参数/)
+  assert.deepEqual(api.getImageModelCapabilities(settings.baseUrl, 'gpt-image-2.6-sunburst').outputs, ['png', 'transparent-png', 'gif'])
+  await assert.rejects(() => api.generateRemoteImages(settings, { ...options, output: 'svg' }), /HFSY 图片参数/)
   await assert.rejects(() => api.generateRemoteImages({ ...settings, model: 'gpt-image-2.6' }, { ...options, referenceImages: Array(7).fill(options.referenceImages[0]) }), /HFSY 图片参数/)
   assert.equal(requests.length, 4)
+})
+
+test('HFSY GPT Image 2.6 sends GIF output on the native create route and preserves GIF results', async t => {
+  const requests=[]
+  t.mock.method(globalThis,'fetch',async (url,init)=>{
+    requests.push({url:String(url),body:init.body && JSON.parse(init.body)})
+    return Response.json({status:'completed',images:[{url:'https://file.hfsyapi.cn/result.gif'}]})
+  })
+  for(const model of ['gpt-image-2.6','gpt-image-2.6-flare','gpt-image-2.6-sunburst']){
+    const settings={baseUrl:'https://www.hfsyapi.cn/v1',apiKey:'test',model}
+    assert.ok(api.getImageModelCapabilities(settings.baseUrl,model).outputs.includes('gif'))
+    const results=await api.generateRemoteImages(settings,{prompt:'A looping animated cat',count:1,output:'gif',aspectRatio:'1:1',resolution:'1K'})
+    assert.match(results[0].url,/result\.gif/)
+    assert.equal(requests.at(-1).body.output_format,'gif')
+    assert.match(requests.at(-1).url,/\/image\/create$/)
+  }
+  assert.ok(!api.getImageModelCapabilities('https://www.hfsyapi.cn/v1','gpt-image-2.5-flare').outputs.includes('gif'))
 })
 
 test('HFSY text uses chat completions, handles SSE chunks and reports error envelopes', async (t) => {

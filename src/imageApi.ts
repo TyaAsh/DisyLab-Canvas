@@ -572,7 +572,8 @@ export function getHfsyImageCapabilities(baseUrl: string, modelId: string) {
     : seedream55 ? ['1:1', '3:2', '2:3', '9:16', '16:9', '4:3', '3:4', '4:5', '5:4', '21:9', '9:21'] : transparent
     ? ['1:1', '5:4', '9:16', '16:9', '4:3', '3:1', '3:2', '3:4']
     : Object.keys(HFSY_IMAGE_SIZES).filter((ratio) => ratio !== '3:1')
-  const outputs: readonly ImageOutput[] = transparent || seedream55 ? ['png', 'transparent-png'] : ['png']
+  const outputs: ImageOutput[] = transparent || seedream55 ? ['png', 'transparent-png'] : ['png']
+  if (/^gpt-image-2\.6(?:-|$)/.test(model)) outputs.push('gif')
   const images = transparent ? 16 : standard || seedream55 ? 6 : seedream ? 10
     : /^(?:nano-banana-pro|gemini-3-pro-image-preview|mj_)/.test(model) ? 7 : 4
   return { ratios, resolutions, outputs, images, qualities: [] as readonly ImageQuality[], customRatio: midjourney }
@@ -3703,7 +3704,7 @@ export async function generateRemoteImages(
     prompt: options.prompt,
     ...(isApiYiSeedream ? {} : { n: options.count }),
     size: requestSize,
-    ...(isOpenAiGptImage && options.output ? { output_format: options.output === 'transparent-png' ? 'png' : options.output,
+    ...((isOpenAiGptImage || isHfsyBaseUrl(settings.baseUrl)) && options.output ? { output_format: options.output === 'transparent-png' ? 'png' : options.output,
       ...(options.output === 'transparent-png' ? { background: 'transparent' } : {}) } : {}),
   }
   // APIYI's Seedream endpoint uses resolution presets. A 1024x1024 OpenAI
@@ -3766,6 +3767,7 @@ export async function generateRemoteImages(
     ...(hfsySize ? { size: hfsySize } : {}),
     ...(publicHfsyReferences.length ? { reference_images: publicHfsyReferences } : {}),
     ...(options.output === 'transparent-png' ? { background: 'transparent' } : {}),
+    ...(options.output === 'gif' ? { output_format: 'gif' } : {}),
   }
   if (isGrsai && options.output && options.output !== grsaiOptions.output) {
     throw new GenerationRequestError('platform', '当前模型或接口不支持此输出格式', `${settings.model} 无法输出 ${options.output}，生成尚未提交。`)
@@ -3922,7 +3924,7 @@ export async function generateRemoteImages(
       const quality = isGrsai ? grsaiOptions.detail : options.detail
       if (quality) form.append('quality', quality)
       if (isGrsai) form.append('output_format', outputFormat ?? 'png')
-      if (isOpenAiGptImage && options.output) {
+      if ((isOpenAiGptImage || hfsy) && options.output) {
         form.append('output_format', options.output === 'transparent-png' ? 'png' : options.output)
         if (options.output === 'transparent-png') form.append('background', 'transparent')
       }

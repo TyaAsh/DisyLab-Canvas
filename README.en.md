@@ -56,6 +56,8 @@ Projects are stored in your current browser, rather than synchronized to a cloud
 - **Reference framing:** center references without stretching. Requests to preserve complete content use content-preserving framing; the generation model may still alter details.
 - **Consistent dialogs:** unified size and appearance, clearer English category spacing, and no duplicate Auto option.
 - Project memory, the old team-role interface, and MUSE integration have been removed.
+- **Review and recover local data**: Storage now lives in the same settings window. Browse retained database content by category, preview media beneath its record, download originals, or restore them to the canvas. Cleanup checks references and requires confirmation.
+
 
 ## Work with Disy Agent
 

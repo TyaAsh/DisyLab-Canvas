@@ -4151,8 +4151,50 @@ body.is-resizing-node-editor { cursor: ns-resize !important; user-select: none !
 .settings-sidebar button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px 12px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; text-align: left; transition: color .2s ease, background .2s ease; }
 .settings-sidebar button:hover { color: var(--ink); background: color-mix(in srgb, var(--accent) 9%, transparent); }
 .settings-sidebar button.is-active { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
-.storage-settings-shell .storage-health-panel { flex: 1; min-width: 0; min-height: 0; margin: 0; border: 0; border-radius: 0; background: transparent; overflow: auto; }
+.settings-shell > .storage-health-panel { flex: 1; min-width: 0; min-height: 0; margin: 0; border: 0; border-radius: 0; background: transparent; overflow: auto; }
 .storage-health-panel { margin: 0; padding: 18px 20px 20px; border: 0; background: transparent; }
+.storage-data-manager { margin-top:20px; padding-top:18px; border-top:1px solid var(--line); }
+.storage-data-manager > header { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:14px; }
+.storage-data-manager h3 { margin:0; font-size:13px; }
+.storage-data-manager p { margin:5px 0 0; color:var(--muted); font-size:11px; line-height:1.6; }
+.storage-data-manager button { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-height:30px; border:1px solid var(--line); border-radius:7px; padding:5px 10px; background:transparent; color:var(--ink); font-size:11px; white-space:nowrap; transition:background .18s,border-color .18s; }
+.storage-data-manager button:hover:not(:disabled) { background:var(--accent-soft); border-color:var(--accent-border); }
+.storage-data-manager button:disabled { opacity:.4; cursor:not-allowed; }
+.storage-data-manager > input { width:100%; height:34px; padding:0 11px; margin-bottom:12px; border:1px solid var(--line); border-radius:8px; color:var(--ink); background:rgba(0,0,0,.12); font-size:12px; }
+.storage-data-categories { display:grid; gap:7px; }
+.storage-data-category { border:1px solid var(--line); border-radius:9px; }
+.storage-data-category > summary { display:flex; align-items:center; gap:9px; min-height:43px; padding:9px 12px; list-style:none; cursor:pointer; font-size:12px; }
+.storage-data-category > summary::-webkit-details-marker { display:none; }
+.storage-data-category > summary > svg { color:var(--muted); transition:transform .18s; }
+.storage-data-category[open] > summary > svg { transform:rotate(180deg); }
+.storage-data-category > summary span { color:var(--muted); font-size:11px; }
+.storage-data-category > summary b { margin-left:auto; font-size:11px; font-variant-numeric:tabular-nums; }
+.storage-data-content { padding:0 12px 10px; }
+.storage-data-actions { display:flex; justify-content:flex-end; gap:8px; padding:8px 0; border-top:1px solid var(--line); }
+.storage-data-row { display:flex; align-items:center; gap:12px; padding:9px 0; border-top:1px solid var(--line); font-size:11px; }
+.storage-data-row > div { flex:1; min-width:0; display:grid; gap:4px; }
+.storage-data-row strong { font-size:11px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.storage-data-row small { color:var(--muted); font-size:10px; }
+.storage-data-row > span { white-space:nowrap; font-variant-numeric:tabular-nums; color:var(--muted); }
+.storage-data-pagination { display:flex; align-items:center; justify-content:center; gap:14px; padding-top:10px; font-size:11px; color:var(--muted); }
+.storage-unused-media { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-top:15px; padding:13px; border:1px solid var(--line); border-radius:9px; }
+.storage-unused-media strong { font-size:12px; }
+.storage-unused-media small { display:block; margin-top:6px; color:var(--muted); font-size:11px; line-height:1.6; }
+.storage-data-manager .storage-data-note { margin-top:12px; }
+.storage-data-error { padding:10px 12px; color:var(--error,#dc8989); border:1px solid currentColor; border-radius:8px; font-size:12px; }
+.storage-media-preview { margin:10px 0; padding:12px; border:1px solid var(--line); border-radius:9px; background:color-mix(in srgb,var(--ink) 3%,transparent); }
+.storage-data-item .storage-media-preview { margin:0 0 12px; animation:storage-preview-open .16s ease-out; }
+@keyframes storage-preview-open { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+@media(prefers-reduced-motion:reduce) { .storage-data-item .storage-media-preview { animation:none; } }
+.storage-media-preview > header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.storage-media-preview > header strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.storage-media-preview-content { display:flex; justify-content:center; margin:12px 0; border-radius:6px; overflow:hidden; background:repeating-conic-gradient(#202224 0% 25%,#292b2d 0% 50%) 50% / 18px 18px; }
+.storage-media-preview-content :is(img,video) { display:block; max-width:100%; max-height:280px; object-fit:contain; }
+.storage-media-preview > footer { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; }
+.storage-media-preview > footer > span { flex:1; min-width:150px; color:var(--muted); font-size:11px; }
+.storage-data-manager :is(button,summary,input):focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+@media(max-width:600px) { .storage-data-manager > header,.storage-unused-media { align-items:flex-start; flex-direction:column; gap:10px; } }
+@media(prefers-reduced-motion:reduce) { .storage-data-manager button,.storage-data-category > summary > svg { transition:none; } }
 .storage-panel-heading { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .storage-panel-title { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .storage-panel-title > span:last-child { min-width: 0; display: grid; gap: 3px; }

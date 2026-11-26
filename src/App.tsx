@@ -29,6 +29,8 @@ import { createContext, Fragment, forwardRef, lazy, memo, Suspense, useCallback,
 import { createPortal } from 'react-dom'
 import { GenerationRequestError, readRecoverableVideo, recoverGeneratedVideoTask, isRecoverableVideoError, normalizeOriginalImageBlob, readImageSourceBlob, publicImageSourceUrl, publishHfsyReferenceImage, publishHfsyVideoReferenceVideo, videoReferenceRules, videoReferenceSettingsIssue, videoModeLimits, supportsImageEditMask, imageReferenceRules, hfsyVideoLimits, isHfsyNativeSeedance, seedanceVideoDefaults, getImageModelCapabilities, getGrsaiVideoCapabilities, resolveImageModelOptions, type ImageOutput, type ImageQuality } from './imageApi'
 import { ImageOutputToggles } from './skill-ui/ImageOutputToggles'
+import { StorageDataManager } from './StorageDataManager'
+import type { StorageEntry, StorageInventory } from './storageInventory'
 import { uniqueImageRatios } from './imageParameterOptions'
 import { IMAGE_OUTPUT_LABELS, imageOutputIntent, inferImageOutput } from './imageOutputIntent'
 import { VideoReferenceAudioField } from './VideoReferenceAudioField'
@@ -155,7 +157,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { useDisyStore, isConnectionUsable, type ApiAuthMode, type ApiConnection, type ApiModelConfig, type ModelCapability, type ModelSelection } from './store'
-import { appendWorkspaceProjects, createWorkspaceCanvas, createWorkspaceProject, deleteAgentSession, deleteHistoryMedia, deleteWorkspaceCanvas, deleteWorkspaceProject, exportWorkspaceSnapshot, listAgentSessions, listHistoryMedia, listWorkspaceCanvases, listWorkspaceProjects, loadHistoryMedia, loadLocalAssets, loadLocalProject, loadWorkspaceAuxiliaryData, loadWorkspaceCanvas, loadWorkspaceImportBackup, makeUniqueWorkspaceName, mergeWorkspaceIntoProject, renameWorkspaceProject, replaceWorkspaceProject, restoreWorkspaceImportBackup, saveAgentSession, saveHistoryMedia, saveLocalAssets, saveWorkspaceAuxiliaryData, saveWorkspaceCanvas, saveWorkspaceProject, validateWorkspaceSnapshot, type StylePresetRecord, type StyleReferenceRecord, type WorkspaceCanvas, type WorkspaceProject } from './localDb'
+import { inspectLocalStorage, deleteStorageArchive, cleanUnusedHistoryMedia, deleteWorkspaceImportBackup, appendWorkspaceProjects, createWorkspaceCanvas, createWorkspaceProject, deleteAgentSession, deleteHistoryMedia, deleteWorkspaceCanvas, deleteWorkspaceProject, exportWorkspaceSnapshot, listAgentSessions, listHistoryMedia, listWorkspaceCanvases, listWorkspaceProjects, loadHistoryMedia, loadLocalAssets, loadLocalProject, loadWorkspaceAuxiliaryData, loadWorkspaceCanvas, loadWorkspaceImportBackup, makeUniqueWorkspaceName, mergeWorkspaceIntoProject, renameWorkspaceProject, replaceWorkspaceProject, restoreWorkspaceImportBackup, saveAgentSession, saveHistoryMedia, saveLocalAssets, saveWorkspaceAuxiliaryData, saveWorkspaceCanvas, saveWorkspaceProject, validateWorkspaceSnapshot, type StylePresetRecord, type StyleReferenceRecord, type WorkspaceCanvas, type WorkspaceProject } from './localDb'
 import { collectReferencedMediaIds, extractMediaIntoBundle, isWorkspaceBundle, packWorkspaceBundle, reinflateBundleMedia, triggerBlobDownload, unpackWorkspaceBundle, type BundleMediaEntry } from './workspaceBundle'
 import { CanvasLayersPanel, type CanvasLayer } from './CanvasLayersPanel'
 import { frontToBackCanvasLayers, moveCanvasLayer } from './canvasLayers'
@@ -3336,7 +3338,7 @@ function useTouchCanvasMode() {
 
 function App() {
   useLocale()
-  const [apiSettingsView, setApiSettingsView] = useState<'api' | 'language'>('api')
+  const [apiSettingsView, setApiSettingsView] = useState<'api' | 'language' | 'storage'>('api')
   const [textModelRecoveries, setTextModelRecoveries] = useState<TextModelRecovery[]>([])
   const [generationFailures, setGenerationFailures] = useState<OutputHistoryRecord[]>([])
   const mobileCanvasMode = useMobileCanvasMode()
@@ -3720,7 +3722,6 @@ function App() {
   const [groupColorMenuOpen, setGroupColorMenuOpen] = useState(false)
   const [groupIconMenuOpen, setGroupIconMenuOpen] = useState(false)
   const [apiOpen, setApiOpen] = useState(false)
-  const [apiStorageNavVisible, setApiStorageNavVisible] = useState(true)
   const [helpOpen, setHelpOpen] = useState(false)
   const [performanceMonitorOpen, setPerformanceMonitorOpen] = useState(false)
   const [manualPerformanceMode, setManualPerformanceMode] = useState(false)
@@ -3745,7 +3746,7 @@ function App() {
   const [projectCoverById, setProjectCoverById] = useState<Record<string, ProjectCoverPreview>>({})
   const projectCoverObjectUrlsRef = useRef(new Set<string>())
 
-  const openApiSettings = useCallback((event?: React.SyntheticEvent, options?: { storageNav?: boolean }) => {
+  const openApiSettings = useCallback((event?: React.SyntheticEvent) => {
     event?.preventDefault()
     event?.stopPropagation()
     setProjectContextMenu(null)
@@ -3753,15 +3754,13 @@ function App() {
     setCreateProjectOpen(false)
     setTransferOpen(false)
     setProjectOpen(false)
-    setStorageOpen(false)
-    setApiStorageNavVisible(options?.storageNav !== false)
     setApiSettingsView('api')
     setApiOpen(true)
   }, [])
 
   const openStorageSettings = () => {
-    setApiOpen(false)
-    setStorageOpen(true)
+    openApiSettings()
+    setApiSettingsView('storage')
     void scanStorage()
   }
 
@@ -4014,7 +4013,9 @@ function App() {
   const [storageUsage, setStorageUsage] = useState<{ usage: number; quota: number } | null>(null)
   const [storageInsights, setStorageInsights] = useState<{ localBytes: number; historyBytes: number; historyCount: number }>({ localBytes: 0, historyBytes: 0, historyCount: 0 })
   const [storageScanning, setStorageScanning] = useState(false)
-  const [storageOpen, setStorageOpen] = useState(false)
+  const [storageInventory, setStorageInventory] = useState<StorageInventory | null>(null)
+  const [storageError, setStorageError] = useState('')
+  const [storageCleaning, setStorageCleaning] = useState(false)
   const [desktopStoragePath, setDesktopStoragePath] = useState<string | null>(null)
   const [desktopStorageBusy, setDesktopStorageBusy] = useState(false)
   const [desktopStorageError, setDesktopStorageError] = useState('')
@@ -4482,19 +4483,18 @@ function App() {
   }, [outputHistoryOpen, outputHistoryFilter])
 
   useEffect(() => {
-    if (!apiAlert && !deleteConfirm && !storageOpen && !expandedEditorNodeId) return
+    if (!apiAlert && !deleteConfirm && !expandedEditorNodeId) return
     const closeDismissibleSurface = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       event.preventDefault()
       event.stopImmediatePropagation()
       if (apiAlert) setApiAlert(null)
       else if (deleteConfirm) setDeleteConfirm(null)
-      else if (storageOpen) setStorageOpen(false)
       else setExpandedEditorNodeId(null)
     }
     window.addEventListener('keydown', closeDismissibleSurface, true)
     return () => window.removeEventListener('keydown', closeDismissibleSurface, true)
-  }, [apiAlert, deleteConfirm, expandedEditorNodeId, storageOpen])
+  }, [apiAlert, deleteConfirm, expandedEditorNodeId])
 
   useEffect(() => {
     try {
@@ -14788,19 +14788,88 @@ function App() {
   }
   const formatProviderCreditAmount = (credits: ProviderCredits) => formatProviderCreditView(credits).amount
   const formatProviderCreditUnit = (credits: ProviderCredits) => formatProviderCreditView(credits).unit
+  const liveStorageReferences = () => [nodes, savedAssets, generationHistory, outputHistory, agentMessages, agentPlans, agentVideoPlans, agentTextPlans, agentReferences, agentPendingReferences, stylePresets]
+  const cleanStorageMedia = async () => {
+    if (storageCleaning || storageScanning || destructiveWorkspaceMutationBlocked()) return
+    if (!await projectConfirm({title:'清理未引用媒体？',message:'只删除未被项目、画布、资产、历史记录、对话或恢复备份引用的媒体文件。清理后无法恢复，请先导出重要项目。',confirmLabel:'确认清理',danger:true})) return
+    setStorageCleaning(true)
+    try {
+      const ids=await cleanUnusedHistoryMedia(liveStorageReferences())
+      for(const id of ids){const url=historyMediaObjectUrlsRef.current.get(id);if(url)URL.revokeObjectURL(url);historyMediaObjectUrlsRef.current.delete(id)}
+      await scanStorage()
+      setToastMessage('已清理 ' + ids.length + ' 项未引用媒体')
+    } catch(error){setStorageError(error instanceof Error ? error.message : '清理失败，请重试。')}
+    finally {setStorageCleaning(false)}
+  }
+  const removeStorageBackup = async () => {
+    if(storageCleaning || transferBusy || destructiveWorkspaceMutationBlocked())return
+    if(!await projectConfirm({title:'删除恢复备份？',message:'这会删除最近一次导入前的恢复副本，当前项目不受影响。删除后将无法恢复到导入前版本。',confirmLabel:'确认删除',danger:true}))return
+    setStorageCleaning(true)
+    try{await deleteWorkspaceImportBackup();setHasImportBackup(false);await scanStorage();setToastMessage('恢复备份已删除')}
+    catch(error){setStorageError(error instanceof Error ? error.message : '删除备份失败')}
+    finally{setStorageCleaning(false)}
+  }
+  const removeStorageArchive = async (kind: 'legacy' | 'checkpoints') => {
+    if(storageCleaning || destructiveWorkspaceMutationBlocked())return
+    const message=kind==='legacy' ? '将删除旧版项目留存数据，无法撤回。请先导出备份。当前新版项目与画布会保留。' : '将删除制作检查点，无法再从这些检查点继续制作。已生成的素材和对话会保留。'
+    if(!await projectConfirm({title:'清除此类留存？',message,confirmLabel:'确认清除',danger:true}))return
+    setStorageCleaning(true)
+    try{await deleteStorageArchive(kind);await scanStorage();setToastMessage('留存数据已清除')}
+    catch(error){setStorageError(error instanceof Error ? error.message : '清理失败，请重试。')}
+    finally{setStorageCleaning(false)}
+  }
+  const restoreStorageMedia = async (mediaId:string) => {
+    const record=await loadHistoryMedia(mediaId)
+    if(!record || !(record.blob instanceof Blob) || !record.blob.size)throw new Error('文件本体已缺失，无法恢复。请检查项目备份。')
+    const video=record.blob.type.startsWith('video/')||/\.(mp4|webm|mov|m4v|mkv)$/i.test(record.fileName)
+    const center=screenToFlowPosition({x:window.innerWidth/2,y:window.innerHeight/2})
+    const id=createNode(video?'video':'upload',{x:center.x-150,y:center.y-100})
+    if(!id)throw new Error('无法创建恢复节点')
+    const url=historyMediaObjectUrlsRef.current.get(mediaId) ?? URL.createObjectURL(record.blob)
+    historyMediaObjectUrlsRef.current.set(mediaId,url)
+    setNodes(current=>current.map(node=>node.id===id?{...node,data:{...node.data,title:record.fileName,fileName:record.fileName,body:'',status:'已找回',...(video?{videoUrl:url,videoMediaId:mediaId,videoSource:'local-upload' as const,videoProgress:100}:{imageUrl:url,imageMediaId:mediaId,imageSource:'local-upload' as const})}}:node))
+    setProjectHomeOpen(false);setApiOpen(false);setSelectedNodeIds([id])
+    setToastMessage('已恢复到当前画布，原文件仍保留在数据库中')
+  }
+  const manageStorageData = async (category:string,entry?:StorageEntry) => {
+    try {
+      if(category==='settings'){setApiSettingsView('api');return}
+      if(category==='backups'){setApiOpen(false);setTransferOpen(true);return}
+      if(entry && (category==='projects'||category==='canvases'||category==='sessions')){
+        const canvasId=category==='projects' ? workspaceProjects.find(project=>project.id===entry.id)?.activeCanvasId : category==='canvases' ? entry.id : entry.canvasId
+        if(!canvasId)throw new Error('对应画布已不可用')
+        if(category==='sessions'&&canvasId===activeCanvasId)await selectAgentConversation(entry.id)
+        else await openWorkspaceCanvas(canvasId,category==='projects'?entry.id:entry.projectId ?? activeProjectId,false,category==='sessions'?entry.id:undefined)
+        setProjectHomeOpen(false);setApiOpen(false)
+        if(category==='sessions')setAgentOpen(true)
+        return
+      }
+      setApiOpen(false)
+      if(['projects','canvases','legacy'].includes(category)){setProjectOpen(true);return}
+      if(['assets','folders'].includes(category)){setAssetScope('all');setActiveAssetFolderId('all');setAssetSearch(entry?.name ?? '');setSelectedAssetId(entry?.id ?? null);setAssetLibraryOpen(true);return}
+      if(category==='generation'){setGenerationHistoryOpen(true);return}
+      if(['sessions','checkpoints'].includes(category)){setAgentOpen(true);setAgentTaskCenterOpen(true);return}
+      setOutputHistoryFilter('all');setOutputHistoryOpen(true)
+    } catch(error){setStorageError(error instanceof Error ? error.message : '无法打开对应数据')}
+  }
   const scanStorage = async () => {
     setStorageScanning(true)
     try {
       const localBytes = Object.keys(localStorage).reduce((total, key) => total + key.length + (localStorage.getItem(key)?.length ?? 0), 0) * 2
-      const historyRecords = await listHistoryMedia().catch(() => [])
-      const historyBytes = historyRecords.reduce((total, record) => total + (record.blob?.size ?? 0), 0)
-      setStorageInsights({ localBytes, historyBytes, historyCount: historyRecords.length })
+      setStorageError('')
+      const inventory = await inspectLocalStorage(liveStorageReferences())
+      setStorageInventory(inventory)
+      const media = inventory.categories.find(category=>category.id==='media')!
+      const historyBytes=media.bytes
+      setStorageInsights({ localBytes, historyBytes, historyCount: media.entries.length })
       if (navigator.storage?.estimate) {
         const estimate = await navigator.storage.estimate()
         setStorageUsage({ usage: estimate.usage ?? 0, quota: estimate.quota ?? 0 })
       } else {
-        setStorageUsage({ usage: localBytes + historyBytes, quota: 0 })
+        setStorageUsage({ usage: localBytes + inventory.bytes, quota: 0 })
       }
+    } catch(error) {
+      setStorageError(error instanceof Error ? error.message : '无法读取本机数据库，请重试。')
     } finally {
       setStorageScanning(false)
     }
@@ -15071,7 +15140,7 @@ function App() {
                 <button className="project-home-icon project-home-transfer" onClick={() => openTransferDialog('workspace-append')} aria-label="导入/导出项目" title="导入/导出"><ArrowUpDown size={18} /></button>
                 <button
                   className={`project-home-api ${apiConfigured ? 'is-configured' : ''}`}
-                  onClick={(event) => openApiSettings(event, { storageNav: false })}
+                  onClick={(event) => openApiSettings(event)}
                   aria-label={apiConfigured ? '管理 API 配置' : '配置 API'}
                   title={apiConfigured ? '管理 API 配置' : '配置 API'}
                 >
@@ -15164,22 +15233,7 @@ function App() {
           </motion.section>
         )}
       </AnimatePresence>
-      <AnimatePresence>
-        {storageOpen && <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setStorageOpen(false)}>
-          <motion.div className="api-modal storage-modal" role="dialog" aria-modal="true" aria-labelledby="storage-dialog-title" initial={{ y: 18, opacity: 0, scale: .98 }} animate={{ y: 0, opacity: 1, scale: 1 }} exit={{ y: 18, opacity: 0, scale: .98 }} onClick={(event) => event.stopPropagation()}>
-            <div className="modal-heading api-manager-heading"><div><span className="eyebrow">设置</span><h2 id="storage-dialog-title">存储空间</h2><p>检查项目的存储占用与可优化空间。</p></div><button aria-label="关闭存储空间" className="modal-close" onClick={() => setStorageOpen(false)}><X size={18} /></button></div>
-            <div className="settings-shell storage-settings-shell"><aside className="settings-sidebar" aria-label="设置分类"><button type="button" onClick={openApiSettings}><KeyRound size={14} />API 设置</button><button type="button" className="is-active"><HardDrive size={14} />存储空间</button></aside><section className="storage-health-panel">{isDesktopApp() && <div className="desktop-storage-settings">
-              <div><strong>本地存储目录</strong><p>手动保存或画布自动保存时，更新此目录里的工作区文件。可通过导入 .disy 恢复项目。</p></div>
-              <div className="desktop-storage-path" title={desktopStoragePath ?? undefined}>{desktopStoragePath ?? '尚未选择目录'}</div>
-              <div className="desktop-storage-actions">
-                <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy(true)}>{desktopStoragePath ? '更换目录' : '选择目录'}</button>
-                {desktopStoragePath && <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy()}>{desktopStorageBusy ? '正在保存…' : '立即保存工作区'}</button>}
-              </div>
-              {desktopStorageError && <p role="alert">{desktopStorageError}</p>}
-            </div>}<div className="storage-panel-heading"><div className="storage-panel-title"><span className="storage-panel-icon"><HardDrive size={17} /></span><span><strong>存储健康中心</strong><small>检测项目的存储占用与可优化空间</small></span></div><button type="button" className="storage-scan-button" onClick={() => void scanStorage()} disabled={storageScanning}>{storageScanning ? <LoaderCircle size={14} className="is-spinning" /> : <RefreshCw size={14} />}{storageScanning ? '扫描中' : '重新扫描'}</button></div>{storageUsage ? <><div className="storage-health-result"><div className="storage-total"><HardDrive size={30} /><strong>{formatStorageBytes(storageUsage.usage)}</strong><span>{storageUsage.quota ? `占浏览器配额 ${Math.round(storageUsage.usage / storageUsage.quota * 100)}%` : '当前浏览器未提供容量上限'}</span></div>{storageUsage.quota > 0 && <div className="storage-usage-track"><i style={{ width: `${Math.min(100, Math.max(2, storageUsage.usage / storageUsage.quota * 100))}%` }} /></div>}</div><div className="storage-breakdown"><div><span><i className="storage-dot is-project" />浏览器本地数据</span><strong>{formatStorageBytes(storageInsights.localBytes)}</strong></div><div><span><i className="storage-dot is-history" />历史媒体 · {storageInsights.historyCount} 条</span><strong>{formatStorageBytes(storageInsights.historyBytes)}</strong></div></div><div className="storage-optimization"><div className="storage-optimization-heading"><span><Lightbulb size={15} /><strong>优化建议</strong></span><b>可优化空间 {formatStorageBytes(storageInsights.historyBytes)}</b></div><p>{storageInsights.historyBytes > 0 ? '历史媒体通常占用最多空间。删除不再需要的输出记录后，浏览器会回收对应文件。' : '当前没有发现可直接清理的历史媒体，继续保持定期导出与清理即可。'}</p><button type="button" onClick={() => { setStorageOpen(false); setOutputHistoryOpen(true) }}><History size={14} />管理历史媒体</button></div></> : <div className="storage-health-empty"><HardDrive size={34} /><strong>还没有扫描数据</strong><span>扫描后查看占用明细、优化建议和可释放空间。</span><button type="button" onClick={() => void scanStorage()}><RefreshCw size={14} />开始扫描</button></div>}<div className="storage-health-note"><Info size={14} /><span>{isDesktopApp() ? '应用内数据保存在本机。工作区文件可用于恢复项目或迁移到其他设备。' : '项目数据保存在当前浏览器本地。导出项目包可用于备份或迁移到其他设备。'}</span></div></section></div>
-          </motion.div>
-        </motion.div>}
-      </AnimatePresence>
+
       <AnimatePresence>
         {transferProgress && <motion.div className="transfer-progress-hud" role="status" aria-live="polite" initial={{ opacity: 0, y: 18, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12, scale: .98 }}>
           <div className="transfer-progress-icon"><LoaderCircle size={18} className="is-spinning" /></div>
@@ -17879,17 +17933,6 @@ function App() {
                     }}
                   ><Plus size={15} /></button>
                 </div>
-                {activeNodeImageModel && activeImageOutputIntent.message && (
-                  <div className={`image-editor-format-notice ${activeImageOutputIntent.blocked ? 'is-unsupported' : ''}`} role="status">
-                    {activeImageOutputIntent.output === 'gif' ? <Film size={15} aria-hidden="true" />
-                      : activeImageOutputIntent.blocked ? <Info size={15} aria-hidden="true" />
-                      : <FileImage size={15} aria-hidden="true" />}
-                    <div>
-                      <strong>{activeImageOutputIntent.output ? IMAGE_OUTPUT_LABELS[activeImageOutputIntent.output] : '输出格式受限'}</strong>
-                      <span>{activeImageOutputIntent.blocked ? activeImageOutputIntent.message : '从提示词识别'}</span>
-                    </div>
-                  </div>
-                )}
                 <div className="image-prompt-field">
                   <AtomicPromptEditor
                     key={activeGenerationNode.id}
@@ -19555,22 +19598,30 @@ function App() {
             >
               <div className="modal-heading api-manager-heading">
                 <div>
-                  <span className="eyebrow">连接你的可能性</span>
-                  <h2 id="api-dialog-title">{apiSettingsView === 'language' ? '设置' : 'API 设置'}</h2>
-                  <p>{apiSettingsView === 'language' ? '按你的习惯调整界面语言。' : '分别管理连接、获取模型，并只启用你实际需要的能力。'}</p>
+                  <span className="eyebrow">设置</span>
+                  <h2 id="api-dialog-title">{apiSettingsView === 'language' ? '语言与显示' : apiSettingsView === 'storage' ? '存储空间' : 'API 设置'}</h2>
+                  <p>{apiSettingsView === 'language' ? '按你的习惯调整界面语言。' : apiSettingsView === 'storage' ? '检查项目的存储占用与可优化空间。' : '分别管理连接、获取模型，并只启用你实际需要的能力。'}</p>
                 </div>
-                <button aria-label="关闭 API 设置" className="modal-close" onClick={() => setApiOpen(false)}>
+                <button aria-label="关闭设置" className="modal-close" onClick={() => setApiOpen(false)}>
                   <X size={18} />
                 </button>
               </div>
 
               <div className="settings-shell">
                 <aside className="settings-sidebar" aria-label="设置分类">
-                  <button type="button" className={apiSettingsView === 'api' ? 'is-active' : ''} onClick={() => setApiSettingsView('api')}><KeyRound size={14} />API 设置</button>
-                  <button type="button" className={apiSettingsView === 'language' ? 'is-active' : ''} onClick={() => setApiSettingsView('language')}><Languages size={14} />语言与显示</button>
-                  {apiStorageNavVisible && <button type="button" onClick={openStorageSettings}><HardDrive size={14} />存储空间</button>}
+                  <button type="button" className={apiSettingsView === 'api' ? 'is-active' : ''} aria-current={apiSettingsView === 'api' ? 'page' : undefined} onClick={() => setApiSettingsView('api')}><KeyRound size={14} />API 设置</button>
+                  <button type="button" className={apiSettingsView === 'language' ? 'is-active' : ''} aria-current={apiSettingsView === 'language' ? 'page' : undefined} onClick={() => setApiSettingsView('language')}><Languages size={14} />语言与显示</button>
+                  <button type="button" className={apiSettingsView === 'storage' ? 'is-active' : ''} aria-current={apiSettingsView === 'storage' ? 'page' : undefined} onClick={openStorageSettings}><HardDrive size={14} />存储空间</button>
                 </aside>
-              {apiSettingsView === 'language' ? <LanguageSettings/> : <div className="api-manager-body">
+              {apiSettingsView === 'language' ? <LanguageSettings/> : apiSettingsView === 'storage' ? <section className="storage-health-panel">{isDesktopApp() && <div className="desktop-storage-settings">
+              <div><strong>本地存储目录</strong><p>手动保存或画布自动保存时，更新此目录里的工作区文件。可通过导入 .disy 恢复项目。</p></div>
+              <div className="desktop-storage-path" title={desktopStoragePath ?? undefined}>{desktopStoragePath ?? '尚未选择目录'}</div>
+              <div className="desktop-storage-actions">
+                <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy(true)}>{desktopStoragePath ? '更换目录' : '选择目录'}</button>
+                {desktopStoragePath && <button type="button" disabled={desktopStorageBusy || transferBusy} onClick={() => void saveDesktopCopy()}>{desktopStorageBusy ? '正在保存…' : '立即保存工作区'}</button>}
+              </div>
+              {desktopStorageError && <p role="alert">{desktopStorageError}</p>}
+            </div>}<div className="storage-panel-heading"><div className="storage-panel-title"><span className="storage-panel-icon"><HardDrive size={17} /></span><span><strong>存储健康中心</strong><small>检测项目的存储占用与可优化空间</small></span></div><button type="button" className="storage-scan-button" onClick={() => void scanStorage()} disabled={storageScanning}>{storageScanning ? <LoaderCircle size={14} className="is-spinning" /> : <RefreshCw size={14} />}{storageScanning ? '扫描中' : '重新扫描'}</button></div>{storageUsage ? <><div className="storage-health-result"><div className="storage-total"><HardDrive size={30} /><strong>{formatStorageBytes(storageUsage.usage)}</strong><span>{storageUsage.quota ? `占浏览器配额 ${Math.round(storageUsage.usage / storageUsage.quota * 100)}%` : '当前浏览器未提供容量上限'}</span></div>{storageUsage.quota > 0 && <div className="storage-usage-track"><i style={{ width: `${Math.min(100, Math.max(2, storageUsage.usage / storageUsage.quota * 100))}%` }} /></div>}</div><div className="storage-breakdown"><div><span><i className="storage-dot is-project" />浏览器本地数据</span><strong>{formatStorageBytes(storageInsights.localBytes)}</strong></div><div><span><i className="storage-dot is-history" />历史媒体 · {storageInsights.historyCount} 条</span><strong>{formatStorageBytes(storageInsights.historyBytes)}</strong></div></div></> : <div className="storage-health-empty"><HardDrive size={34} /><strong>还没有扫描数据</strong><span>扫描后查看占用明细、优化建议和可释放空间。</span><button type="button" onClick={() => void scanStorage()}><RefreshCw size={14} />开始扫描</button></div>}{storageError && <p className="storage-data-error" role="alert">{storageError}</p>}{storageInventory && <StorageDataManager inventory={storageInventory} busy={storageCleaning || storageScanning || transferBusy} formatBytes={formatStorageBytes} onManage={(category,entry)=>void manageStorageData(category,entry)} onRestoreMedia={restoreStorageMedia} onClean={()=>void cleanStorageMedia()} onDeleteBackup={()=>void removeStorageBackup()} onDeleteArchive={kind=>void removeStorageArchive(kind)} onExport={()=>void exportWholeWorkspace().catch(error=>setStorageError(error instanceof Error ? error.message : '导出失败'))}/>}<div className="storage-health-note"><Info size={14} /><span>{isDesktopApp() ? '应用内数据保存在本机。工作区文件可用于恢复项目或迁移到其他设备。' : '项目数据保存在当前浏览器本地。导出项目包可用于备份或迁移到其他设备。'}</span></div></section> : <div className="api-manager-body">
                 <aside className="api-connection-list">
                   <button type="button" className="api-new-connection" disabled={savingApiConnection} onClick={beginNewApiConnection}>
                     <Plus size={15} /><span>添加 API 连接</span>

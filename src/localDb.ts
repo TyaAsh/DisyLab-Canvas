@@ -9,6 +9,7 @@
  */
 import { withoutLegacyAgentSettings } from './agentProject'
 import type { FilmCheckpoint } from './skills/filmProduction'
+import { buildStorageInventory } from './storageInventory'
 
 const DATABASE_NAME = 'disy-infinite-local'
 const DATABASE_VERSION = 7
@@ -703,6 +704,54 @@ export async function listHistoryMedia(): Promise<HistoryMediaRecord[]> {
   } finally {
     database.close()
   }
+}
+
+async function readStorageStores(transaction: IDBTransaction) {
+  const stores = Array.from(transaction.objectStoreNames)
+  const values = await Promise.all(stores.map(name => requestResult(transaction.objectStore(name).getAll())))
+  return Object.fromEntries(stores.map((name,index)=>[name,values[index]]))
+}
+
+export async function inspectLocalStorage(liveReferences: unknown[] = []) {
+  const database = await openDatabase()
+  try {
+    return buildStorageInventory(await readStorageStores(database.transaction(Array.from(database.objectStoreNames),'readonly')),liveReferences)
+  } finally { database.close() }
+}
+
+/** Recheck references under the same write transaction that deletes the unused blobs. */
+export async function cleanUnusedHistoryMedia(liveReferences: unknown[] = []) {
+  const database=await openDatabase()
+  try {
+    const transaction=database.transaction(Array.from(database.objectStoreNames),'readwrite')
+    const complete=new Promise<void>((resolve,reject)=>{transaction.oncomplete=()=>resolve();transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error ?? new Error('Storage cleanup aborted'))})
+    void complete.catch(()=>undefined)
+    try {
+      const inventory=buildStorageInventory(await readStorageStores(transaction),liveReferences)
+      for(const id of inventory.unusedMediaIds) transaction.objectStore(HISTORY_MEDIA_STORE).delete(id)
+      await complete
+      return inventory.unusedMediaIds
+    } catch(error) {
+      try{transaction.abort()}catch{/* The transaction may already have aborted. */}
+      await complete.catch(()=>undefined)
+      throw error
+    }
+  } finally {database.close()}
+}
+
+export async function deleteWorkspaceImportBackup() {
+  await runTransaction<void>([IMPORT_BACKUP_STORE],'readwrite',transaction=>{transaction.objectStore(IMPORT_BACKUP_STORE).clear()})
+}
+
+export async function deleteStorageArchive(kind: 'legacy' | 'checkpoints') {
+  if(kind==='legacy') {
+    await runTransaction<void>([LEGACY_PROJECT_STORE],'readwrite',transaction=>{transaction.objectStore(LEGACY_PROJECT_STORE).clear()})
+    return
+  }
+  await runTransaction<void>([WORKSPACE_DATA_STORE],'readwrite',transaction=>{
+    const request=transaction.objectStore(WORKSPACE_DATA_STORE).openCursor()
+    request.onsuccess=()=>{const cursor=request.result;if(!cursor)return;if(String(cursor.key).startsWith('film-checkpoint:'))cursor.delete();cursor.continue()}
+  })
 }
 
 function blobToDataUrl(blob: Blob) {
